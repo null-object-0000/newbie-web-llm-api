@@ -1,0 +1,626 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <title>Web-LLM-API 测试台</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { margin: 0; padding: 0; font-family: sans-serif; display: flex; height: 100vh; }
+        
+        /* 侧边栏样式 */
+        .sidebar { width: 250px; background: #f5f5f5; border-right: 1px solid #ddd; display: flex; flex-direction: column; }
+        .sidebar-header { padding: 15px; border-bottom: 1px solid #ddd; }
+        .sidebar-header h3 { margin: 0; font-size: 16px; }
+        .conversation-list { flex: 1; overflow-y: auto; padding: 10px; }
+        .conversation-item { padding: 10px; margin-bottom: 5px; background: white; border-radius: 5px; cursor: pointer; border: 1px solid #ddd; transition: all 0.2s; }
+        .conversation-item:hover { background: #e3f2fd; border-color: #007bff; }
+        .conversation-item.active { background: #007bff; color: white; border-color: #007bff; }
+        .conversation-item-title { font-weight: bold; margin-bottom: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; padding: 2px 4px; border-radius: 3px; }
+        .conversation-item-title:hover { background: rgba(0,0,0,0.05); }
+        .conversation-item.active .conversation-item-title:hover { background: rgba(255,255,255,0.2); }
+        .conversation-item-title-input { width: 100%; padding: 4px; border: 1px solid #007bff; border-radius: 3px; font-size: 14px; font-weight: bold; }
+        .conversation-item-time { font-size: 12px; opacity: 0.7; }
+        .conversation-item-actions { margin-top: 5px; display: flex; gap: 5px; }
+        .conversation-item-actions button { padding: 3px 8px; font-size: 12px; background: #dc3545; border: none; border-radius: 3px; color: white; cursor: pointer; }
+        .conversation-item-actions button:hover { background: #c82333; }
+        .conversation-item.active .conversation-item-actions button { background: rgba(255,255,255,0.3); }
+        .conversation-item.active .conversation-item-actions button:hover { background: rgba(255,255,255,0.5); }
+        
+        /* 主内容区样式 */
+        .main-content { flex: 1; display: flex; flex-direction: column; max-width: 800px; margin: 0 auto; padding: 20px; width: 100%; }
+        #chat-box { flex: 1; border: 1px solid #ddd; overflow-y: scroll; padding: 10px; margin-bottom: 10px; border-radius: 8px; background: #f9f9f9; min-height: 0; }
+        .message { margin-bottom: 15px; padding: 10px; border-radius: 5px; }
+        .user { background-color: #e3f2fd; text-align: right; }
+        .ai { background-color: #fff; border: 1px solid #eee; }
+        .config-area { display: flex; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+        .config-area select { padding: 8px; border: 1px solid #ddd; border-radius: 4px; }
+        .input-area { display: flex; gap: 10px; }
+        input { flex: 1; padding: 10px; border: 1px solid #ddd; border-radius: 4px; }
+        button { padding: 10px 20px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        button:disabled { background: #ccc; }
+        .new-chat-btn { background: #28a745; }
+        .new-chat-btn:hover { background: #218838; }
+    </style>
+</head>
+<body>
+<!-- 侧边栏：对话列表 -->
+<div class="sidebar">
+    <div class="sidebar-header">
+        <h3>💬 对话列表</h3>
+        <button onclick="createNewConversation()" class="new-chat-btn" style="width: 100%; margin-top: 10px; padding: 8px;">+ 新对话</button>
+    </div>
+    <div class="conversation-list" id="conversationList">
+        <!-- 对话列表将在这里动态生成 -->
+    </div>
+</div>
+
+<!-- 主内容区 -->
+<div class="main-content">
+<h2>🤖 Web-LLM-API 调试器</h2>
+<div class="config-area">
+    <select id="providerSelect" onchange="onProviderChange()">
+        <option value="">加载中...</option>
+    </select>
+    <select id="modelSelect">
+        <option value="">加载中...</option>
+    </select>
+    <label style="display: flex; align-items: center; gap: 5px; cursor: pointer;">
+        <input type="checkbox" id="thinkingToggle" style="width: auto; cursor: pointer;">
+        <span>深度思考</span>
+    </label>
+</div>
+<div id="chat-box"></div>
+<div class="input-area">
+    <button onclick="newChat()" class="new-chat-btn" id="newChatBtn">新对话</button>
+    <input type="text" id="prompt" placeholder="输入问题测试，例如：讲个笑话..." onkeypress="if(event.keyCode==13) send()">
+    <button onclick="send()" id="sendBtn">发送</button>
+</div>
+
+<!-- 使用 ES6 模块方式引入 OpenAI SDK -->
+<script type="module">
+    // 动态导入 OpenAI SDK
+    const { default: OpenAI } = await import('https://cdn.jsdelivr.net/npm/openai@6.10.0/+esm');
+    
+    const chatBox = document.getElementById('chat-box');
+    const providerSelect = document.getElementById('providerSelect');
+    const modelSelect = document.getElementById('modelSelect');
+    
+    let providersData = {};
+    let modelsData = [];
+    let conversationHistory = []; // 维护当前对话历史
+    let currentConversationId = null; // 当前对话ID
+    const STORAGE_KEY = 'web_llm_conversations'; // localStorage 键名
+
+    // 初始化 OpenAI 客户端（指向本地后端）
+    // 创建自定义 fetch 函数来添加自定义 header
+        const customFetch = async (url, options = {}) => {
+        // 从全局变量获取 newConversation 值
+        const newConv = window._currentNewConversation !== undefined 
+            ? String(window._currentNewConversation) 
+            : 'false';
+        
+        // 获取深度思考模式状态
+        const thinkingToggle = document.getElementById('thinkingToggle');
+        const thinking = thinkingToggle ? thinkingToggle.checked : false;
+        
+        // 获取当前对话的 URL（如果有）
+        const conversations = loadConversations();
+        const currentConv = currentConversationId ? conversations[currentConversationId] : null;
+        const conversationUrl = currentConv?.url || '';
+        
+        // 正确处理 headers（可能是 Headers 对象、普通对象或 undefined）
+        let headers;
+        if (options.headers instanceof Headers) {
+            headers = new Headers(options.headers);
+            headers.set('X-New-Conversation', newConv);
+            headers.set('X-Thinking', String(thinking));
+            if (conversationUrl) {
+                headers.set('X-Conversation-URL', conversationUrl);
+            }
+        } else if (options.headers) {
+            // 如果是普通对象，转换为 Headers
+            headers = new Headers(options.headers);
+            headers.set('X-New-Conversation', newConv);
+            headers.set('X-Thinking', String(thinking));
+            if (conversationUrl) {
+                headers.set('X-Conversation-URL', conversationUrl);
+            }
+        } else {
+            headers = new Headers();
+            headers.set('X-New-Conversation', newConv);
+            headers.set('X-Thinking', String(thinking));
+            if (conversationUrl) {
+                headers.set('X-Conversation-URL', conversationUrl);
+            }
+        }
+        
+        // 如果是 POST 请求，也需要在 body 中添加 thinking 参数
+        if (options.method === 'POST' && options.body) {
+            try {
+                const body = JSON.parse(options.body);
+                body.thinking = thinking;
+                options.body = JSON.stringify(body);
+            } catch (e) {
+                // 如果解析失败，忽略
+            }
+        }
+        
+        return fetch(url, {
+            ...options,
+            headers: headers
+        });
+    };
+    
+    const openai = new OpenAI({
+        baseURL: 'http://localhost:24753/v1',
+        apiKey: 'not-needed', // 本地后端不需要真实的 API Key
+        dangerouslyAllowBrowser: true, // 允许在浏览器中使用
+        fetch: customFetch // 使用自定义 fetch
+    });
+    
+    // 从 localStorage 加载对话列表
+    function loadConversations() {
+        try {
+            const data = localStorage.getItem(STORAGE_KEY);
+            return data ? JSON.parse(data) : {};
+        } catch (e) {
+            console.error('加载对话列表失败:', e);
+            return {};
+        }
+    }
+    
+    // 保存对话列表到 localStorage
+    function saveConversations(conversations) {
+        try {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(conversations));
+        } catch (e) {
+            console.error('保存对话列表失败:', e);
+        }
+    }
+    
+    // 生成对话ID
+    function generateConversationId() {
+        return 'conv_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+    }
+    
+    // 渲染对话列表
+    function renderConversationList() {
+        const conversations = loadConversations();
+        const listDiv = document.getElementById('conversationList');
+        listDiv.innerHTML = '';
+        
+        // 按时间倒序排列
+        const sortedConvs = Object.entries(conversations).sort((a, b) => 
+            b[1].updatedAt - a[1].updatedAt
+        );
+        
+        sortedConvs.forEach(([id, conv]) => {
+            const item = document.createElement('div');
+            item.className = 'conversation-item' + (id === currentConversationId ? ' active' : '');
+            item.onclick = () => loadConversation(id);
+            
+            const title = conv.title || '新对话';
+            const time = new Date(conv.updatedAt).toLocaleString('zh-CN', {
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit'
+            });
+            
+            item.innerHTML = `
+                <div class="conversation-item-title" onclick="editConversationTitle('${id}', event)" title="点击编辑标题">${escapeHtml(title)}</div>
+                <div class="conversation-item-time">${time}</div>
+                <div class="conversation-item-actions" onclick="event.stopPropagation();">
+                    <button onclick="deleteConversation('${id}', event)">删除</button>
+                </div>
+            `;
+            
+            listDiv.appendChild(item);
+        });
+    }
+    
+    // HTML 转义函数
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+    
+    // 创建新对话
+    window.createNewConversation = function() {
+        currentConversationId = generateConversationId();
+        conversationHistory = [];
+        chatBox.innerHTML = '';
+        renderConversationList();
+        console.log('已创建新对话:', currentConversationId);
+    };
+    
+    // 新对话函数（兼容旧代码）
+    window.newChat = function() {
+        createNewConversation();
+    };
+    
+    // 加载指定对话
+    function loadConversation(id) {
+        const conversations = loadConversations();
+        const conv = conversations[id];
+        
+        if (!conv) {
+            console.error('对话不存在:', id);
+            return;
+        }
+        
+        currentConversationId = id;
+        conversationHistory = conv.messages || [];
+        
+        // 渲染对话历史
+        chatBox.innerHTML = '';
+        conversationHistory.forEach(msg => {
+            if (msg.role === 'user' || msg.role === 'assistant') {
+                appendMessage(msg.role, msg.content);
+            }
+        });
+        
+        chatBox.scrollTop = chatBox.scrollHeight;
+        renderConversationList();
+        console.log('已加载对话:', id);
+    }
+    
+    // 删除对话
+    window.deleteConversation = function(id, event) {
+        event.stopPropagation();
+        
+        if (!confirm('确定要删除这个对话吗？')) {
+            return;
+        }
+        
+        const conversations = loadConversations();
+        delete conversations[id];
+        saveConversations(conversations);
+        
+        // 如果删除的是当前对话，创建新对话
+        if (id === currentConversationId) {
+            createNewConversation();
+        } else {
+            renderConversationList();
+        }
+    };
+    
+    // 保存当前对话
+    function saveCurrentConversation() {
+        if (!currentConversationId || conversationHistory.length === 0) {
+            return;
+        }
+        
+        const conversations = loadConversations();
+        const existingConv = conversations[currentConversationId];
+        
+        // 如果已有标题，保留；否则从第一条用户消息生成
+        let title = existingConv?.title;
+        if (!title || title === '新对话' || title.endsWith('...')) {
+            const firstUserMessage = conversationHistory.find(m => m.role === 'user')?.content;
+            if (firstUserMessage) {
+                title = firstUserMessage.length > 20 ? firstUserMessage.substring(0, 20) + '...' : firstUserMessage;
+            } else {
+                title = '新对话';
+            }
+        }
+        
+        conversations[currentConversationId] = {
+            id: currentConversationId,
+            title: title,
+            messages: [...conversationHistory],
+            url: existingConv?.url || '', // 保留已有的 URL
+            createdAt: existingConv?.createdAt || Date.now(),
+            updatedAt: Date.now()
+        };
+        
+        saveConversations(conversations);
+        renderConversationList();
+    }
+    
+    // 编辑对话标题
+    window.editConversationTitle = function(id, event) {
+        event.stopPropagation();
+        
+        const conversations = loadConversations();
+        const conv = conversations[id];
+        if (!conv) return;
+        
+        const item = event.target.closest('.conversation-item');
+        const titleDiv = item.querySelector('.conversation-item-title');
+        const currentTitle = conv.title || '新对话';
+        
+        // 创建输入框
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'conversation-item-title-input';
+        input.value = currentTitle.endsWith('...') ? currentTitle.substring(0, currentTitle.length - 3) : currentTitle;
+        input.maxLength = 50;
+        
+        // 替换标题
+        const oldTitle = titleDiv.textContent;
+        titleDiv.style.display = 'none';
+        titleDiv.parentNode.insertBefore(input, titleDiv);
+        input.focus();
+        input.select();
+        
+        // 保存标题
+        const saveTitle = () => {
+            const newTitle = input.value.trim() || '新对话';
+            const shortTitle = newTitle.length > 20 ? newTitle.substring(0, 20) + '...' : newTitle;
+            
+            conversations[id].title = shortTitle;
+            saveConversations(conversations);
+            
+            titleDiv.textContent = shortTitle;
+            titleDiv.style.display = '';
+            input.remove();
+            renderConversationList();
+        };
+        
+        // 取消编辑
+        const cancelEdit = () => {
+            titleDiv.style.display = '';
+            input.remove();
+        };
+        
+        // 绑定事件
+        input.addEventListener('blur', saveTitle);
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                saveTitle();
+            } else if (e.key === 'Escape') {
+                e.preventDefault();
+                cancelEdit();
+            }
+        });
+    };
+
+    // 加载提供者和模型列表
+    async function loadProviders() {
+        try {
+            // 使用自定义 API 获取提供者信息（用于提供者选择）
+            const providersRes = await fetch('http://localhost:24753/v1/providers');
+            providersData = await providersRes.json();
+            
+            // 使用 OpenAI SDK 获取模型列表（符合 OpenAI 规范）
+            const modelsResponse = await openai.models.list();
+            modelsData = modelsResponse.data || [];
+            
+            // 填充提供者下拉框
+            providerSelect.innerHTML = '<option value="">选择提供者</option>';
+            for (const [name, info] of Object.entries(providersData)) {
+                const option = document.createElement('option');
+                option.value = name;
+                option.textContent = `${name} (${info.models.length} 个模型)`;
+                providerSelect.appendChild(option);
+            }
+            
+            // 默认选择第一个提供者
+            if (Object.keys(providersData).length > 0) {
+                providerSelect.value = Object.keys(providersData)[0];
+                onProviderChange();
+            }
+        } catch (err) {
+            console.error('加载提供者失败:', err);
+            providerSelect.innerHTML = '<option value="">加载失败</option>';
+            modelSelect.innerHTML = '<option value="">加载失败</option>';
+        }
+    }
+
+    // 提供者改变时更新模型列表
+    window.onProviderChange = function() {
+        const selectedProvider = providerSelect.value;
+        modelSelect.innerHTML = '<option value="">选择模型</option>';
+        
+        if (selectedProvider && providersData[selectedProvider]) {
+            const models = providersData[selectedProvider].models;
+            models.forEach(model => {
+                const option = document.createElement('option');
+                option.value = model;
+                option.textContent = model;
+                modelSelect.appendChild(option);
+            });
+            
+            // 默认选择第一个模型
+            if (models.length > 0) {
+                modelSelect.value = models[0];
+            }
+        }
+    };
+
+    // 将 send 函数暴露到全局作用域，以便 HTML 中的 onclick 可以调用
+    window.send = async function() {
+        const input = document.getElementById('prompt');
+        const btn = document.getElementById('sendBtn');
+        const newChatBtn = document.getElementById('newChatBtn');
+        const text = input.value.trim();
+        const selectedModel = modelSelect.value;
+        
+        if (!text) return;
+        if (!selectedModel) {
+            alert('请先选择模型');
+            return;
+        }
+
+        // 判断是否是新对话（历史为空）
+        const isNewConversation = conversationHistory.length === 0;
+        
+        // 如果是新对话，创建新的对话ID
+        if (isNewConversation && !currentConversationId) {
+            currentConversationId = generateConversationId();
+        }
+
+        // 1. 上屏用户消息
+        appendMessage('user', text);
+        input.value = '';
+        btn.disabled = true;
+        newChatBtn.disabled = true;
+
+        // 2. 添加到对话历史
+        conversationHistory.push({ role: "user", content: text });
+        // 保存对话到本地存储（用户消息）
+        saveCurrentConversation();
+
+        // 3. 创建 AI 消息占位符
+        const aiMsgDiv = appendMessage('ai', '正在思考...');
+        let fullText = '';
+
+        try {
+            aiMsgDiv.innerText = ''; // 清空"正在思考..."
+
+            // 4. 构建消息列表（包含历史消息）
+            const messages = [...conversationHistory];
+
+            console.log('发送请求:', {
+                model: selectedModel,
+                messagesCount: messages.length,
+                newConversation: isNewConversation
+            });
+
+            // 5. 设置全局变量，让自定义 fetch 可以访问
+            window._currentNewConversation = isNewConversation;
+            
+            // 6. 使用 OpenAI SDK 发起流式请求
+            try {
+                const stream = await openai.chat.completions.create({
+                    model: selectedModel,
+                    messages: messages,
+                    stream: true
+                });
+
+                // 7. 处理流式响应（SDK 自动处理 SSE 解析）
+                // 创建思考内容容器（如果不存在）
+                let thinkingDiv = null;
+                
+                for await (const chunk of stream) {
+                    const delta = chunk.choices[0]?.delta?.content;
+                    if (delta) {
+                        // 检查是否是对话 URL
+                        if (delta.startsWith('__URL__')) {
+                            // 对话 URL：保存到当前对话
+                            const url = delta.substring('__URL__'.length);
+                            if (currentConversationId && url) {
+                                const conversations = loadConversations();
+                                if (conversations[currentConversationId]) {
+                                    conversations[currentConversationId].url = url;
+                                    saveConversations(conversations);
+                                    console.log('已保存对话 URL:', url);
+                                }
+                            }
+                        }
+                        // 检查是否是思考内容
+                        else if (delta.startsWith('__THINKING__')) {
+                            // 思考内容：移除标记，显示在思考区域
+                            const thinkingContent = delta.substring('__THINKING__'.length);
+                            
+                            // 创建或获取思考内容容器
+                            if (!thinkingDiv) {
+                                thinkingDiv = document.createElement('div');
+                                thinkingDiv.className = 'thinking-content';
+                                thinkingDiv.style.cssText = 'background: #f5f5f5; padding: 10px; margin: 10px 0; border-left: 3px solid #007bff; border-radius: 4px; font-style: italic; color: #666;';
+                                thinkingDiv.innerHTML = '<div style="font-weight: bold; margin-bottom: 5px; color: #007bff;">💭 思考过程：</div><div class="thinking-text"></div>';
+                                aiMsgDiv.parentNode.insertBefore(thinkingDiv, aiMsgDiv);
+                            }
+                            
+                            const thinkingTextDiv = thinkingDiv.querySelector('.thinking-text');
+                            if (thinkingTextDiv) {
+                                thinkingTextDiv.innerText += thinkingContent;
+                            }
+                            chatBox.scrollTop = chatBox.scrollHeight;
+                        }
+                        // 检查是否是整体替换消息
+                        else if (delta.startsWith('__REPLACE__')) {
+                            // 整体替换：移除标记，替换整个内容
+                            const replaceContent = delta.substring('__REPLACE__'.length);
+                            fullText = replaceContent;
+                            aiMsgDiv.innerText = fullText;
+                            console.log('收到整体替换消息，新内容长度:', fullText.length);
+                            chatBox.scrollTop = chatBox.scrollHeight;
+                        } else {
+                            // 增量更新：追加内容
+                            fullText += delta;
+                            aiMsgDiv.innerText = fullText;
+                            chatBox.scrollTop = chatBox.scrollHeight;
+                        }
+                    }
+                }
+            } catch (streamError) {
+                // 如果是 400 错误，尝试获取详细错误信息
+                if (streamError.status === 400 || streamError.message?.includes('400')) {
+                    console.error('400 错误详情:', streamError);
+                    // 尝试从错误对象中获取更多信息
+                    if (streamError.error) {
+                        console.error('错误详情:', streamError.error);
+                        throw new Error(`请求错误: ${JSON.stringify(streamError.error)}`);
+                    }
+                }
+                throw streamError;
+            } finally {
+                // 清理全局变量
+                delete window._currentNewConversation;
+            }
+
+            // 7. 将 AI 回复添加到对话历史
+            if (fullText) {
+                conversationHistory.push({ role: "assistant", content: fullText });
+                // 保存对话到本地存储
+                saveCurrentConversation();
+            }
+
+        } catch (err) {
+            aiMsgDiv.innerText = '错误: ' + err.message;
+            console.error('请求错误:', err);
+            // 如果出错，从历史中移除刚才添加的用户消息
+            conversationHistory.pop();
+        } finally {
+            // 清理全局变量
+            delete window._currentNewConversation;
+            btn.disabled = false;
+            newChatBtn.disabled = false;
+        }
+    };
+
+    function appendMessage(role, text) {
+        const div = document.createElement('div');
+        div.className = `message ${role}`;
+        div.innerText = text;
+        chatBox.appendChild(div);
+        chatBox.scrollTop = chatBox.scrollHeight;
+        return div;
+    }
+
+    // 页面加载时初始化
+    // 由于是 ES6 模块，代码执行时 DOM 可能已经加载完成
+    // 所以同时检查 DOMContentLoaded 和直接执行
+    function initializePage() {
+        // 加载对话列表
+        renderConversationList();
+        // 如果有对话，加载最新的一个
+        const conversations = loadConversations();
+        const sortedConvs = Object.entries(conversations).sort((a, b) => 
+            b[1].updatedAt - a[1].updatedAt
+        );
+        if (sortedConvs.length > 0) {
+            loadConversation(sortedConvs[0][0]);
+        } else {
+            // 没有历史对话，创建新对话
+            createNewConversation();
+        }
+    }
+    
+    // 如果 DOM 已经加载完成，直接执行；否则等待 DOMContentLoaded
+    if (document.readyState === 'loading') {
+        window.addEventListener('DOMContentLoaded', initializePage);
+    } else {
+        // DOM 已经加载完成，直接执行
+        initializePage();
+    }
+    
+    // 页面加载时获取提供者和模型列表
+    loadProviders();
+</script>
+</body>
+</html>
