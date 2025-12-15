@@ -12,7 +12,6 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
-import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
@@ -60,7 +59,7 @@ public class DeepSeekProvider extends BaseProvider {
 
     @Override
     public List<String> getSupportedModels() {
-        return Arrays.asList("deepseek-web");
+        return List.of("deepseek-web");
     }
 
     /**
@@ -103,8 +102,7 @@ public class DeepSeekProvider extends BaseProvider {
                     // 继续对话：根据 conversationUrl 决定使用哪个页面
                     String conversationUrl = request.getConversationUrl();
                     
-                    if (conversationUrl != null && !conversationUrl.isEmpty() && 
-                        conversationUrl.contains("chat.deepseek.com")) {
+                    if (conversationUrl != null && conversationUrl.contains("chat.deepseek.com")) {
                         // 如果有指定的对话 URL，尝试导航到该 URL
                         log.info("继续指定对话，URL: {}", conversationUrl);
                         
@@ -168,7 +166,7 @@ public class DeepSeekProvider extends BaseProvider {
                 // 为当前请求创建 SSE 内容队列（每次请求都需要新的队列）
                 // 在页面创建后设置 SSE 拦截器
                 BlockingQueue<String> sseContentQueue = new LinkedBlockingQueue<>();
-                setupSseInterceptor(page, sseContentQueue);
+                setupSseInterceptor(page);
 
                 // 3. 如果是新对话，点击"新对话"按钮
                 if (request.isNewConversation()) {
@@ -239,7 +237,7 @@ public class DeepSeekProvider extends BaseProvider {
                                             const text = btn.textContent || '';
                                             if (text.includes('深度思考') || text.includes('Thinking')) {
                                                 // 检查是否是 toggle button 且未激活
-                                                const isActive = btn.classList.contains('active') || 
+                                                const isActive = btn.classList.contains('active') ||
                                                                btn.classList.contains('selected') ||
                                                                btn.classList.contains('ds-toggle-button--active');
                                                 if (!isActive) {
@@ -292,7 +290,7 @@ public class DeepSeekProvider extends BaseProvider {
                                         for (const btn of buttons) {
                                             const text = btn.textContent || '';
                                             if (text.includes('深度思考') || text.includes('Thinking')) {
-                                                const isActive = btn.classList.contains('active') || 
+                                                const isActive = btn.classList.contains('active') ||
                                                                btn.classList.contains('selected') ||
                                                                btn.classList.contains('ds-toggle-button--active');
                                                 if (isActive) {
@@ -309,6 +307,117 @@ public class DeepSeekProvider extends BaseProvider {
                     } catch (Exception e) {
                         // 忽略错误
                     }
+                }
+
+                // 5.1 处理联网搜索开关（仅在 DeepSeek 页面存在对应按钮时生效）
+                try {
+                    if (request.isWebSearch()) {
+                        log.info("尝试启用联网搜索模式");
+                        // 尝试多种方式查找“联网搜索”按钮
+                        Locator webSearchToggle = page.locator("button:has-text('联网搜索')")
+                                .or(page.locator("button:has-text('联网')"))
+                                .or(page.locator("button[aria-label*='联网'], button[aria-label*='搜索'], button[aria-label*='Search']"))
+                                .first();
+
+                        if (webSearchToggle.count() > 0) {
+                            try {
+                                String className = webSearchToggle.getAttribute("class");
+                                boolean isActive = className != null &&
+                                        (className.contains("active") || className.contains("selected") ||
+                                                className.contains("ds-toggle-button--active"));
+
+                                if (!isActive) {
+                                    webSearchToggle.click();
+                                    page.waitForTimeout(500);
+                                    log.info("已启用联网搜索模式");
+                                } else {
+                                    log.info("联网搜索模式已启用");
+                                }
+                            } catch (Exception e) {
+                                // 检查失败则直接点击
+                                webSearchToggle.click();
+                                page.waitForTimeout(500);
+                                log.info("已点击联网搜索按钮（未检查状态）");
+                            }
+                        } else {
+                            // 如果按钮选择器失效，尝试用 JS 兜底（根据按钮文本模糊查找）
+                            try {
+                                Boolean result = (Boolean) page.evaluate("""
+                                    () => {
+                                        const buttons = document.querySelectorAll('button');
+                                        for (const btn of buttons) {
+                                            const text = (btn.textContent || '').trim();
+                                            if (text.includes('联网搜索') || text.includes('联网') || text.includes('Web Search')) {
+                                                const isActive = btn.classList.contains('active') ||
+                                                                btn.classList.contains('selected') ||
+                                                                btn.classList.contains('ds-toggle-button--active');
+                                                if (!isActive) {
+                                                    btn.click();
+                                                    return true;
+                                                }
+                                                return false;
+                                            }
+                                        }
+                                        return false;
+                                    }
+                                """);
+                                if (Boolean.TRUE.equals(result)) {
+                                    log.info("通过 JavaScript 已启用联网搜索模式");
+                                } else {
+                                    log.warn("未找到联网搜索按钮或已启用");
+                                }
+                            } catch (Exception e) {
+                                log.warn("无法启用联网搜索模式: {}", e.getMessage());
+                            }
+                        }
+                    } else {
+                        // 未开启联网搜索时，尽量保证按钮处于关闭状态
+                        try {
+                            Locator webSearchToggle = page.locator("button:has-text('联网搜索')")
+                                    .or(page.locator("button:has-text('联网')"))
+                                    .first();
+
+                            if (webSearchToggle.count() > 0) {
+                                try {
+                                    String className = webSearchToggle.getAttribute("class");
+                                    boolean isActive = className != null &&
+                                            (className.contains("active") || className.contains("selected") ||
+                                                    className.contains("ds-toggle-button--active"));
+
+                                    if (isActive) {
+                                        webSearchToggle.click();
+                                        page.waitForTimeout(300);
+                                        log.info("已关闭联网搜索模式");
+                                    }
+                                } catch (Exception e) {
+                                    // 检查失败则尝试用 JS 关闭
+                                    page.evaluate("""
+                                        () => {
+                                            const buttons = document.querySelectorAll('button');
+                                            for (const btn of buttons) {
+                                                const text = (btn.textContent || '').trim();
+                                                if (text.includes('联网搜索') || text.includes('联网') || text.includes('Web Search')) {
+                                                    const isActive = btn.classList.contains('active') ||
+                                                                    btn.classList.contains('selected') ||
+                                                                    btn.classList.contains('ds-toggle-button--active');
+                                                    if (isActive) {
+                                                        btn.click();
+                                                        return true;
+                                                    }
+                                                }
+                                            }
+                                            return false;
+                                        }
+                                    """);
+                                }
+                            }
+                        } catch (Exception e) {
+                            // 忽略关闭失败的异常，避免影响主流程
+                            log.debug("关闭联网搜索模式时出错: {}", e.getMessage());
+                        }
+                    }
+                } catch (Exception e) {
+                    log.warn("处理联网搜索模式时出错，继续执行: {}", e.getMessage());
                 }
 
                 // 6. 定位输入框并填入内容
@@ -344,7 +453,7 @@ public class DeepSeekProvider extends BaseProvider {
                     // 如果未设置，重新设置
                     if (!Boolean.TRUE.equals(interceptorStatus)) {
                         log.warn("SSE 拦截器未设置，重新设置...");
-                        setupSseInterceptor(page, sseContentQueue);
+                        setupSseInterceptor(page);
                     }
                 } catch (Exception e) {
                     log.warn("检查 SSE 拦截器状态失败: {}", e.getMessage());
@@ -365,7 +474,7 @@ public class DeepSeekProvider extends BaseProvider {
 
                 // 11. 使用混合方式监听回复：DOM 实时流式 + SSE 最终修正
                 log.info("开始监听 AI 回复（DOM 实时 + SSE 修正）...");
-                monitorResponseHybrid(page, emitter, request, messageCountBefore, sseContentQueue);
+                monitorResponseHybrid(page, emitter, request, messageCountBefore);
 
             } catch (Exception e) {
                 log.error("Chat Error", e);
@@ -398,7 +507,7 @@ public class DeepSeekProvider extends BaseProvider {
     /**
      * 设置 SSE 拦截器（通过 JavaScript 注入拦截 EventSource 和 fetch）
      */
-    private void setupSseInterceptor(Page page, BlockingQueue<String> sseContentQueue) {
+    private void setupSseInterceptor(Page page) {
         // 初始化全局变量
         try {
             page.evaluate("""
@@ -608,8 +717,8 @@ public class DeepSeekProvider extends BaseProvider {
                     JsonNode json = objectMapper.readTree(jsonStr);
                     
                     // 提取 "v" 字段（文本内容）
-                    if (json.has("v") && json.get("v").isTextual()) {
-                        String content = json.get("v").asText();
+                    if (json.has("v") && json.get("v").isString()) {
+                        String content = json.get("v").asString();
                         if (content != null && !content.isEmpty()) {
                             text.append(content);
                         }
@@ -620,7 +729,7 @@ public class DeepSeekProvider extends BaseProvider {
             }
         }
         
-        return text.length() > 0 ? text.toString() : null;
+        return !text.isEmpty() ? text.toString() : null;
     }
 
     /**
@@ -628,12 +737,15 @@ public class DeepSeekProvider extends BaseProvider {
      * 支持区分思考内容和最终回复（深度思考模式）
      */
     private void monitorResponseHybrid(Page page, SseEmitter emitter, ChatCompletionRequest request,
-                                      int messageCountBefore, BlockingQueue<String> sseContentQueue)
+                                      int messageCountBefore)
             throws IOException, InterruptedException {
         // 思考内容选择器：在 .ds-think-content 内的 .ds-markdown
         String thinkingSelector = ".ds-think-content .ds-markdown";
         // 所有 markdown 选择器（用于查找最终回复）
         String allMarkdownSelector = ".ds-markdown";
+
+        // 本次请求是否需要输出思考内容
+        boolean enableThinking = request.isThinking();
         
         // 等待新的回复框出现
         Locator allResponseLocators = page.locator(allMarkdownSelector);
@@ -668,25 +780,29 @@ public class DeepSeekProvider extends BaseProvider {
                 // 1. DOM 解析（实时流式）
                 try {
                     // 1.1 检查思考内容（深度思考模式）
-                    try {
-                        Locator thinkingLocators = page.locator(thinkingSelector);
-                        int thinkingCount = thinkingLocators.count();
-                        
-                        if (thinkingCount > 0) {
-                            // 获取最后一个思考内容
-                            String thinkingText = thinkingLocators.nth(thinkingCount - 1).innerText();
-                            
-                            if (thinkingText.length() > collectedThinkingText.length()) {
-                                String thinkingDelta = thinkingText.substring(collectedThinkingText.length());
-                                collectedThinkingText.append(thinkingDelta);
-                                
-                                // 发送思考内容（使用特殊标记）
-                                log.debug("发送思考内容增量，长度: {}", thinkingDelta.length());
-                                sendThinkingContent(emitter, id, thinkingDelta, request.getModel());
+                    // 注意：只有当当前请求显式开启了深度思考时才会推送思考内容，
+                    // 避免上一轮开启深度思考后，本轮已关闭但仍重复输出旧思考内容。
+                    if (enableThinking) {
+                        try {
+                            Locator thinkingLocators = page.locator(thinkingSelector);
+                            int thinkingCount = thinkingLocators.count();
+
+                            if (thinkingCount > 0) {
+                                // 获取最后一个思考内容
+                                String thinkingText = thinkingLocators.nth(thinkingCount - 1).innerText();
+
+                                if (thinkingText.length() > collectedThinkingText.length()) {
+                                    String thinkingDelta = thinkingText.substring(collectedThinkingText.length());
+                                    collectedThinkingText.append(thinkingDelta);
+
+                                    // 发送思考内容（使用特殊标记）
+                                    log.debug("发送思考内容增量，长度: {}", thinkingDelta.length());
+                                    sendThinkingContent(emitter, id, thinkingDelta, request.getModel());
+                                }
                             }
+                        } catch (Exception e) {
+                            log.debug("读取思考内容时出错: {}", e.getMessage());
                         }
-                    } catch (Exception e) {
-                        log.debug("读取思考内容时出错: {}", e.getMessage());
                     }
                     
                     // 1.2 检查最终回复内容（排除思考区域内的）
@@ -727,7 +843,7 @@ public class DeepSeekProvider extends BaseProvider {
                                     // 发送增量（实时）
                                     log.debug("发送最终回复增量，长度: {}", delta.length());
                                     sendSseChunk(emitter, id, delta, request.getModel());
-                                } else if (finalText.equals(lastFullText) && finalText.length() > 0) {
+                                } else if (finalText.equals(lastFullText) && !finalText.isEmpty()) {
                                     noChangeCount++;
                                 }
                                 
@@ -857,7 +973,7 @@ public class DeepSeekProvider extends BaseProvider {
                 }
 
                 log.error("监听响应时出错", e);
-                if (collectedText.length() > 0) {
+                if (!collectedText.isEmpty()) {
                     log.info("已收集部分内容，长度: {}，结束监听", collectedText.length());
                     break;
                 }
@@ -868,7 +984,7 @@ public class DeepSeekProvider extends BaseProvider {
 
         // 在发送完成标记之前，发送当前页面的 URL 给前端
         try {
-            if (page != null && !page.isClosed()) {
+            if (!page.isClosed()) {
                 String currentUrl = page.url();
                 if (currentUrl.contains("chat.deepseek.com")) {
                     // 更新记录的 URL
@@ -884,98 +1000,6 @@ public class DeepSeekProvider extends BaseProvider {
             log.warn("发送对话 URL 时出错: {}", e.getMessage());
         }
 
-        sendDone(emitter);
-    }
-
-    /**
-     * 从 DOM 解析监听 AI 回复（回退方法）
-     */
-    private void monitorResponse(Page page, SseEmitter emitter, ChatCompletionRequest request, int messageCountBefore) throws IOException, InterruptedException {
-        // --- 定义选择器 (这里最容易失效，需要根据实际 F12 调整) ---
-        // 策略：找到所有的消息气泡，只监听新增的消息（索引 >= messageCountBefore）
-        // 假设 DeepSeek 的回复都包含在某个特定的 div class 里，比如 "ds-markdown" 或 "message-content"
-        String responseSelector = ".ds-markdown";
-
-        // 等待新的回复框出现（消息数量增加）
-        Locator allResponseLocators = page.locator(responseSelector);
-        int maxWaitTime = 30000; // 最多等待30秒
-        long waitStartTime = System.currentTimeMillis();
-        while (allResponseLocators.count() <= messageCountBefore) {
-            if (System.currentTimeMillis() - waitStartTime > maxWaitTime) {
-                throw new RuntimeException("等待新消息超时");
-            }
-            Thread.sleep(100);
-        }
-
-        log.info("检测到新消息，当前消息数量: {} (之前: {})", allResponseLocators.count(), messageCountBefore);
-
-        // 只监听新增的消息（最后一个）
-        // 这是一个简单的轮询逻辑
-        // 生产环境建议使用 mutation observer (JS注入) 以获得更低延迟
-        StringBuilder collectedText = new StringBuilder();
-        long startTime = System.currentTimeMillis();
-        String id = UUID.randomUUID().toString();
-
-        String lastFullText = "";
-        int noChangeCount = 0;
-
-        while (true) {
-            try {
-                // 获取最后一个回复框的文本（只获取新增的消息）
-                Locator currentResponseLocators = page.locator(responseSelector);
-                int currentCount = currentResponseLocators.count();
-
-                if (currentCount <= messageCountBefore) {
-                    // 如果消息数量没有增加，说明还没有新消息
-                    Thread.sleep(100);
-                    continue;
-                }
-
-                // 获取最后一个消息的文本（这是新增的消息）
-                String fullText = currentResponseLocators.nth(currentCount - 1).innerText();
-
-                if (fullText.length() > collectedText.length()) {
-                    // 计算增量 (Delta)
-                    String delta = fullText.substring(collectedText.length());
-                    collectedText.append(delta);
-                    noChangeCount = 0; // 重置无变化计数
-
-                    // 发送 SSE 消息 (OpenAI 格式)
-                    log.debug("发送增量: {}", delta);
-                    sendSseChunk(emitter, id, delta, request.getModel());
-                } else if (fullText.equals(lastFullText) && fullText.length() > 0) {
-                    // 文本没有变化
-                    noChangeCount++;
-                    // 如果连续 20 次（2秒）没有变化，且文本不为空，认为生成完成
-                    if (noChangeCount >= 20) {
-                        log.info("检测到文本不再变化，生成完成。总长度: {}", fullText.length());
-                        break;
-                    }
-                }
-
-                lastFullText = fullText;
-
-                // 判断结束条件：
-                // 1. 出现了 "Regenerate" (重新生成) 按钮，说明生成结束了
-                // 2. 或者 "Stop generating" 按钮消失了
-                // 这里用一个简单的超时兜底，防止死循环
-                if (System.currentTimeMillis() - startTime > 120000) { // 2分钟超时
-                    log.warn("达到超时时间，结束监听");
-                    break;
-                }
-
-                Thread.sleep(100); // 稍微休眠，避免 CPU 100%
-            } catch (Exception e) {
-                log.error("监听响应时出错", e);
-                // 如果出错，尝试发送已收集的文本
-                if (collectedText.length() > 0) {
-                    break; // 跳出循环，发送完成标记
-                }
-                throw e;
-            }
-        }
-
-        // 发送 [DONE]
         sendDone(emitter);
     }
 

@@ -1,5 +1,6 @@
 package site.newbie.web.llm.api.controller;
 
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -12,6 +13,7 @@ import site.newbie.web.llm.api.provider.ProviderRegistry;
 
 import java.util.Map;
 
+@Slf4j
 @RestController
 @RequestMapping("/v1")
 @CrossOrigin(origins = "*")
@@ -28,6 +30,7 @@ public class OpenAiController {
             @RequestBody ChatCompletionRequest request,
             @RequestHeader(value = "X-New-Conversation", required = false) String newConversationHeader,
             @RequestHeader(value = "X-Thinking", required = false) String thinkingHeader,
+            @RequestHeader(value = "X-Web-Search", required = false) String webSearchHeader,
             @RequestHeader(value = "X-Conversation-URL", required = false) String conversationUrlHeader) {
         try {
             // 1. 简单的参数校验
@@ -58,14 +61,20 @@ public class OpenAiController {
             if (thinkingHeader != null && !thinkingHeader.isEmpty()) {
                 request.setThinking(Boolean.parseBoolean(thinkingHeader));
             }
+
+            // 4. 从 Header 读取 webSearch（如果请求体中没有设置）
+            if (webSearchHeader != null && !webSearchHeader.isEmpty()) {
+                request.setWebSearch(Boolean.parseBoolean(webSearchHeader));
+            }
             
-            // 4. 从 Header 读取 conversationUrl（如果请求体中没有设置）
+            // 5. 从 Header 读取 conversationUrl（如果请求体中没有设置）
             if (conversationUrlHeader != null && !conversationUrlHeader.isEmpty()) {
                 request.setConversationUrl(conversationUrlHeader);
             }
 
-            System.out.println("收到请求: 模型=" + request.getModel() + ", 新对话=" + request.isNewConversation() + 
-                    ", 深度思考=" + request.isThinking() + ", 对话URL=" + request.getConversationUrl() + ", 消息数=" + request.getMessages().size());
+            log.info("收到请求: 模型=" + request.getModel() + ", 新对话=" + request.isNewConversation() +
+                    ", 深度思考=" + request.isThinking() + ", 联网搜索=" + request.isWebSearch() +
+                    ", 对话URL=" + request.getConversationUrl() + ", 消息数=" + request.getMessages().size());
         } catch (Exception e) {
             System.err.println("解析请求时出错: " + e.getMessage());
             e.printStackTrace();

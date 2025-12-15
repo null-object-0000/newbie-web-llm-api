@@ -32,6 +32,10 @@ public class ChatCompletionRequest {
     // 是否启用深度思考模式（DeepSeek Think）
     @Builder.Default
     private Boolean thinking = false;
+
+    // 是否启用联网搜索（仅对支持的模型生效，例如 DeepSeek Web 搜索）
+    @Builder.Default
+    private Boolean webSearch = false;
     
     // 对话 URL（用于继续特定对话）
     private String conversationUrl;
@@ -47,6 +51,10 @@ public class ChatCompletionRequest {
     
     public boolean isThinking() {
         return thinking != null && thinking;
+    }
+
+    public boolean isWebSearch() {
+        return webSearch != null && webSearch;
     }
 
     // 内部类：消息结构

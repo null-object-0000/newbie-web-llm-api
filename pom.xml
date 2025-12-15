@@ -12,9 +12,7 @@
     <artifactId>web.llm.api</artifactId>
     <version>0.0.1-SNAPSHOT</version>
     <name>newbie-web-llm-api</name>
-    <description>Turn web-based LLMs (e.g., DeepSeek) into standard OpenAI-compatible APIs. （将网页版 LLM 转换为标准的
-        OpenAI 兼容 API。）
-    </description>
+    <description>Turn web-based LLMs (e.g., DeepSeek) into standard OpenAI-compatible APIs. （将网页版 LLM 转换为标准的 OpenAI 兼容 API。）</description>
     <url/>
     <licenses>
         <license/>
