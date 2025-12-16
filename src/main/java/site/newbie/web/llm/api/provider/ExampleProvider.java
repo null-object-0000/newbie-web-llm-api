@@ -4,8 +4,10 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import site.newbie.web.llm.api.model.ChatCompletionRequest;
+import site.newbie.web.llm.api.model.ChatCompletionResponse;
 import tools.jackson.databind.ObjectMapper;
 
+import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
@@ -18,12 +20,13 @@ import java.util.concurrent.Executors;
  */
 @Slf4j
 @Component
-public class ExampleProvider extends BaseProvider {
+public class ExampleProvider implements LLMProvider {
     
+    private final ObjectMapper objectMapper;
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
     
     public ExampleProvider(ObjectMapper objectMapper) {
-        super(objectMapper);
+        this.objectMapper = objectMapper;
     }
     
     @Override
@@ -58,5 +61,20 @@ public class ExampleProvider extends BaseProvider {
             }
         });
     }
+    
+    private void sendSseChunk(SseEmitter emitter, String id, String content, String model) throws IOException {
+        ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
+                .delta(ChatCompletionResponse.Delta.builder().content(content).build())
+                .index(0).build();
+        ChatCompletionResponse response = ChatCompletionResponse.builder()
+                .id(id).object("chat.completion.chunk")
+                .created(System.currentTimeMillis() / 1000)
+                .model(model).choices(List.of(choice)).build();
+        emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(response)));
+    }
+    
+    private void sendDone(SseEmitter emitter) throws IOException {
+        emitter.send(SseEmitter.event().data("[DONE]"));
+        emitter.complete();
+    }
 }
-
