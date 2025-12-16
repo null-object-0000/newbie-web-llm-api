@@ -4,6 +4,7 @@ import com.microsoft.playwright.Locator;
 import com.microsoft.playwright.Page;
 import lombok.extern.slf4j.Slf4j;
 import jakarta.annotation.PreDestroy;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import site.newbie.web.llm.api.manager.BrowserManager;
@@ -14,11 +15,9 @@ import tools.jackson.databind.ObjectMapper;
 import java.io.IOException;
 import java.util.List;
 import java.util.UUID;
-import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.LinkedBlockingQueue;
 
 @Slf4j
 @Component
@@ -32,6 +31,14 @@ public class DeepSeekProvider extends BaseProvider {
     private final ConcurrentHashMap<String, Page> modelPages = new ConcurrentHashMap<>();
     // 记录每个页面的 URL（key: model, value: url）
     private final ConcurrentHashMap<String, String> pageUrls = new ConcurrentHashMap<>();
+    
+    /**
+     * 监听模式：true 使用 SSE 拦截数据实时流，false 使用 DOM 解析
+     * 可通过 application.properties 中的 deepseek.monitor.mode 配置来切换
+     * 可选值：sse（SSE 实时流模式）或 dom（DOM 解析模式，默认）
+     */
+    @Value("${deepseek.monitor.mode:dom}")
+    private String monitorMode;
     
     /**
      * 根据 URL 查找对应的页面
@@ -163,9 +170,7 @@ public class DeepSeekProvider extends BaseProvider {
                     shouldClosePage = false; // 不关闭，保存复用
                 }
 
-                // 为当前请求创建 SSE 内容队列（每次请求都需要新的队列）
                 // 在页面创建后设置 SSE 拦截器
-                BlockingQueue<String> sseContentQueue = new LinkedBlockingQueue<>();
                 setupSseInterceptor(page);
 
                 // 3. 如果是新对话，点击"新对话"按钮
@@ -472,9 +477,14 @@ public class DeepSeekProvider extends BaseProvider {
                     log.info("检测到初始 SSE 数据，长度: {}", initialSseData.length());
                 }
 
-                // 11. 使用混合方式监听回复：DOM 实时流式 + SSE 最终修正
-                log.info("开始监听 AI 回复（DOM 实时 + SSE 修正）...");
-                monitorResponseHybrid(page, emitter, request, messageCountBefore);
+                // 11. 根据配置选择监听方式
+                if ("sse".equalsIgnoreCase(monitorMode)) {
+                    log.info("开始监听 AI 回复（SSE 拦截数据实时流模式）...");
+                    monitorResponseSse(page, emitter, request, messageCountBefore);
+                } else {
+                    log.info("开始监听 AI 回复（DOM 实时 + SSE 修正模式）...");
+                    monitorResponseHybrid(page, emitter, request, messageCountBefore);
+                }
 
             } catch (Exception e) {
                 log.error("Chat Error", e);
@@ -668,7 +678,7 @@ public class DeepSeekProvider extends BaseProvider {
                             if (window.__deepseekSseData && window.__deepseekSseData.length > 0) {
                                 const data = window.__deepseekSseData.join('\\n');
                                 window.__deepseekSseData = []; // 清空已读取的数据
-                                console.log('[SSE Interceptor] Returning data, length:', data.length);
+                                console.log('[SSE Interceptor] Returning data, length:', data.length, data);
                                 return data;
                             }
                             return null;
@@ -678,7 +688,7 @@ public class DeepSeekProvider extends BaseProvider {
             if (result != null) {
                 String data = result.toString();
                 if (!data.isEmpty()) {
-                    log.debug("从页面获取到 SSE 数据，长度: {}", data.length());
+                    log.info("从页面获取到 SSE 数据，长度: {}", data.length());
                 }
                 return data;
             }
@@ -730,6 +740,471 @@ public class DeepSeekProvider extends BaseProvider {
         }
         
         return !text.isEmpty() ? text.toString() : null;
+    }
+
+    /**
+     * SSE 数据解析结果
+     */
+    private static class SseParseResult {
+        String thinkingContent;  // 思考内容增量
+        String responseContent;  // 最终回复增量
+        boolean finished;         // 是否完成
+        
+        SseParseResult(String thinkingContent, String responseContent, boolean finished) {
+            this.thinkingContent = thinkingContent;
+            this.responseContent = responseContent;
+            this.finished = finished;
+        }
+    }
+
+    /**
+     * 增量解析 SSE 数据，区分思考内容和最终回复
+     * 根据实际 DeepSeek SSE 数据格式解析：
+     * - fragment 创建：{"v": [{"id": 1, "type": "THINK", ...}], "p": "fragments", "o": "APPEND"}
+     * - 内容更新：{"v": "xxx", "p": "response/fragments/0/content", "o": "APPEND"}
+     * - 简单格式：{"v": "xxx"} (需要根据上下文判断)
+     * 
+     * @param sseData 新的 SSE 数据（增量）
+     * @param fragmentTypeMap fragment 数组索引到类型的映射（用于根据 path 判断类型）
+     * @param lastActiveFragmentIndex 上次活跃的 fragment 索引（用于判断简单格式的类型）
+     * @return 解析结果，包含思考内容和回复内容的增量，以及当前活跃的 fragment 索引
+     */
+    private static class ParseResultWithIndex {
+        SseParseResult result;
+        Integer lastActiveFragmentIndex;
+        
+        ParseResultWithIndex(SseParseResult result, Integer lastActiveFragmentIndex) {
+            this.result = result;
+            this.lastActiveFragmentIndex = lastActiveFragmentIndex;
+        }
+    }
+    
+    private ParseResultWithIndex parseSseIncremental(String sseData, java.util.Map<Integer, String> fragmentTypeMap, Integer lastActiveFragmentIndex) {
+        if (sseData == null || sseData.isEmpty()) {
+            return new ParseResultWithIndex(new SseParseResult(null, null, false), lastActiveFragmentIndex);
+        }
+        
+        StringBuilder thinkingText = new StringBuilder();
+        StringBuilder responseText = new StringBuilder();
+        boolean finished = false;
+        String currentEvent = null;
+        Integer currentActiveIndex = lastActiveFragmentIndex;
+        
+        String[] lines = sseData.split("\n");
+        
+        for (String line : lines) {
+            line = line.trim();
+            
+            // 检查完成标记
+            if (line.startsWith("event: ")) {
+                currentEvent = line.substring(7).trim();
+                if ("finish".equals(currentEvent) || "close".equals(currentEvent)) {
+                    finished = true;
+                }
+                continue;
+            }
+            
+            if (line.startsWith("data: ")) {
+                String jsonStr = line.substring(6).trim();
+                if (jsonStr.isEmpty() || jsonStr.equals("{}")) {
+                    continue;
+                }
+                
+                try {
+                    JsonNode json = objectMapper.readTree(jsonStr);
+                    
+                    // 提取 path 和 operation
+                    String path = null;
+                    String operation = null;
+                    if (json.has("p") && json.get("p").isString()) {
+                        path = json.get("p").asString();
+                    }
+                    if (json.has("o") && json.get("o").isString()) {
+                        operation = json.get("o").asString();
+                    }
+                    
+                    boolean isThinking = false;
+                    String content = null;
+                    
+                    // 情况1: fragment 创建 - {"v": [{"id": 1, "type": "THINK", ...}], "p": "fragments", "o": "APPEND"}
+                    // fragment 按创建顺序分配数组索引（第一个是 0，第二个是 1，以此类推）
+                    if ("fragments".equals(path) && "APPEND".equals(operation) && json.has("v") && json.get("v").isArray()) {
+                        JsonNode fragments = json.get("v");
+                        // 找到当前最大的索引，新 fragment 从下一个索引开始
+                        int nextIndex = fragmentTypeMap.isEmpty() ? 0 : 
+                                       fragmentTypeMap.keySet().stream().mapToInt(Integer::intValue).max().orElse(-1) + 1;
+                        
+                        for (JsonNode fragment : fragments) {
+                            if (fragment.has("type") && fragment.get("type").isString()) {
+                                String type = fragment.get("type").asString();
+                                // 使用数组索引（不是 fragment id）作为 key
+                                fragmentTypeMap.put(nextIndex, type);
+                                
+                                // 如果 fragment 创建时就有初始内容，必须提取并返回
+                                if (fragment.has("content") && fragment.get("content").isString()) {
+                                    String fragmentContent = fragment.get("content").asString();
+                                    if (!fragmentContent.isEmpty()) {
+                                        if ("THINK".equals(type)) {
+                                            thinkingText.append(fragmentContent);
+                                            log.info("从 fragment 创建提取思考内容 (索引 {}): {}", nextIndex, fragmentContent);
+                                        } else if ("RESPONSE".equals(type)) {
+                                            responseText.append(fragmentContent);
+                                            log.info("从 fragment 创建提取回复内容 (索引 {}): {}", nextIndex, fragmentContent);
+                                        }
+                                    } else {
+                                        log.warn("Fragment 创建时 content 为空，类型: {}, 索引: {}", type, nextIndex);
+                                    }
+                                } else {
+                                    log.debug("Fragment 创建时没有 content 字段，类型: {}, 索引: {}", type, nextIndex);
+                                }
+                                
+                                nextIndex++;
+                            }
+                        }
+                        // 注意：这里不 continue，让后续逻辑也能处理，但实际上 fragment 创建后应该继续处理其他数据
+                        // 但为了确保初始内容被返回，我们需要继续处理
+                        continue;
+                    }
+                    
+                    // 情况2: 内容更新 - {"v": "xxx", "p": "response/fragments/0/content", "o": "APPEND"}
+                    if (path != null && path.startsWith("response/fragments/") && path.endsWith("/content")) {
+                        // 提取 fragment 索引：response/fragments/0/content -> 0
+                        try {
+                            String[] pathParts = path.split("/");
+                            if (pathParts.length >= 3) {
+                                int fragmentIndex = Integer.parseInt(pathParts[2]);
+                                currentActiveIndex = fragmentIndex; // 更新当前活跃的 fragment 索引
+                                
+                                String fragmentType = fragmentTypeMap.get(fragmentIndex);
+                                
+                                if (fragmentType != null) {
+                                    if ("THINK".equals(fragmentType)) {
+                                        isThinking = true;
+                                    } else if ("RESPONSE".equals(fragmentType)) {
+                                        isThinking = false;
+                                    }
+                                    log.debug("内容更新 - fragment 索引: {}, 类型: {}", fragmentIndex, fragmentType);
+                                } else {
+                                    // fragment 类型未知，根据索引推断（通常索引 0 是思考，索引 1 是回复）
+                                    log.warn("Fragment 类型未知，索引: {}，尝试推断", fragmentIndex);
+                                    if (fragmentIndex == 0) {
+                                        isThinking = true; // 通常第一个 fragment 是思考
+                                    } else {
+                                        isThinking = false; // 其他是回复
+                                    }
+                                }
+                            }
+                        } catch (NumberFormatException e) {
+                            log.debug("解析 fragment 索引失败: {}", path);
+                        }
+                        
+                        // 提取内容
+                        if (json.has("v")) {
+                            JsonNode vNode = json.get("v");
+                            if (vNode.isString()) {
+                                content = vNode.asString();
+                                log.debug("提取内容更新: {} (思考: {})", content, isThinking);
+                            }
+                        }
+                    }
+                    // 情况3: 简单格式 - {"v": "xxx"} (根据当前活跃的 fragment 类型判断)
+                    // 从实际数据看，简单格式通常出现在 fragment 内容更新之后，是增量内容
+                    // 我们根据最近更新的 fragment 索引来判断
+                    else if (json.has("v") && !json.has("p")) {
+                        JsonNode vNode = json.get("v");
+                        if (vNode.isString()) {
+                            content = vNode.asString();
+                            
+                            // 优先根据当前活跃的 fragment 索引判断
+                            if (currentActiveIndex != null) {
+                                String fragmentType = fragmentTypeMap.get(currentActiveIndex);
+                                if (fragmentType != null) {
+                                    isThinking = "THINK".equals(fragmentType);
+                                    log.debug("简单格式 - 根据活跃索引 {} (类型: {}) 判断为: {}", 
+                                            currentActiveIndex, fragmentType, isThinking ? "思考" : "回复");
+                                } else {
+                                    // 类型未知，根据索引推断
+                                    isThinking = (currentActiveIndex == 0);
+                                    log.debug("简单格式 - 根据活跃索引 {} (类型未知) 推断为: {}", 
+                                            currentActiveIndex, isThinking ? "思考" : "回复");
+                                }
+                            } else {
+                                // 没有活跃索引，根据 fragmentTypeMap 判断
+                                boolean hasThink = fragmentTypeMap.containsValue("THINK");
+                                boolean hasResponse = fragmentTypeMap.containsValue("RESPONSE");
+                                
+                                if (hasThink && !hasResponse) {
+                                    // 只有思考 fragment，认为是思考内容
+                                    isThinking = true;
+                                } else if (hasResponse) {
+                                    // 有回复 fragment，认为是回复内容
+                                    isThinking = false;
+                                } else if (hasThink) {
+                                    // 有思考也有回复，根据最近更新的类型判断（简化：优先认为是回复）
+                                    isThinking = false;
+                                }
+                                log.debug("简单格式 - 根据 fragmentTypeMap 判断为: {}", isThinking ? "思考" : "回复");
+                            }
+                        }
+                    }
+                    // 情况4: BATCH 操作 - {"v": [...], "p": "response", "o": "BATCH"}
+                    // BATCH 操作可能包含 fragment 创建和内容更新
+                    else if ("response".equals(path) && "BATCH".equals(operation) && json.has("v") && json.get("v").isArray()) {
+                        JsonNode batchData = json.get("v");
+                        // 找到当前最大的索引，新 fragment 从下一个索引开始
+                        int nextIndex = fragmentTypeMap.isEmpty() ? 0 : 
+                                       fragmentTypeMap.keySet().stream().mapToInt(Integer::intValue).max().orElse(-1) + 1;
+                        
+                        for (JsonNode item : batchData) {
+                            if (item.has("p") && item.has("v")) {
+                                String itemPath = item.get("p").asString();
+                                String itemOperation = item.has("o") && item.get("o").isString() ? item.get("o").asString() : null;
+                                
+                                // 处理 fragment 创建（在 BATCH 中）
+                                if ("fragments".equals(itemPath) && "APPEND".equals(itemOperation) && item.get("v").isArray()) {
+                                    JsonNode fragments = item.get("v");
+                                    for (JsonNode fragment : fragments) {
+                                        if (fragment.has("type") && fragment.get("type").isString()) {
+                                            String type = fragment.get("type").asString();
+                                            fragmentTypeMap.put(nextIndex, type);
+                                            
+                                            // 提取 fragment 创建时的初始内容
+                                            if (fragment.has("content") && fragment.get("content").isString()) {
+                                                String fragmentContent = fragment.get("content").asString();
+                                                if (!fragmentContent.isEmpty()) {
+                                                    if ("THINK".equals(type)) {
+                                                        thinkingText.append(fragmentContent);
+                                                        log.info("从 BATCH 中 fragment 创建提取思考内容 (索引 {}): {}", nextIndex, fragmentContent);
+                                                    } else if ("RESPONSE".equals(type)) {
+                                                        responseText.append(fragmentContent);
+                                                        log.info("从 BATCH 中 fragment 创建提取回复内容 (索引 {}): {}", nextIndex, fragmentContent);
+                                                    }
+                                                }
+                                            }
+                                            
+                                            nextIndex++;
+                                        }
+                                    }
+                                }
+                                // 处理内容更新（在 BATCH 中）
+                                else if (itemPath.startsWith("response/fragments/") && itemPath.endsWith("/content")) {
+                                    try {
+                                        String[] pathParts = itemPath.split("/");
+                                        if (pathParts.length >= 3) {
+                                            int fragmentIndex = Integer.parseInt(pathParts[2]);
+                                            currentActiveIndex = fragmentIndex; // 更新当前活跃的 fragment 索引
+                                            
+                                            String fragmentType = fragmentTypeMap.get(fragmentIndex);
+                                            
+                                            JsonNode itemValue = item.get("v");
+                                            String itemContent = null;
+                                            if (itemValue.isString()) {
+                                                itemContent = itemValue.asString();
+                                            }
+                                            
+                                            if (itemContent != null && !itemContent.isEmpty()) {
+                                                if ("THINK".equals(fragmentType)) {
+                                                    thinkingText.append(itemContent);
+                                                } else if ("RESPONSE".equals(fragmentType)) {
+                                                    responseText.append(itemContent);
+                                                }
+                                            }
+                                        }
+                                    } catch (Exception e) {
+                                        log.debug("解析 BATCH 中的内容更新失败: {}", e.getMessage());
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    
+                    // 输出内容
+                    if (content != null && !content.isEmpty()) {
+                        if (isThinking) {
+                            thinkingText.append(content);
+                        } else {
+                            responseText.append(content);
+                        }
+                    }
+                } catch (Exception e) {
+                    log.debug("解析 SSE JSON 时出错: {}", e.getMessage());
+                }
+            }
+        }
+        
+        String thinking = thinkingText.length() > 0 ? thinkingText.toString() : null;
+        String response = responseText.length() > 0 ? responseText.toString() : null;
+        
+        // 记录解析结果，确保初始内容被包含
+        if (thinking != null && !thinking.isEmpty()) {
+            log.info("解析结果 - 思考内容长度: {}, 内容: {}", thinking.length(), 
+                     thinking.length() > 50 ? thinking.substring(0, 50) + "..." : thinking);
+        }
+        if (response != null && !response.isEmpty()) {
+            log.info("解析结果 - 回复内容长度: {}, 内容: {}", response.length(),
+                     response.length() > 50 ? response.substring(0, 50) + "..." : response);
+        }
+        
+        SseParseResult result = new SseParseResult(thinking, response, finished);
+        return new ParseResultWithIndex(result, currentActiveIndex);
+    }
+
+    /**
+     * 基于 SSE 拦截数据的实时流式监听
+     * 直接从网络拦截的 SSE 数据中提取内容，实时流式输出
+     * 根据实际 DeepSeek SSE 数据格式解析思考内容和回复内容
+     */
+    private void monitorResponseSse(Page page, SseEmitter emitter, ChatCompletionRequest request,
+                                   int messageCountBefore)
+            throws IOException, InterruptedException {
+        boolean enableThinking = request.isThinking();
+        String id = UUID.randomUUID().toString();
+        StringBuilder collectedThinkingText = new StringBuilder();
+        StringBuilder collectedResponseText = new StringBuilder();
+        long startTime = System.currentTimeMillis();
+        boolean finished = false;
+        int noDataCount = 0;
+        
+        // 维护 fragment 索引到类型的映射（用于根据 path 判断是思考还是回复）
+        java.util.Map<Integer, String> fragmentTypeMap = new java.util.concurrent.ConcurrentHashMap<>();
+        // 维护当前活跃的 fragment 索引（用于判断简单格式的类型）
+        Integer lastActiveFragmentIndex = null;
+
+        log.info("开始 SSE 实时流式监听（思考模式: {}）", enableThinking);
+
+        while (!finished) {
+            try {
+                // 检查页面状态
+                if (page.isClosed()) {
+                    log.warn("页面已关闭，结束监听");
+                    break;
+                }
+
+                // 从 SSE 数据获取内容
+                String sseData = getSseDataFromPage(page);
+                
+                if (sseData != null && !sseData.isEmpty()) {
+                    // 有新的数据
+                    noDataCount = 0;
+                    
+                    // 解析新增的 SSE 数据（传入 fragmentTypeMap 和 lastActiveFragmentIndex）
+                    ParseResultWithIndex parseResult = parseSseIncremental(sseData, fragmentTypeMap, lastActiveFragmentIndex);
+                    SseParseResult result = parseResult.result;
+                    lastActiveFragmentIndex = parseResult.lastActiveFragmentIndex; // 更新活跃索引
+                    
+                    // 发送思考内容增量（从 SSE 数据中提取）
+                    if (enableThinking && result.thinkingContent != null && 
+                        !result.thinkingContent.isEmpty()) {
+                        collectedThinkingText.append(result.thinkingContent);
+                        log.info("从 SSE 发送思考内容增量，长度: {}, 内容: {}", 
+                                result.thinkingContent.length(),
+                                result.thinkingContent.length() > 20 ? 
+                                result.thinkingContent.substring(0, 20) + "..." : result.thinkingContent);
+                        sendThinkingContent(emitter, id, result.thinkingContent, request.getModel());
+                    }
+                    
+                    // 发送回复内容增量
+                    if (result.responseContent != null && !result.responseContent.isEmpty()) {
+                        collectedResponseText.append(result.responseContent);
+                        log.info("从 SSE 发送回复内容增量，长度: {}, 内容: {}", 
+                                result.responseContent.length(),
+                                result.responseContent.length() > 20 ? 
+                                result.responseContent.substring(0, 20) + "..." : result.responseContent);
+                        sendSseChunk(emitter, id, result.responseContent, request.getModel());
+                    }
+                    
+                    // 检查是否完成
+                    if (result.finished) {
+                        finished = true;
+                        log.info("SSE 流已完成");
+                    }
+                } else {
+                    // 没有新数据
+                    noDataCount++;
+                    
+                    // 如果长时间没有新数据，检查是否完成
+                    if (noDataCount > 50) { // 5秒没有新数据
+                        // 尝试从页面获取完整的 SSE 数据检查完成标记
+                        try {
+                            Object fullData = page.evaluate("""
+                                () => {
+                                    if (window.__deepseekSseData && window.__deepseekSseData.length > 0) {
+                                        return window.__deepseekSseData.join('\\n');
+                                    }
+                                    return null;
+                                }
+                            """);
+                            
+                            if (fullData != null) {
+                                String fullSseData = fullData.toString();
+                                if (fullSseData.contains("event: finish") || 
+                                    fullSseData.contains("event: close")) {
+                                    finished = true;
+                                    log.info("检测到完成标记，结束监听");
+                                }
+                            }
+                        } catch (Exception e) {
+                            log.debug("检查完成标记时出错: {}", e.getMessage());
+                        }
+                        
+                        if (!finished && noDataCount > 200) { // 20秒没有新数据，超时
+                            log.warn("长时间没有新数据，结束监听");
+                            finished = true;
+                        }
+                    }
+                }
+
+                // 超时检查
+                if (System.currentTimeMillis() - startTime > 120000) {
+                    log.warn("达到超时时间，结束监听");
+                    break;
+                }
+
+                Thread.sleep(100);
+            } catch (Exception e) {
+                // 检查是否是页面关闭或导航导致的错误
+                if (page.isClosed()) {
+                    log.warn("页面已关闭，结束监听");
+                    break;
+                }
+
+                // 如果是 Playwright 连接错误，可能是页面状态变化，尝试继续
+                if (e.getMessage() != null &&
+                        (e.getMessage().contains("Cannot find command") ||
+                                e.getMessage().contains("Target closed") ||
+                                e.getMessage().contains("Session closed"))) {
+                    log.warn("检测到页面状态变化，尝试继续监听: {}", e.getMessage());
+                    Thread.sleep(500);
+                    continue;
+                }
+
+                log.error("SSE 监听时出错", e);
+                if (!collectedResponseText.isEmpty()) {
+                    log.info("已收集部分内容，长度: {}，结束监听", collectedResponseText.length());
+                    break;
+                }
+                throw e;
+            }
+        }
+
+        // 发送对话 URL
+        try {
+            if (!page.isClosed()) {
+                String currentUrl = page.url();
+                if (currentUrl.contains("chat.deepseek.com")) {
+                    String model = request.getModel();
+                    pageUrls.put(model, currentUrl);
+                    String urlId = UUID.randomUUID().toString();
+                    sendConversationUrl(emitter, urlId, currentUrl, model);
+                    log.info("已发送对话 URL: {}", currentUrl);
+                }
+            }
+        } catch (Exception e) {
+            log.warn("发送对话 URL 时出错: {}", e.getMessage());
+        }
+
+        sendDone(emitter);
     }
 
     /**
