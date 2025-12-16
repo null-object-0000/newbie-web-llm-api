@@ -30,10 +30,28 @@ public class ChatCompletionResponse {
         private ChatCompletionRequest.Message message;
         
         // 流式模式下使用 delta
-        private ChatCompletionRequest.Message delta;
+        private Delta delta;
 
         // 停止原因 (null, "stop", "length")
         @JsonProperty("finish_reason")
         private String finishReason;
+    }
+    
+    /**
+     * 流式响应中的增量数据
+     * 兼容 OpenAI API 格式，支持 reasoning_content（思考内容）和 content（最终回复）
+     */
+    @Data
+    @Builder
+    public static class Delta {
+        // 角色（通常为 "assistant"）
+        private String role;
+        
+        // 最终回复内容
+        private String content;
+        
+        // 思考内容（reasoning content，用于 o1/o3 等推理模型）
+        @JsonProperty("reasoning_content")
+        private String reasoningContent;
     }
 }

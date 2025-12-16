@@ -28,8 +28,6 @@ public class OpenAiController {
     @PostMapping(value = "/chat/completions", produces = {MediaType.TEXT_EVENT_STREAM_VALUE, MediaType.APPLICATION_JSON_VALUE})
     public Object chat(
             @RequestBody ChatCompletionRequest request,
-            @RequestHeader(value = "X-New-Conversation", required = false) String newConversationHeader,
-            @RequestHeader(value = "X-Thinking", required = false) String thinkingHeader,
             @RequestHeader(value = "X-Web-Search", required = false) String webSearchHeader,
             @RequestHeader(value = "X-Conversation-URL", required = false) String conversationUrlHeader) {
         try {
@@ -52,28 +50,23 @@ public class OpenAiController {
                         .body(Map.of("error", Map.of("message", "Model is required", "type", "invalid_request_error")));
             }
 
-            // 2. 从 Header 读取 newConversation（如果请求体中没有设置）
-            if (newConversationHeader != null && !newConversationHeader.isEmpty()) {
-                request.setNewConversation(Boolean.parseBoolean(newConversationHeader));
-            }
-            
-            // 3. 从 Header 读取 thinking（如果请求体中没有设置）
-            if (thinkingHeader != null && !thinkingHeader.isEmpty()) {
-                request.setThinking(Boolean.parseBoolean(thinkingHeader));
-            }
-
-            // 4. 从 Header 读取 webSearch（如果请求体中没有设置）
+            // 2. 从 Header 读取 webSearch（如果请求体中没有设置）
+            // 注意：是否新对话现在完全根据是否有 conversationUrl 来判断，不再接收外部参数
             if (webSearchHeader != null && !webSearchHeader.isEmpty()) {
                 request.setWebSearch(Boolean.parseBoolean(webSearchHeader));
             }
             
-            // 5. 从 Header 读取 conversationUrl（如果请求体中没有设置）
+            // 3. 从 Header 读取 conversationUrl（如果请求体中没有设置）
             if (conversationUrlHeader != null && !conversationUrlHeader.isEmpty()) {
                 request.setConversationUrl(conversationUrlHeader);
             }
 
-            log.info("收到请求: 模型=" + request.getModel() + ", 新对话=" + request.isNewConversation() +
-                    ", 深度思考=" + request.isThinking() + ", 联网搜索=" + request.isWebSearch() +
+            // 注意：
+            // - 深度思考模式现在完全根据模型名称自动判断，不再接收外部参数
+            // - 是否新对话现在完全根据是否有 conversationUrl 来判断，不再接收外部参数
+            boolean isNewConversation = (request.getConversationUrl() == null || request.getConversationUrl().isEmpty());
+            log.info("收到请求: 模型=" + request.getModel() + ", 新对话=" + isNewConversation +
+                    ", 联网搜索=" + request.isWebSearch() +
                     ", 对话URL=" + request.getConversationUrl() + ", 消息数=" + request.getMessages().size());
         } catch (Exception e) {
             System.err.println("解析请求时出错: " + e.getMessage());

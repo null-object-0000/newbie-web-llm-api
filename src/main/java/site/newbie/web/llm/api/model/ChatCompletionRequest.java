@@ -28,10 +28,6 @@ public class ChatCompletionRequest {
     // 是否新开对话（true: 新对话，false: 继续当前对话）
     @Builder.Default
     private Boolean newConversation = false;
-    
-    // 是否启用深度思考模式（DeepSeek Think）
-    @Builder.Default
-    private Boolean thinking = false;
 
     // 是否启用联网搜索（仅对支持的模型生效，例如 DeepSeek Web 搜索）
     @Builder.Default
@@ -47,10 +43,6 @@ public class ChatCompletionRequest {
     
     public boolean isNewConversation() {
         return newConversation != null && newConversation;
-    }
-    
-    public boolean isThinking() {
-        return thinking != null && thinking;
     }
 
     public boolean isWebSearch() {

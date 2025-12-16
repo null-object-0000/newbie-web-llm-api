@@ -758,13 +758,7 @@
                 <textarea id="promptInput" placeholder="发送消息..." rows="1" onkeydown="handleKeyDown(event)"></textarea>
                 <div class="input-toolbar">
                     <div class="input-options">
-                        <button class="option-btn" id="thinkingBtn" onclick="toggleOption('thinking')">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <circle cx="12" cy="12" r="3"></circle>
-                                <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"></path>
-                            </svg>
-                            <span>深度思考</span>
-                        </button>
+                        <!-- 深度思考模式现在完全根据模型名称自动判断，不再需要手动控制 -->
                         <button class="option-btn" id="webSearchBtn" onclick="toggleOption('webSearch')">
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <circle cx="12" cy="12" r="10"></circle>
@@ -787,7 +781,7 @@
 </main>
 
 <!-- 隐藏的 checkbox 用于保存状态 -->
-<input type="checkbox" id="thinkingToggle" style="display:none">
+<!-- 深度思考模式现在完全根据模型名称自动判断，不再需要手动控制 -->
 <input type="checkbox" id="webSearchToggle" style="display:none">
 
 <script type="module">
@@ -831,31 +825,98 @@
         checkbox.checked = btn.classList.contains('active');
     };
 
+    // 从历史对话中提取 URL（检查最后一条 assistant 消息是否包含 URL 标记）
+    function extractUrlFromHistory() {
+        if (conversationHistory.length === 0) return '';
+        
+        // 从后往前查找最后一条 assistant 消息
+        for (let i = conversationHistory.length - 1; i >= 0; i--) {
+            const msg = conversationHistory[i];
+            if (msg.role === 'assistant' && msg.content) {
+                const content = msg.content;
+                
+                // 检查新的 URL 标记格式
+                const startIdx = content.indexOf('__CONVERSATION_URL_START__');
+                const endIdx = content.indexOf('__CONVERSATION_URL_END__');
+                if (startIdx !== -1 && endIdx !== -1) {
+                    const url = content.substring(startIdx + '__CONVERSATION_URL_START__'.length, endIdx)
+                        .trim()
+                        .split('\n')
+                        .filter(line => line.trim() && !line.includes('__CONVERSATION_URL'))
+                        .join('')
+                        .trim();
+                    if (url) return url;
+                }
+                
+                // 向后兼容：检查旧的 __URL__ 标记格式
+                if (content.includes('__URL__')) {
+                    const urlMatch = content.match(/__URL__([^\n]+)/);
+                    if (urlMatch && urlMatch[1]) {
+                        return urlMatch[1].trim();
+                    }
+                }
+            }
+        }
+        
+        return '';
+    }
+
     // 自定义 fetch
     const customFetch = async (url, options = {}) => {
-        const newConv = window._currentNewConversation !== undefined 
-            ? String(window._currentNewConversation) : 'false';
-        
-        const thinking = document.getElementById('thinkingToggle')?.checked || false;
+        // 深度思考模式现在完全根据模型名称自动判断，不再传递参数
         const webSearch = document.getElementById('webSearchToggle')?.checked || false;
         
         const conversations = loadConversations();
         const currentConv = currentConversationId ? conversations[currentConversationId] : null;
-        const conversationUrl = currentConv?.url || '';
+        
+        // 根据后端新逻辑：只有传递了 conversationUrl 才复用，否则开启新对话
+        // 如果当前对话是新对话（没有历史消息），则不发送 URL，让后端开启新对话
+        const isNewConversation = conversationHistory.length === 0;
+        
+        // 优先使用保存的 URL，如果没有则从历史对话中提取
+        let conversationUrl = '';
+        if (!isNewConversation) {
+            // 先尝试从保存的对话中获取 URL
+            if (currentConv?.url) {
+                conversationUrl = currentConv.url;
+            } else {
+                // 如果保存的对话中没有 URL，从历史对话中提取
+                conversationUrl = extractUrlFromHistory();
+                // 如果提取到了 URL，保存到对话中
+                if (conversationUrl && currentConversationId) {
+                    if (!currentConv) {
+                        conversations[currentConversationId] = {
+                            id: currentConversationId,
+                            title: '新对话',
+                            messages: [...conversationHistory],
+                            url: conversationUrl,
+                            createdAt: Date.now(),
+                            updatedAt: Date.now()
+                        };
+                    } else {
+                        currentConv.url = conversationUrl;
+                    }
+                    saveConversations(conversations);
+                }
+            }
+        }
         
         let headers = new Headers(options.headers || {});
-        headers.set('X-New-Conversation', newConv);
-        headers.set('X-Thinking', String(thinking));
         headers.set('X-Web-Search', String(webSearch));
-        if (conversationUrl) {
+        // 只有在有 conversationUrl 时才发送，让后端复用对话
+        // 如果没有 conversationUrl，后端会自动开启新对话
+        if (conversationUrl && conversationUrl.includes('chat.deepseek.com')) {
             headers.set('X-Conversation-URL', conversationUrl);
         }
         
         if (options.method === 'POST' && options.body) {
             try {
                 const body = JSON.parse(options.body);
-                body.thinking = thinking;
                 body.webSearch = webSearch;
+                // 在请求体中也可以设置 conversationUrl（如果后端支持）
+                if (conversationUrl && conversationUrl.includes('chat.deepseek.com')) {
+                    body.conversationUrl = conversationUrl;
+                }
                 options.body = JSON.stringify(body);
             } catch (e) {}
         }
@@ -951,6 +1012,12 @@
     window.createNewConversation = function() {
         currentConversationId = generateId();
         conversationHistory = [];
+        // 清除当前对话的 URL，确保下次发送时不会复用旧对话
+        const conversations = loadConversations();
+        if (conversations[currentConversationId]) {
+            conversations[currentConversationId].url = '';
+            saveConversations(conversations);
+        }
         chatMessages.innerHTML = `
             <div class="welcome-screen" id="welcomeScreen">
                 <div class="welcome-logo">
@@ -1256,13 +1323,14 @@
         const { msgDiv, textEl } = appendMessage('assistant', '', true);
         let fullText = '';
         let thinkingEl = null;
+        // 用于累积 URL 标记内容（因为 URL 是分多次发送的）
+        let urlBuffer = '';
 
         isGenerating = true;
         sendBtn.disabled = true;
 
         try {
-            window._currentNewConversation = isNewConversation;
-            
+            // 不再需要设置 window._currentNewConversation，因为后端完全根据 conversationUrl 判断是否新对话
             const stream = await openai.chat.completions.create({
                 model,
                 messages: [...conversationHistory],
@@ -1270,11 +1338,60 @@
             });
 
             for await (const chunk of stream) {
-                const delta = chunk.choices[0]?.delta?.content;
-                if (!delta) continue;
+                const choice = chunk.choices[0];
+                if (!choice || !choice.delta) continue;
+                
+                const delta = choice.delta;
+                
+                // 处理思考内容（OpenAI API 兼容格式：reasoning_content）
+                if (delta.reasoning_content) {
+                    if (!thinkingEl) {
+                        thinkingEl = createThinkingBlock(msgDiv);
+                    }
+                    thinkingEl.textContent += delta.reasoning_content;
+                    chatContainer.scrollTop = chatContainer.scrollHeight;
+                    continue; // 思考内容不继续处理 content
+                }
+                
+                // 处理最终回复内容
+                const content = delta.content;
+                if (!content) continue;
 
-                if (delta.startsWith('__URL__')) {
-                    const url = delta.substring(7);
+                // 累积 URL 标记内容（因为 URL 是分多次发送的）
+                if (content.includes('__CONVERSATION_URL_START__') || 
+                    content.includes('__CONVERSATION_URL_END__') || 
+                    urlBuffer.length > 0) {
+                    urlBuffer += content;
+                    
+                    // 检查是否已经接收到完整的 URL 标记
+                    const startIdx = urlBuffer.indexOf('__CONVERSATION_URL_START__');
+                    const endIdx = urlBuffer.indexOf('__CONVERSATION_URL_END__');
+                    
+                    if (startIdx !== -1 && endIdx !== -1) {
+                        // 提取 URL（在开始标记和结束标记之间）
+                        const url = urlBuffer.substring(startIdx + '__CONVERSATION_URL_START__'.length, endIdx)
+                            .trim()
+                            .split('\n')
+                            .filter(line => line.trim() && !line.includes('__CONVERSATION_URL'))
+                            .join('')
+                            .trim();
+                        if (url && currentConversationId) {
+                            const conversations = loadConversations();
+                            if (conversations[currentConversationId]) {
+                                conversations[currentConversationId].url = url;
+                                saveConversations(conversations);
+                            }
+                        }
+                        // 清空缓冲区
+                        urlBuffer = '';
+                    }
+                    // 不显示 URL 标记内容，直接跳过
+                    continue;
+                }
+                
+                // 向后兼容：支持旧的 __URL__ 标记格式
+                if (content.startsWith('__URL__')) {
+                    const url = content.substring(7);
                     if (currentConversationId && url) {
                         const conversations = loadConversations();
                         if (conversations[currentConversationId]) {
@@ -1282,17 +1399,19 @@
                             saveConversations(conversations);
                         }
                     }
-                } else if (delta.startsWith('__THINKING__')) {
-                    const content = delta.substring(12);
+                    continue;
+                } else if (content.startsWith('__THINKING__')) {
+                    // 向后兼容：支持旧的 __THINKING__ 标记格式
+                    const thinkingContent = content.substring(12);
                     if (!thinkingEl) {
                         thinkingEl = createThinkingBlock(msgDiv);
                     }
-                    thinkingEl.textContent += content;
-                } else if (delta.startsWith('__REPLACE__')) {
-                    fullText = delta.substring(11);
+                    thinkingEl.textContent += thinkingContent;
+                } else if (content.startsWith('__REPLACE__')) {
+                    fullText = content.substring(11);
                     renderContent(textEl, fullText);
                 } else {
-                    fullText += delta;
+                    fullText += content;
                     renderContent(textEl, fullText);
                 }
                 
@@ -1311,7 +1430,6 @@
             textEl.innerHTML = `<span style="color: var(--danger);">错误: ${err.message}</span>`;
             conversationHistory.pop();
         } finally {
-            delete window._currentNewConversation;
             isGenerating = false;
             sendBtn.disabled = false;
         }

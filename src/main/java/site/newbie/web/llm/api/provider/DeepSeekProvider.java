@@ -40,17 +40,55 @@ public class DeepSeekProvider extends BaseProvider {
     @Value("${deepseek.monitor.mode:dom}")
     private String monitorMode;
     
+    // SSE 拦截器配置
+    private static final SseInterceptorConfig SSE_CONFIG = new SseInterceptorConfig(
+            "__deepseekSseData",
+            "__deepseekSseInterceptorSet",
+            new String[]{"/api/v0/chat/completion"},
+            true  // DeepSeek 需要拦截 XMLHttpRequest
+    );
+    
     /**
-     * 根据 URL 查找对应的页面
+     * 根据 URL 查找对应的页面（检查所有打开的 tab）
      */
-    private Page findPageByUrl(String model, String targetUrl) {
-        Page page = modelPages.get(model);
-        if (page != null && !page.isClosed()) {
-            String savedUrl = pageUrls.get(model);
-            if (savedUrl != null && savedUrl.equals(targetUrl)) {
-                return page;
+    private Page findPageByUrl(String targetUrl) {
+        if (targetUrl == null || targetUrl.isEmpty()) {
+            return null;
+        }
+        
+        // 首先检查 modelPages 中是否有匹配的页面
+        for (String model : modelPages.keySet()) {
+            Page page = modelPages.get(model);
+            if (page != null && !page.isClosed()) {
+                String savedUrl = pageUrls.get(model);
+                if (savedUrl != null && savedUrl.equals(targetUrl)) {
+                    log.info("在 modelPages 中找到匹配的页面，模型: {}, URL: {}", model, targetUrl);
+                    return page;
+                }
             }
         }
+        
+        // 检查所有打开的 tab 中是否已经打开过此链接
+        try {
+            List<Page> allPages = browserManager.getAllPages();
+            for (Page page : allPages) {
+                if (page != null && !page.isClosed()) {
+                    try {
+                        String currentUrl = page.url();
+                        if (currentUrl.equals(targetUrl)) {
+                            log.info("在所有打开的 tab 中找到匹配的页面，URL: {}", targetUrl);
+                            return page;
+                        }
+                    } catch (Exception e) {
+                        // 忽略获取 URL 时的错误（可能是页面正在关闭）
+                        log.debug("获取页面 URL 时出错: {}", e.getMessage());
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.warn("检查所有打开的 tab 时出错: {}", e.getMessage());
+        }
+        
         return null;
     }
 
@@ -66,7 +104,7 @@ public class DeepSeekProvider extends BaseProvider {
 
     @Override
     public List<String> getSupportedModels() {
-        return List.of("deepseek-web");
+        return List.of("deepseek-web-chat", "deepseek-web-reasoner");
     }
 
     /**
@@ -80,10 +118,75 @@ public class DeepSeekProvider extends BaseProvider {
             boolean shouldClosePage = false;
             try {
                 String model = request.getModel();
+                
+                // 根据模型名称自动判断是否需要深度思考模式（不再依赖外部参数）
+                boolean shouldEnableThinking = "deepseek-web-reasoner".equals(model);
+                if (shouldEnableThinking) {
+                    log.info("检测到 deepseek-web-reasoner 模型，自动启用深度思考模式");
+                } else {
+                    log.info("检测到 {} 模型，自动禁用深度思考模式", model);
+                }
 
                 // 1. 获取或创建页面
-                if (request.isNewConversation()) {
-                    // 新对话：关闭旧页面（如果存在），创建新页面
+                // 修改逻辑：只有传递了 conversationUrl 才复用，否则开启新对话
+                String conversationUrl = request.getConversationUrl();
+                
+                // 如果请求中没有传递 conversationUrl，尝试从历史对话中提取（使用基类的公共能力）
+                if ((conversationUrl == null || conversationUrl.isEmpty()) && request.getMessages() != null && !request.getMessages().isEmpty()) {
+                    String extractedUrl = extractUrlFromHistory(request, "chat.deepseek.com");
+                    if (extractedUrl != null && !extractedUrl.isEmpty()) {
+                        conversationUrl = extractedUrl;
+                        log.info("从历史对话中提取到 URL，将用于复用对话: {}", conversationUrl);
+                    }
+                }
+                
+                // 判断是否为新对话：完全根据是否有 conversationUrl 来判断
+                boolean isNewConversation = (conversationUrl == null || conversationUrl.isEmpty() || !conversationUrl.contains("chat.deepseek.com"));
+                
+                if (!isNewConversation) {
+                    // 有对话 URL：检查当前打开的 tab 中是否已经打开过此链接
+                    log.info("检测到对话 URL，尝试复用: {}", conversationUrl);
+                    
+                    // 检查所有打开的 tab 中是否已经打开过此链接
+                    page = findPageByUrl(conversationUrl);
+                    
+                    if (page != null && !page.isClosed()) {
+                        // 找到已打开的页面，直接复用
+                        String currentUrl = page.url();
+                        if (currentUrl.equals(conversationUrl)) {
+                            log.info("复用已打开的页面，URL: {}", currentUrl);
+                            // 确保该页面在 modelPages 中（如果不在，添加进去）
+                            if (!modelPages.containsValue(page)) {
+                                // 找到对应的 model（如果有），否则使用当前 model
+                                modelPages.put(model, page);
+                                pageUrls.put(model, conversationUrl);
+                            }
+                        } else {
+                            // URL 不匹配，导航到指定 URL
+                            log.info("页面 URL 不匹配，导航到指定 URL。当前: {}, 目标: {}", currentUrl, conversationUrl);
+                            page.navigate(conversationUrl);
+                            page.waitForLoadState();
+                            // 更新记录
+                            modelPages.put(model, page);
+                            pageUrls.put(model, conversationUrl);
+                        }
+                    } else {
+                        // 没有找到已打开的页面，创建新页面并导航到指定 URL
+                        log.info("未找到已打开的页面，创建新页面并导航到: {}", conversationUrl);
+                        page = browserManager.newPage();
+                        modelPages.put(model, page);
+                        
+                        page.navigate(conversationUrl);
+                        page.waitForLoadState();
+                        pageUrls.put(model, conversationUrl);
+                        log.info("已导航到指定对话 URL: {}", conversationUrl);
+                    }
+                    shouldClosePage = false; // 不关闭，保存复用
+                } else {
+                    // 没有对话 URL：开启新对话
+                    log.info("未传递对话 URL，开启新对话");
+                    
+                    // 关闭旧页面（如果存在）
                     Page oldPage = modelPages.remove(model);
                     if (oldPage != null && !oldPage.isClosed()) {
                         try {
@@ -93,11 +196,13 @@ public class DeepSeekProvider extends BaseProvider {
                             log.warn("关闭旧页面时出错", e);
                         }
                     }
+                    
+                    // 创建新页面
                     page = browserManager.newPage();
                     modelPages.put(model, page);
                     shouldClosePage = false; // 不关闭，保存复用
 
-                    // 2. 导航到 DeepSeek
+                    // 导航到 DeepSeek
                     page.navigate("https://chat.deepseek.com/");
                     page.waitForLoadState();
                     
@@ -105,76 +210,13 @@ public class DeepSeekProvider extends BaseProvider {
                     String initialUrl = page.url();
                     pageUrls.put(model, initialUrl);
                     log.info("创建新对话页面，模型: {}, URL: {}", model, initialUrl);
-                } else {
-                    // 继续对话：根据 conversationUrl 决定使用哪个页面
-                    String conversationUrl = request.getConversationUrl();
-                    
-                    if (conversationUrl != null && conversationUrl.contains("chat.deepseek.com")) {
-                        // 如果有指定的对话 URL，尝试导航到该 URL
-                        log.info("继续指定对话，URL: {}", conversationUrl);
-                        
-                        // 检查是否有对应 URL 的页面
-                        page = findPageByUrl(model, conversationUrl);
-                        
-                        if (page == null || page.isClosed()) {
-                            // 创建新页面并导航到指定 URL
-                            if (page != null && page.isClosed()) {
-                                modelPages.remove(model, page);
-                            }
-                            page = browserManager.newPage();
-                            modelPages.put(model, page);
-                            
-                            page.navigate(conversationUrl);
-                            page.waitForLoadState();
-                            pageUrls.put(model, conversationUrl); // 记录 URL
-                            log.info("已导航到指定对话 URL: {}", conversationUrl);
-                        } else {
-                            // 复用现有页面，但确保 URL 正确
-                            String currentUrl = page.url();
-                            if (!currentUrl.equals(conversationUrl)) {
-                                log.info("页面 URL 不匹配，导航到指定 URL。当前: {}, 目标: {}", currentUrl, conversationUrl);
-                                page.navigate(conversationUrl);
-                                page.waitForLoadState();
-                                pageUrls.put(model, conversationUrl); // 更新记录的 URL
-                            } else {
-                                log.info("复用现有页面，URL: {}", currentUrl);
-                            }
-                        }
-                    } else {
-                        // 没有指定 URL，复用现有页面（兼容旧逻辑）
-                        page = modelPages.get(model);
-                        if (page == null || page.isClosed()) {
-                            // 如果页面不存在或已关闭，创建新页面
-                            log.info("页面不存在或已关闭，创建新页面，模型: {}", model);
-                            if (page != null && page.isClosed()) {
-                                // 从缓存中移除已关闭的页面
-                                modelPages.remove(model, page);
-                            }
-                            page = browserManager.newPage();
-                            modelPages.put(model, page);
-
-                            page.navigate("https://chat.deepseek.com/");
-                            page.waitForLoadState();
-                        } else {
-                            log.info("复用现有页面，模型: {}, URL: {}", model, page.url());
-
-                            // 确保页面仍然在 DeepSeek 网站
-                            String currentUrl = page.url();
-                            if (!currentUrl.contains("chat.deepseek.com")) {
-                                log.warn("页面不在 DeepSeek 网站，重新导航");
-                                page.navigate("https://chat.deepseek.com/");
-                                page.waitForLoadState();
-                            }
-                        }
-                    }
-                    shouldClosePage = false; // 不关闭，保存复用
                 }
 
                 // 在页面创建后设置 SSE 拦截器
-                setupSseInterceptor(page);
+                setupSseInterceptor(page, SSE_CONFIG);
 
                 // 3. 如果是新对话，点击"新对话"按钮
-                if (request.isNewConversation()) {
+                if (isNewConversation) {
                     try {
                         // 尝试点击新对话按钮（根据实际页面调整选择器）
                         // 常见的选择器：button[aria-label*="New"], .new-chat-button, [data-testid="new-chat"]
@@ -198,74 +240,151 @@ public class DeepSeekProvider extends BaseProvider {
                     }
                 }
 
-                // 5. 处理深度思考模式开关
-                if (request.isThinking()) {
+                // 5. 处理深度思考模式开关（根据模型名称自动判断）
+                if (shouldEnableThinking) {
                     try {
                         log.info("尝试启用深度思考模式");
-                        // 根据实际 DOM 结构查找深度思考按钮
-                        // 按钮包含文本"深度思考"，类名包含 ds-toggle-button
-                        Locator thinkingToggle = page.locator("button.ds-toggle-button:has-text('深度思考')")
-                                .or(page.locator("button:has-text('深度思考')"))
-                                .or(page.locator("button[aria-label*='思考'], button[aria-label*='Think']"))
-                                .or(page.locator(".ds-toggle-button:has-text('Thinking')"))
-                                .first();
+                        // 等待页面完全加载，确保按钮已渲染
+                        // 先等待输入框出现，说明页面基本加载完成
+                        try {
+                            page.locator("textarea").waitFor();
+                        } catch (Exception e) {
+                            log.debug("等待输入框超时: {}", e.getMessage());
+                        }
+                        page.waitForTimeout(1500); // 额外等待，确保所有按钮都已渲染
                         
-                        if (thinkingToggle.count() > 0) {
-                            // 检查按钮是否已激活（toggle button 可能有 active 状态）
+                        // 尝试多种方式查找深度思考按钮，最多重试3次
+                        boolean thinkingEnabled = false;
+                        int maxRetries = 3;
+                        
+                        for (int retry = 0; retry < maxRetries && !thinkingEnabled; retry++) {
+                            if (retry > 0) {
+                                log.info("重试查找深度思考按钮 (第 {} 次)", retry + 1);
+                                page.waitForTimeout(1000); // 重试前等待
+                            }
+                            
+                            // 方法1: 使用 Playwright Locator
                             try {
-                                String className = thinkingToggle.getAttribute("class");
-                                boolean isActive = className != null && 
-                                    (className.contains("active") || className.contains("selected") || 
-                                     className.contains("ds-toggle-button--active"));
+                                Locator thinkingToggle = page.locator("div[role='button'].ds-toggle-button:has-text('深度思考')")
+                                        .or(page.locator("div[role='button']:has-text('深度思考')"))
+                                        .or(page.locator("button.ds-toggle-button:has-text('深度思考')"))
+                                        .or(page.locator("button:has-text('深度思考')"))
+                                        .or(page.locator("div[role='button'][aria-label*='思考'], div[role='button'][aria-label*='Think']"))
+                                        .or(page.locator("button[aria-label*='思考'], button[aria-label*='Think']"))
+                                        .or(page.locator(".ds-toggle-button:has-text('Thinking')"))
+                                        .or(page.locator("button:has-text('Thinking')"))
+                                        .first();
                                 
-                                if (!isActive) {
-                                    thinkingToggle.click();
-                                    page.waitForTimeout(500); // 等待开关切换
-                                    log.info("已启用深度思考模式");
-                                } else {
-                                    log.info("深度思考模式已启用");
+                                if (thinkingToggle.count() > 0) {
+                                    thinkingToggle.waitFor();
+                                    // 检查按钮是否已激活
+                                    try {
+                                        String className = thinkingToggle.getAttribute("class");
+                                        boolean isActive = className != null && 
+                                            (className.contains("active") || className.contains("selected") || 
+                                             className.contains("ds-toggle-button--active") ||
+                                             className.contains("ds-toggle-button-active"));
+                                        
+                                        if (!isActive) {
+                                            thinkingToggle.click();
+                                            page.waitForTimeout(800); // 等待开关切换
+                                            log.info("已通过 Locator 启用深度思考模式");
+                                            thinkingEnabled = true;
+                                        } else {
+                                            log.info("深度思考模式已启用（通过 Locator 检查）");
+                                            thinkingEnabled = true;
+                                        }
+                                    } catch (Exception e) {
+                                        // 如果检查失败，直接点击
+                                        thinkingToggle.click();
+                                        page.waitForTimeout(800);
+                                        log.info("已通过 Locator 点击深度思考按钮");
+                                        thinkingEnabled = true;
+                                    }
                                 }
                             } catch (Exception e) {
-                                // 如果检查失败，直接点击
-                                thinkingToggle.click();
-                                page.waitForTimeout(500);
-                                log.info("已点击深度思考按钮");
+                                log.debug("Locator 方法失败 (重试 {}): {}", retry + 1, e.getMessage());
                             }
-                        } else {
-                            // 如果找不到按钮，尝试通过 JavaScript 直接设置
-                            try {
-                                Boolean result = (Boolean) page.evaluate("""
+                            
+                            // 如果 Locator 失败，立即尝试 JavaScript 方法
+                            if (!thinkingEnabled) {
+                        
+                                // 方法2: 使用 JavaScript 查找并点击
+                                try {
+                                String result = (String) page.evaluate("""
                                     () => {
-                                        // 查找包含"深度思考"文本的按钮
-                                        const buttons = document.querySelectorAll('button');
+                                        // 查找包含"深度思考"或"Thinking"文本的按钮
+                                        // 包括 button 元素和 div[role="button"] 元素
+                                        const buttons = document.querySelectorAll('button, div[role="button"]');
+                                        let foundButton = null;
+                                        let buttonText = '';
+                                        
                                         for (const btn of buttons) {
-                                            const text = btn.textContent || '';
-                                            if (text.includes('深度思考') || text.includes('Thinking')) {
+                                            const text = (btn.textContent || '').trim();
+                                            const ariaLabel = (btn.getAttribute('aria-label') || '').trim();
+                                            
+                                            // 检查文本或 aria-label
+                                            if (text.includes('深度思考') || text.includes('Thinking') ||
+                                                ariaLabel.includes('思考') || ariaLabel.includes('Think')) {
+                                                foundButton = btn;
+                                                buttonText = text || ariaLabel;
+                                                
                                                 // 检查是否是 toggle button 且未激活
+                                                // 对于 div[role="button"]，检查类名和 aria-pressed
                                                 const isActive = btn.classList.contains('active') ||
                                                                btn.classList.contains('selected') ||
-                                                               btn.classList.contains('ds-toggle-button--active');
+                                                               btn.classList.contains('ds-toggle-button--active') ||
+                                                               btn.classList.contains('ds-toggle-button-active') ||
+                                                               btn.getAttribute('aria-pressed') === 'true';
+                                                
                                                 if (!isActive) {
                                                     btn.click();
-                                                    return true;
+                                                    return 'clicked: ' + buttonText;
+                                                } else {
+                                                    return 'already-active: ' + buttonText;
                                                 }
-                                                return false;
                                             }
                                         }
-                                        return false;
+                                        
+                                        // 如果没找到，尝试查找所有可能的按钮并返回信息用于调试
+                                        const allButtons = Array.from(buttons).map(btn => ({
+                                            text: (btn.textContent || '').trim(),
+                                            ariaLabel: (btn.getAttribute('aria-label') || '').trim(),
+                                            classes: btn.className,
+                                            role: btn.getAttribute('role') || 'button'
+                                        })).filter(btn => btn.text.length > 0 || btn.ariaLabel.length > 0);
+                                        
+                                        return 'not-found. total-buttons: ' + allButtons.length;
                                     }
                                 """);
-                                if (Boolean.TRUE.equals(result)) {
-                                    log.info("通过 JavaScript 已启用深度思考模式");
-                                } else {
-                                    log.warn("未找到深度思考按钮或已启用");
+                                
+                                if (result != null) {
+                                    if (result.startsWith("clicked:")) {
+                                        page.waitForTimeout(800);
+                                        log.info("通过 JavaScript 已启用深度思考模式: {}", result);
+                                        thinkingEnabled = true;
+                                    } else if (result.startsWith("already-active:")) {
+                                        log.info("深度思考模式已启用（通过 JavaScript 检查）: {}", result);
+                                        thinkingEnabled = true;
+                                    } else {
+                                        if (retry == maxRetries - 1) {
+                                            log.warn("未找到深度思考按钮: {}", result);
+                                        }
+                                    }
                                 }
-                            } catch (Exception e) {
-                                log.warn("无法启用深度思考模式: {}", e.getMessage());
+                                } catch (Exception e) {
+                                    if (retry == maxRetries - 1) {
+                                        log.warn("JavaScript 方法失败: {}", e.getMessage());
+                                    }
+                                }
                             }
                         }
+                        
+                        if (!thinkingEnabled) {
+                            log.warn("无法启用深度思考模式，可能按钮尚未加载或页面结构已变化");
+                        }
                     } catch (Exception e) {
-                        log.warn("启用深度思考模式时出错，继续执行: {}", e.getMessage());
+                        log.warn("启用深度思考模式时出错，继续执行: {}", e.getMessage(), e);
                     }
                 } else {
                     // 如果不需要深度思考模式，确保它是关闭的
@@ -438,11 +557,11 @@ public class DeepSeekProvider extends BaseProvider {
                         .map(ChatCompletionRequest.Message::getContent)
                         .orElse("Hello");
 
-                if (request.isNewConversation()) {
-                    log.info("新对话，发送消息: {} (深度思考: {})", messageToSend, request.isThinking());
+                if (isNewConversation) {
+                    log.info("新对话，发送消息: {} (深度思考: {})", messageToSend, shouldEnableThinking);
                 } else {
                     log.info("继续对话，只发送最后一条用户消息: {} (页面已保存历史上下文, 深度思考: {})",
-                            messageToSend, request.isThinking());
+                            messageToSend, shouldEnableThinking);
                 }
 
                 // 8. 记录发送前的消息数量（用于只获取新增的回复）
@@ -452,13 +571,13 @@ public class DeepSeekProvider extends BaseProvider {
 
                 // 7. 验证 SSE 拦截器是否已设置
                 try {
-                    Object interceptorStatus = page.evaluate("() => window.__deepseekSseInterceptorSet || false");
+                    Object interceptorStatus = page.evaluate("() => window." + SSE_CONFIG.getInterceptorVarName() + " || false");
                     log.info("SSE 拦截器状态: {}", interceptorStatus);
 
                     // 如果未设置，重新设置
                     if (!Boolean.TRUE.equals(interceptorStatus)) {
                         log.warn("SSE 拦截器未设置，重新设置...");
-                        setupSseInterceptor(page);
+                        setupSseInterceptor(page, SSE_CONFIG);
                     }
                 } catch (Exception e) {
                     log.warn("检查 SSE 拦截器状态失败: {}", e.getMessage());
@@ -472,7 +591,7 @@ public class DeepSeekProvider extends BaseProvider {
                 page.waitForTimeout(500);
 
                 // 10. 检查是否有 SSE 数据
-                String initialSseData = getSseDataFromPage(page);
+                String initialSseData = getSseDataFromPage(page, SSE_CONFIG.getDataVarName());
                 if (initialSseData != null && !initialSseData.isEmpty()) {
                     log.info("检测到初始 SSE 数据，长度: {}", initialSseData.length());
                 }
@@ -480,10 +599,10 @@ public class DeepSeekProvider extends BaseProvider {
                 // 11. 根据配置选择监听方式
                 if ("sse".equalsIgnoreCase(monitorMode)) {
                     log.info("开始监听 AI 回复（SSE 拦截数据实时流模式）...");
-                    monitorResponseSse(page, emitter, request, messageCountBefore);
+                    monitorResponseSse(page, emitter, request, messageCountBefore, shouldEnableThinking);
                 } else {
                     log.info("开始监听 AI 回复（DOM 实时 + SSE 修正模式）...");
-                    monitorResponseHybrid(page, emitter, request, messageCountBefore);
+                    monitorResponseHybrid(page, emitter, request, messageCountBefore, shouldEnableThinking);
                 }
 
             } catch (Exception e) {
@@ -514,193 +633,6 @@ public class DeepSeekProvider extends BaseProvider {
         });
     }
 
-    /**
-     * 设置 SSE 拦截器（通过 JavaScript 注入拦截 EventSource 和 fetch）
-     */
-    private void setupSseInterceptor(Page page) {
-        // 初始化全局变量
-        try {
-            page.evaluate("""
-                        () => {
-                            if (!window.__deepseekSseData) {
-                                window.__deepseekSseData = [];
-                            }
-                        }
-                    """);
-        } catch (Exception e) {
-            log.debug("初始化 SSE 数据存储失败: {}", e.getMessage());
-        }
-
-        // 注入 JavaScript 来拦截 EventSource 和 fetch 的 SSE 响应
-        // 使用 evaluate 而不是 addInitScript，确保在页面加载后也能执行
-        try {
-            page.evaluate("""
-                        (function() {
-                            // 如果已经设置过，不再重复设置
-                            if (window.__deepseekSseInterceptorSet) {
-                                return;
-                            }
-                            window.__deepseekSseInterceptorSet = true;
-                    
-                            // 拦截 EventSource
-                            const originalEventSource = window.EventSource;
-                            window.EventSource = function(url, eventSourceInitDict) {
-                                console.log('[SSE Interceptor] EventSource created:', url);
-                                const es = new originalEventSource(url, eventSourceInitDict);
-                    
-                                // 只拦截 chat/completion 相关的 EventSource
-                                if (url.includes('/api/v0/chat/completion')) {
-                                    console.log('[SSE Interceptor] Intercepting EventSource:', url);
-                    
-                                    es.addEventListener('message', function(event) {
-                                        console.log('[SSE Interceptor] EventSource message:', event.data);
-                                        window.__deepseekSseData = window.__deepseekSseData || [];
-                                        window.__deepseekSseData.push(event.data);
-                                    });
-                    
-                                    es.addEventListener('error', function(event) {
-                                        console.log('[SSE Interceptor] EventSource error:', event);
-                                    });
-                                }
-                    
-                                return es;
-                            };
-                    
-                            // 拦截 fetch 的 SSE 响应
-                            const originalFetch = window.fetch;
-                            window.fetch = function(...args) {
-                                const url = args[0];
-                                if (typeof url === 'string' && url.includes('/api/v0/chat/completion')) {
-                                    console.log('[SSE Interceptor] Intercepting fetch:', url);
-                    
-                                    return originalFetch.apply(this, args).then(response => {
-                                        const contentType = response.headers.get('content-type');
-                                        console.log('[SSE Interceptor] Response content-type:', contentType);
-                    
-                                        if (contentType && contentType.includes('text/event-stream')) {
-                                            console.log('[SSE Interceptor] Detected SSE response');
-                    
-                                            // 克隆响应，这样原始响应仍然可用
-                                            const clonedResponse = response.clone();
-                                            const reader = clonedResponse.body.getReader();
-                                            const decoder = new TextDecoder();
-                    
-                                            window.__deepseekSseData = window.__deepseekSseData || [];
-                    
-                                            function readStream() {
-                                                reader.read().then(({ done, value }) => {
-                                                    if (done) {
-                                                        console.log('[SSE Interceptor] Stream finished');
-                                                        return;
-                                                    }
-                    
-                                                    const chunk = decoder.decode(value, { stream: true });
-                                                    console.log('[SSE Interceptor] Received chunk:', chunk.substring(0, 100));
-                                                    window.__deepseekSseData.push(chunk);
-                    
-                                                    readStream();
-                                                }).catch(err => {
-                                                    console.error('[SSE Interceptor] Read error:', err);
-                                                });
-                                            }
-                    
-                                            readStream();
-                                        }
-                    
-                                        return response;
-                                    });
-                                }
-                                return originalFetch.apply(this, args);
-                            };
-                    
-                            // 拦截 XMLHttpRequest 的 SSE 响应
-                            const originalXHROpen = XMLHttpRequest.prototype.open;
-                            const originalXHRSend = XMLHttpRequest.prototype.send;
-                    
-                            XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-                                this._interceptedUrl = url;
-                                return originalXHROpen.apply(this, [method, url, ...rest]);
-                            };
-                    
-                            XMLHttpRequest.prototype.send = function(...args) {
-                                if (this._interceptedUrl && this._interceptedUrl.includes('/api/v0/chat/completion')) {
-                                    console.log('[SSE Interceptor] Intercepting XMLHttpRequest:', this._interceptedUrl);
-                    
-                                    const originalOnReadyStateChange = this.onreadystatechange;
-                                    this.onreadystatechange = function() {
-                                        if (this.readyState === 3 || this.readyState === 4) { // LOADING or DONE
-                                            const responseText = this.responseText;
-                                            if (responseText) {
-                                                const contentType = this.getResponseHeader('content-type');
-                                                if (contentType && contentType.includes('text/event-stream')) {
-                                                    console.log('[SSE Interceptor] XMLHttpRequest SSE data:', responseText.substring(0, 100));
-                                                    window.__deepseekSseData = window.__deepseekSseData || [];
-                                                    // 只保存新增的部分
-                                                    if (this._lastResponseLength === undefined) {
-                                                        this._lastResponseLength = 0;
-                                                    }
-                                                    if (responseText.length > this._lastResponseLength) {
-                                                        const newData = responseText.substring(this._lastResponseLength);
-                                                        window.__deepseekSseData.push(newData);
-                                                        this._lastResponseLength = responseText.length;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        if (originalOnReadyStateChange) {
-                                            originalOnReadyStateChange.apply(this, arguments);
-                                        }
-                                    };
-                                }
-                                return originalXHRSend.apply(this, args);
-                            };
-                    
-                            console.log('[SSE Interceptor] Interceptor setup complete');
-                        })();
-                    """);
-            log.info("已设置 SSE 拦截器（通过 JavaScript 注入）");
-        } catch (Exception e) {
-            log.error("设置 SSE 拦截器失败: {}", e.getMessage(), e);
-        }
-    }
-
-    /**
-     * 从 JavaScript 中获取 SSE 数据
-     */
-    private String getSseDataFromPage(Page page) {
-        try {
-            if (page.isClosed()) {
-                return null;
-            }
-
-            Object result = page.evaluate("""
-                        () => {
-                            if (window.__deepseekSseData && window.__deepseekSseData.length > 0) {
-                                const data = window.__deepseekSseData.join('\\n');
-                                window.__deepseekSseData = []; // 清空已读取的数据
-                                console.log('[SSE Interceptor] Returning data, length:', data.length, data);
-                                return data;
-                            }
-                            return null;
-                        }
-                    """);
-
-            if (result != null) {
-                String data = result.toString();
-                if (!data.isEmpty()) {
-                    log.info("从页面获取到 SSE 数据，长度: {}", data.length());
-                }
-                return data;
-            }
-            return null;
-        } catch (Exception e) {
-            // 如果是页面关闭错误，不记录日志
-            if (!e.getMessage().contains("Target closed") && !e.getMessage().contains("Session closed")) {
-                log.debug("获取 SSE 数据失败: {}", e.getMessage());
-            }
-            return null;
-        }
-    }
 
     /**
      * 解析 SSE 数据，提取最终回复文本内容（不包括思考内容）
@@ -827,8 +759,9 @@ public class DeepSeekProvider extends BaseProvider {
                     String content = null;
                     
                     // 情况1: fragment 创建 - {"v": [{"id": 1, "type": "THINK", ...}], "p": "fragments", "o": "APPEND"}
+                    // 或者 {"v": [{"id": 2, "type": "RESPONSE", ...}], "p": "response/fragments", "o": "APPEND"}
                     // fragment 按创建顺序分配数组索引（第一个是 0，第二个是 1，以此类推）
-                    if ("fragments".equals(path) && "APPEND".equals(operation) && json.has("v") && json.get("v").isArray()) {
+                    if (("fragments".equals(path) || "response/fragments".equals(path)) && "APPEND".equals(operation) && json.has("v") && json.get("v").isArray()) {
                         JsonNode fragments = json.get("v");
                         // 找到当前最大的索引，新 fragment 从下一个索引开始
                         int nextIndex = fragmentTypeMap.isEmpty() ? 0 : 
@@ -961,7 +894,8 @@ public class DeepSeekProvider extends BaseProvider {
                                 String itemOperation = item.has("o") && item.get("o").isString() ? item.get("o").asString() : null;
                                 
                                 // 处理 fragment 创建（在 BATCH 中）
-                                if ("fragments".equals(itemPath) && "APPEND".equals(itemOperation) && item.get("v").isArray()) {
+                                // 支持 "fragments" 和 "response/fragments" 两种路径
+                                if (("fragments".equals(itemPath) || "response/fragments".equals(itemPath)) && "APPEND".equals(itemOperation) && item.get("v").isArray()) {
                                     JsonNode fragments = item.get("v");
                                     for (JsonNode fragment : fragments) {
                                         if (fragment.has("type") && fragment.get("type").isString()) {
@@ -974,10 +908,10 @@ public class DeepSeekProvider extends BaseProvider {
                                                 if (!fragmentContent.isEmpty()) {
                                                     if ("THINK".equals(type)) {
                                                         thinkingText.append(fragmentContent);
-                                                        log.info("从 BATCH 中 fragment 创建提取思考内容 (索引 {}): {}", nextIndex, fragmentContent);
+                                                        log.debug("从 BATCH 中 fragment 创建提取思考内容 (索引 {}): {}", nextIndex, fragmentContent);
                                                     } else if ("RESPONSE".equals(type)) {
                                                         responseText.append(fragmentContent);
-                                                        log.info("从 BATCH 中 fragment 创建提取回复内容 (索引 {}): {}", nextIndex, fragmentContent);
+                                                        log.debug("从 BATCH 中 fragment 创建提取回复内容 (索引 {}): {}", nextIndex, fragmentContent);
                                                     }
                                                 }
                                             }
@@ -1038,11 +972,11 @@ public class DeepSeekProvider extends BaseProvider {
         
         // 记录解析结果，确保初始内容被包含
         if (thinking != null && !thinking.isEmpty()) {
-            log.info("解析结果 - 思考内容长度: {}, 内容: {}", thinking.length(), 
+            log.debug("解析结果 - 思考内容长度: {}, 内容: {}", thinking.length(),
                      thinking.length() > 50 ? thinking.substring(0, 50) + "..." : thinking);
         }
         if (response != null && !response.isEmpty()) {
-            log.info("解析结果 - 回复内容长度: {}, 内容: {}", response.length(),
+            log.debug("解析结果 - 回复内容长度: {}, 内容: {}", response.length(),
                      response.length() > 50 ? response.substring(0, 50) + "..." : response);
         }
         
@@ -1056,9 +990,8 @@ public class DeepSeekProvider extends BaseProvider {
      * 根据实际 DeepSeek SSE 数据格式解析思考内容和回复内容
      */
     private void monitorResponseSse(Page page, SseEmitter emitter, ChatCompletionRequest request,
-                                   int messageCountBefore)
+                                   int messageCountBefore, boolean enableThinking)
             throws IOException, InterruptedException {
-        boolean enableThinking = request.isThinking();
         String id = UUID.randomUUID().toString();
         StringBuilder collectedThinkingText = new StringBuilder();
         StringBuilder collectedResponseText = new StringBuilder();
@@ -1082,7 +1015,7 @@ public class DeepSeekProvider extends BaseProvider {
                 }
 
                 // 从 SSE 数据获取内容
-                String sseData = getSseDataFromPage(page);
+                String sseData = getSseDataFromPage(page, SSE_CONFIG.getDataVarName());
                 
                 if (sseData != null && !sseData.isEmpty()) {
                     // 有新的数据
@@ -1097,7 +1030,7 @@ public class DeepSeekProvider extends BaseProvider {
                     if (enableThinking && result.thinkingContent != null && 
                         !result.thinkingContent.isEmpty()) {
                         collectedThinkingText.append(result.thinkingContent);
-                        log.info("从 SSE 发送思考内容增量，长度: {}, 内容: {}", 
+                        log.debug("从 SSE 发送思考内容增量，长度: {}, 内容: {}",
                                 result.thinkingContent.length(),
                                 result.thinkingContent.length() > 20 ? 
                                 result.thinkingContent.substring(0, 20) + "..." : result.thinkingContent);
@@ -1107,7 +1040,7 @@ public class DeepSeekProvider extends BaseProvider {
                     // 发送回复内容增量
                     if (result.responseContent != null && !result.responseContent.isEmpty()) {
                         collectedResponseText.append(result.responseContent);
-                        log.info("从 SSE 发送回复内容增量，长度: {}, 内容: {}", 
+                        log.debug("从 SSE 发送回复内容增量，长度: {}, 内容: {}",
                                 result.responseContent.length(),
                                 result.responseContent.length() > 20 ? 
                                 result.responseContent.substring(0, 20) + "..." : result.responseContent);
@@ -1212,15 +1145,12 @@ public class DeepSeekProvider extends BaseProvider {
      * 支持区分思考内容和最终回复（深度思考模式）
      */
     private void monitorResponseHybrid(Page page, SseEmitter emitter, ChatCompletionRequest request,
-                                      int messageCountBefore)
+                                      int messageCountBefore, boolean enableThinking)
             throws IOException, InterruptedException {
         // 思考内容选择器：在 .ds-think-content 内的 .ds-markdown
         String thinkingSelector = ".ds-think-content .ds-markdown";
         // 所有 markdown 选择器（用于查找最终回复）
         String allMarkdownSelector = ".ds-markdown";
-
-        // 本次请求是否需要输出思考内容
-        boolean enableThinking = request.isThinking();
         
         // 等待新的回复框出现
         Locator allResponseLocators = page.locator(allMarkdownSelector);
@@ -1337,7 +1267,7 @@ public class DeepSeekProvider extends BaseProvider {
                 // 2. SSE 解析（用于最终修正）
                 if (!sseFinished) {
                     try {
-                        String sseData = getSseDataFromPage(page);
+                        String sseData = getSseDataFromPage(page, SSE_CONFIG.getDataVarName());
                         if (sseData != null && !sseData.isEmpty()) {
                             log.debug("获取到 SSE 数据，长度: {}, 前200字符: {}",
                                     sseData.length(),

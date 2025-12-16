@@ -69,6 +69,16 @@ public class BrowserManager {
         return browserContext.newPage();
     }
 
+    /**
+     * 获取所有打开的页面
+     */
+    public List<Page> getAllPages() {
+        if (browserContext == null) {
+            throw new IllegalStateException("Browser is not initialized");
+        }
+        return browserContext.pages();
+    }
+
     @PreDestroy
     public void destroy() {
         log.info("正在关闭 Playwright...");
