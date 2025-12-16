@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <include resource="org/springframework/boot/logging/logback/defaults.xml"/>
+    
+    <!-- 控制台输出 -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>${CONSOLE_LOG_PATTERN}</pattern>
+        </encoder>
+    </appender>
+    
+    <!-- SSE 数据日志文件 -->
+    <appender name="SSE_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>logs/sse-data.log</file>
+        <!-- 每次启动时覆盖旧文件，而不是追加 -->
+        <append>false</append>
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+        <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+            <!-- 按天滚动 -->
+            <fileNamePattern>logs/sse-data.%d{yyyy-MM-dd}.log</fileNamePattern>
+            <!-- 保留 30 天的日志 -->
+            <maxHistory>30</maxHistory>
+            <!-- 单个日志文件最大 100MB -->
+            <totalSizeCap>10GB</totalSizeCap>
+        </rollingPolicy>
+    </appender>
+    
+    <!-- SSE 数据记录器 -->
+    <logger name="site.newbie.web.llm.api.provider.SseDataLogger" level="INFO" additivity="false">
+        <appender-ref ref="SSE_FILE"/>
+    </logger>
+    
+    <!-- 根日志配置 -->
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+</configuration>
+

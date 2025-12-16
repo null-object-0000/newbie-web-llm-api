@@ -7,6 +7,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import site.newbie.web.llm.api.model.ChatCompletionRequest;
 import site.newbie.web.llm.api.provider.ModelConfig;
+import site.newbie.web.llm.api.provider.SseDataLogger;
 
 import java.io.IOException;
 import java.util.UUID;
@@ -53,7 +54,7 @@ public class OpenAIChatConfig implements OpenAIModelConfig {
                 }
             }
         } catch (Exception e) {
-            log.debug("关闭深度思考模式时出错: {}", e.getMessage());
+            log.error("关闭深度思考模式时出错: {}", e.getMessage());
         }
     }
 
@@ -82,7 +83,9 @@ public class OpenAIChatConfig implements OpenAIModelConfig {
 
         boolean doneDetected = false;
         int doneWaitCount = 0;
-        int maxDoneWaitCount = 15; // 检测到完成标记后，最多等待 3 秒（30 * 100ms）
+        
+        // 用于调试：记录所有接收到的原始 SSE 数据
+        SseDataLogger sseLogger = new SseDataLogger(request.getModel(), request);
         
         while (!finished) {
             try {
@@ -97,35 +100,78 @@ public class OpenAIChatConfig implements OpenAIModelConfig {
                         doneWaitCount = 0; // 重置完成等待计数，因为还有新数据
                     }
                     
+                    // 记录完整的原始 SSE 响应数据（用于调试）
+                    sseLogger.logSseChunk(sseData);
+                    
                     // 简化的 SSE 解析，只提取回复内容
+                    log.info("读取到 SSE 数据，长度: {}", sseData.length());
                     String content = handler.extractTextFromSse(sseData);
                     if (content != null && !content.isEmpty()) {
                         collectedText.append(content);
                         handler.sendChunk(emitter, id, content, request.getModel());
-                        log.trace("发送内容块，长度: {}, 累计长度: {}", content.length(), collectedText.length());
+                        log.info("发送内容块，长度: {}, 累计长度: {}", content.length(), collectedText.length());
+                    } else {
+                        log.info("本次读取未提取到内容");
                     }
                     
                     // 检测完成标记，但不立即结束，继续读取剩余数据
+                    // 注意：即使检测到 [DONE]，也要继续读取，因为可能还有数据在缓冲区
                     if (sseData.contains("event: done") || sseData.contains("[DONE]")) {
                         if (!doneDetected) {
                             doneDetected = true;
                             log.info("检测到完成标记，继续读取剩余数据...");
+                            log.info("检测到完成标记时的 SSE 数据长度: {}, 累计文本长度: {}", sseData.length(), collectedText.length());
+                            // 检测到完成标记后，立即再尝试读取一次，确保当前批次的所有数据都被处理
+                            String finalData = handler.getSseData(page, "__openaiSseData");
+                            if (finalData != null && !finalData.isEmpty()) {
+                                log.info("检测到完成标记后立即读取，数据长度: {}", finalData.length());
+                                // 记录完成标记后的原始 SSE 数据
+                                sseLogger.logSseChunk(finalData, "完成标记后立即读取");
+                                String finalContent = handler.extractTextFromSse(finalData);
+                                if (finalContent != null && !finalContent.isEmpty()) {
+                                    collectedText.append(finalContent);
+                                    handler.sendChunk(emitter, id, finalContent, request.getModel());
+                                    log.info("检测到完成标记后立即提取到内容，长度: {}, 累计长度: {}", finalContent.length(), collectedText.length());
+                                }
+                            }
                         }
+                        // 检测到 [DONE] 后，再读取一次确保没有遗漏
+                        // 不立即结束，让循环继续处理
                     }
                 } else {
                     noDataCount++;
                     
-                    // 如果已检测到完成标记，等待一段时间确保所有数据都被读取
+                    // 如果已检测到完成标记，检查是否还有数据在缓冲区
                     if (doneDetected) {
+                        // 再次尝试读取，确保没有遗漏的数据
+                        String remainingData = handler.getSseData(page, "__openaiSseData");
+                        if (remainingData != null && !remainingData.isEmpty()) {
+                            log.info("检测到完成标记后，读取到剩余数据，长度: {}", remainingData.length());
+                            // 记录剩余数据的原始 SSE 响应
+                            sseLogger.logSseChunk(remainingData, "剩余数据");
+                            String content = handler.extractTextFromSse(remainingData);
+                            if (content != null && !content.isEmpty()) {
+                                collectedText.append(content);
+                                handler.sendChunk(emitter, id, content, request.getModel());
+                                log.info("检测到完成标记后，读取到额外内容，长度: {}, 累计长度: {}", content.length(), collectedText.length());
+                                noDataCount = 0; // 重置计数
+                                doneWaitCount = 0; // 重置等待计数
+                                continue; // 继续循环
+                            } else {
+                                log.info("检测到完成标记后，剩余数据未提取到内容");
+                            }
+                        }
+                        
                         doneWaitCount++;
-                        // 等待最多 3 秒（30 次循环）确保所有数据都被读取
-                        if (doneWaitCount >= maxDoneWaitCount) {
+                        // 等待最多 1 秒（10 次循环）确保所有数据都被读取
+                        // 增加等待时间，因为网络延迟可能导致数据分批到达
+                        if (doneWaitCount >= 10) {
                             finished = true;
-                            log.info("SSE 流已完成（等待 {} 次后结束，共 {}ms）", maxDoneWaitCount, maxDoneWaitCount * 100);
+                            log.info("SSE 流已完成（等待 {} 次后结束，共 {}ms），最终累计长度: {}", doneWaitCount, doneWaitCount * 100, collectedText.length());
                         }
                     } else if (noDataCount > 200) {
                         finished = true;
-                        log.info("SSE 流已完成（无数据超时）");
+                        log.info("SSE 流已完成（无数据超时），最终累计长度: {}", collectedText.length());
                     }
                 }
 
@@ -145,6 +191,9 @@ public class OpenAIChatConfig implements OpenAIModelConfig {
                 throw e;
             }
         }
+
+        // 记录完整的原始 SSE 响应数据汇总（用于调试）
+        sseLogger.logSummary(collectedText.length());
 
         handler.sendUrlAndComplete(page, emitter, request);
     }
@@ -199,7 +248,7 @@ public class OpenAIChatConfig implements OpenAIModelConfig {
                         }
                     }
                 } catch (Exception e) {
-                    log.debug("DOM 查询时出错: {}", e.getMessage());
+                    log.error("DOM 查询时出错: {}", e.getMessage());
                 }
 
                 if (noChangeCount >= 20) break;

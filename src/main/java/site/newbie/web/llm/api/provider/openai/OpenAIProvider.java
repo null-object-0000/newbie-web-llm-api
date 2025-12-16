@@ -187,7 +187,7 @@ public class OpenAIProvider implements LLMProvider {
             return page;
         }
         
-        page = browserManager.newPage();
+        page = browserManager.newPage(getProviderName());
         modelPages.put(model, page);
         page.navigate(url);
         page.waitForLoadState();
@@ -201,7 +201,7 @@ public class OpenAIProvider implements LLMProvider {
             try { oldPage.close(); } catch (Exception e) { }
         }
         
-        Page page = browserManager.newPage();
+        Page page = browserManager.newPage(getProviderName());
         modelPages.put(model, page);
         page.navigate("https://chatgpt.com/");
         page.waitForLoadState();
@@ -218,7 +218,7 @@ public class OpenAIProvider implements LLMProvider {
             }
         }
         try {
-            for (Page page : browserManager.getAllPages()) {
+            for (Page page : browserManager.getAllPages(getProviderName())) {
                 if (page != null && !page.isClosed() && targetUrl.equals(page.url())) {
                     return page;
                 }
@@ -310,9 +310,9 @@ public class OpenAIProvider implements LLMProvider {
     // ==================== SSE 拦截器 ====================
     
     private void setupSseInterceptor(Page page) {
-        // 清空旧的 SSE 数据（避免复用页面时读取到旧数据）
+        // 清空旧的 SSE 数据和索引（避免复用页面时读取到旧数据）
         try {
-            page.evaluate(String.format("() => { window.%s = []; }", SSE_DATA_VAR));
+            page.evaluate(String.format("() => { window.%s = []; window.%sIndex = 0; }", SSE_DATA_VAR, SSE_DATA_VAR));
         } catch (Exception e) { }
 
         StringBuilder urlCondition = new StringBuilder();
@@ -373,16 +373,19 @@ public class OpenAIProvider implements LLMProvider {
     private String getSseDataFromPage(Page page, String varName) {
         try {
             if (page.isClosed()) return null;
+            // 使用索引跟踪已读取的数据，避免清空数组导致数据丢失
             Object result = page.evaluate(String.format("""
                 () => {
-                    if (window.%s && window.%s.length > 0) {
-                        const data = window.%s.join('\\n');
-                        window.%s = [];
-                        return data;
+                    if (!window.%s) return null;
+                    if (!window.%sIndex) window.%sIndex = 0;
+                    if (window.%s.length > window.%sIndex) {
+                        const newData = window.%s.slice(window.%sIndex);
+                        window.%sIndex = window.%s.length;
+                        return newData.join('\\n');
                     }
                     return null;
                 }
-                """, varName, varName, varName, varName));
+                """, varName, varName, varName, varName, varName, varName, varName, varName, varName));
             return result != null ? result.toString() : null;
         } catch (Exception e) {
             return null;
@@ -456,6 +459,8 @@ public class OpenAIProvider implements LLMProvider {
         StringBuilder text = new StringBuilder();
         
         String[] lines = sseData.split("\n");
+        int processedCount = 0;
+        int skippedCount = 0;
         
         for (int i = 0; i < lines.length; i++) {
             String line = lines[i].trim();
@@ -470,8 +475,10 @@ public class OpenAIProvider implements LLMProvider {
                 continue;
             }
             
-            // 跳过完成标记
+            // 跳过完成标记（但先处理完当前批次的其他数据）
             if (line.contains("[DONE]")) {
+                // 注意：不立即 continue，让循环继续处理其他行
+                // 因为 [DONE] 可能在数据中间
                 continue;
             }
             
@@ -483,27 +490,61 @@ public class OpenAIProvider implements LLMProvider {
             try {
                 var json = objectMapper.readTree(jsonStr);
                 
+                // 处理纯字符串的情况（可能是版本号等元数据，但先记录）
+                if (json.isTextual()) {
+                    skippedCount++;
+                    log.debug("跳过纯字符串数据: {}", jsonStr.length() > 100 ? jsonStr.substring(0, 100) + "..." : jsonStr);
+                    continue;
+                }
+                
+                // 必须是对象节点
+                if (!json.isObject()) {
+                    skippedCount++;
+                    log.debug("跳过非对象数据: {}", jsonStr.length() > 100 ? jsonStr.substring(0, 100) + "..." : jsonStr);
+                    continue;
+                }
+                
                 // 跳过有 type 字段的元数据（如 resume_conversation_token, input_message 等）
                 if (json.has("type")) {
+                    skippedCount++;
+                    String type = json.get("type").asText();
+                    // 记录重要的元数据类型，帮助调试
+                    if (!"message_stream_complete".equals(type) && !"conversation_detail_metadata".equals(type)) {
+                        log.info("跳过元数据: {}", type);
+                    }
                     continue;
                 }
                 
                 // 格式1: {"p": "/message/content/parts/0", "o": "append", "v": "内容"}
+                // 注意：只处理 append 操作，patch 操作由格式3处理
                 if (json.has("p") && json.has("o") && json.has("v")) {
                     String path = json.get("p").asText();
                     String operation = json.get("o").asText();
                     
                     // 处理内容路径的 append 操作
-                    if (path != null && path.contains("/message/content/parts/") && "append".equals(operation)) {
-                        if (json.get("v").isTextual()) {
+                    // 支持多种可能的内容路径格式
+                    if (path != null && "append".equals(operation)) {
+                        boolean isContentPath = path.contains("/message/content/parts/") ||
+                                              path.contains("/content/parts/") ||
+                                              path.contains("/content") ||
+                                              path.endsWith("/content") ||
+                                              path.contains("content");
+                        
+                        if (isContentPath && json.get("v").isTextual()) {
                             String content = json.get("v").asText();
                             if (content != null && !content.isEmpty()) {
                                 text.append(content);
-                                log.trace("提取内容 (路径格式): {}", content);
+                                processedCount++;
+                                log.info("提取内容 (路径格式, path={}): {}", path, content);
                             }
+                        } else if (isContentPath) {
+                            log.info("内容路径的值不是文本类型: path={}, op={}, v类型={}", path, operation, json.get("v").getNodeType());
+                        } else {
+                            log.trace("跳过非内容路径: path={}, op={}", path, operation);
                         }
+                        continue; // 只有 append 操作处理完才跳过
                     }
-                    continue;
+                    // 注意：如果 operation 不是 "append"（如 "patch", "add", "replace"），不要 continue，让后续逻辑处理
                 }
                 
                 // 格式2: {"v": "内容"} - 简单格式，直接追加（不依赖 event，因为可能跨批次）
@@ -514,7 +555,8 @@ public class OpenAIProvider implements LLMProvider {
                         String content = vNode.asText();
                         if (content != null && !content.isEmpty()) {
                             text.append(content);
-                            log.trace("提取内容 (简单格式): {}", content);
+                            processedCount++;
+                            log.info("提取内容 (简单格式): {}", content);
                         }
                     }
                     continue;
@@ -524,34 +566,93 @@ public class OpenAIProvider implements LLMProvider {
                 if (json.has("p") && json.has("o") && "patch".equals(json.get("o").asText())) {
                     if (json.has("v") && json.get("v").isArray()) {
                         var patchArray = json.get("v");
+                        int patchItemCount = 0;
+                        int totalPatchItems = patchArray.size();
+                        log.info("处理 patch 格式，包含 {} 个操作项", totalPatchItems);
                         for (var patchItem : patchArray) {
                             if (patchItem.has("p") && patchItem.has("o") && patchItem.has("v")) {
                                 String itemPath = patchItem.get("p").asText();
                                 String itemOp = patchItem.get("o").asText();
                                 
-                                // 处理内容路径的 append 操作
-                                if (itemPath != null && itemPath.contains("/message/content/parts/") && "append".equals(itemOp)) {
-                                    if (patchItem.get("v").isTextual()) {
+                                // 处理内容路径的 append 操作，支持更多路径格式
+                                if (itemPath != null && "append".equals(itemOp)) {
+                                    boolean isContentPath = itemPath.contains("/message/content/parts/") ||
+                                                          itemPath.contains("/content/parts/") ||
+                                                          itemPath.contains("/content") ||
+                                                          itemPath.endsWith("/content") ||
+                                                          itemPath.contains("content");
+                                    
+                                    if (isContentPath && patchItem.get("v").isTextual()) {
                                         String content = patchItem.get("v").asText();
                                         if (content != null && !content.isEmpty()) {
                                             text.append(content);
-                                            log.trace("提取内容 (patch格式): {}", content);
+                                            patchItemCount++;
+                                            log.info("提取内容 (patch格式, path={}): {}", itemPath, content);
                                         }
+                                    } else if (isContentPath) {
+                                        log.info("patch 项的值不是文本类型: path={}, op={}, v类型={}", itemPath, itemOp, patchItem.get("v").getNodeType());
+                                    } else {
+                                        log.trace("跳过 patch 项（非内容路径）: path={}, op={}", itemPath, itemOp);
                                     }
+                                } else {
+                                    log.trace("跳过 patch 项（非 append 操作）: path={}, op={}", itemPath, itemOp);
                                 }
+                            } else {
+                                log.info("patch 项格式不完整: {}", patchItem);
                             }
                         }
+                        if (patchItemCount > 0) {
+                            processedCount++;
+                            log.info("patch 格式处理完成，提取了 {} 个内容项，共 {} 个操作项", patchItemCount, totalPatchItems);
+                        } else if (totalPatchItems > 0) {
+                            log.info("patch 格式未提取到任何内容，共 {} 个操作项", totalPatchItems);
+                        }
+                    } else {
+                        log.warn("patch 格式的 v 字段不是数组: {}", jsonStr.length() > 200 ? jsonStr.substring(0, 200) + "..." : jsonStr);
                     }
                     continue;
                 }
+                
+                // 如果都没有匹配，记录未处理的格式
+                skippedCount++;
+                // 检查是否是消息对象（可能包含内容）
+                if (json.has("v") && json.get("v").isObject()) {
+                    var vObj = json.get("v");
+                    if (vObj.has("message")) {
+                        log.debug("跳过消息对象（可能是初始化消息）");
+                    } else {
+                        // 尝试从消息对象中提取内容
+                        if (vObj.has("content") && vObj.get("content").isTextual()) {
+                            String content = vObj.get("content").asText();
+                            if (content != null && !content.isEmpty()) {
+                                text.append(content);
+                                processedCount++;
+                                log.info("从消息对象中提取内容: {}", content.length() > 50 ? content.substring(0, 50) + "..." : content);
+                                continue;
+                            }
+                        }
+                        log.warn("未处理的 JSON 格式（包含 v 对象）: {}", jsonStr.length() > 300 ? jsonStr.substring(0, 300) + "..." : jsonStr);
+                    }
+                } else {
+                    log.warn("未处理的 JSON 格式: {}", jsonStr.length() > 300 ? jsonStr.substring(0, 300) + "..." : jsonStr);
+                }
             } catch (Exception e) {
-                log.debug("解析 SSE 数据行失败: {}", e.getMessage());
+                skippedCount++;
+                log.error("解析 SSE 数据行失败: {} - {}", e.getMessage(), jsonStr.length() > 100 ? jsonStr.substring(0, 100) + "..." : jsonStr);
             }
         }
         
         if (text.length() > 0) {
-            log.debug("从 SSE 提取到 {} 字符", text.length());
+            log.info("从 SSE 提取到 {} 字符，处理了 {} 条数据，跳过了 {} 条", text.length(), processedCount, skippedCount);
+            if (log.isDebugEnabled() && text.length() < 100) {
+                log.debug("提取的内容预览: {}", text.toString());
+            }
             return text.toString();
+        } else if (processedCount > 0 || skippedCount > 0) {
+            log.info("SSE 数据已处理但无文本内容，处理了 {} 条，跳过了 {} 条", processedCount, skippedCount);
+            if (log.isDebugEnabled() && sseData.length() < 500) {
+                log.debug("SSE 数据内容: {}", sseData);
+            }
         }
         return null;
     }

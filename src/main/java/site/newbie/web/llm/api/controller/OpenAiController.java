@@ -91,22 +91,37 @@ public class OpenAiController {
     }
 
     // 处理流式请求 (SSE)
-    private SseEmitter handleStreamRequest(ChatCompletionRequest request, LLMProvider provider) {
+    private Object handleStreamRequest(ChatCompletionRequest request, LLMProvider provider) {
+        String providerName = provider.getProviderName();
+        
+        // 尝试获取锁
+        if (!providerRegistry.tryAcquireLock(providerName)) {
+            log.warn("提供器 {} 正忙，拒绝请求", providerName);
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                    .body(Map.of("error", Map.of(
+                            "message", providerName + " 提供器正忙，请等待当前对话完成后再试",
+                            "type", "provider_busy_error"
+                    )));
+        }
+        
         SseEmitter emitter = new SseEmitter(5 * 60 * 1000L);
         
         // 设置响应头
         emitter.onError((ex) -> {
             System.err.println("SSE Error: " + ex.getMessage());
             ex.printStackTrace();
+            providerRegistry.releaseLock(providerName);
         });
         
         emitter.onTimeout(() -> {
             System.err.println("SSE Timeout");
             emitter.complete();
+            providerRegistry.releaseLock(providerName);
         });
         
         emitter.onCompletion(() -> {
             System.out.println("SSE Completed");
+            providerRegistry.releaseLock(providerName);
         });
         
         // 调用提供者处理请求

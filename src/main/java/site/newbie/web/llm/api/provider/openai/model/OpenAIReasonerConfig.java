@@ -7,6 +7,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import site.newbie.web.llm.api.model.ChatCompletionRequest;
 import site.newbie.web.llm.api.provider.ModelConfig;
+import site.newbie.web.llm.api.provider.SseDataLogger;
 import tools.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
@@ -45,7 +46,7 @@ public class OpenAIReasonerConfig implements OpenAIModelConfig {
             try {
                 page.locator("div.ProseMirror[id='prompt-textarea']").waitFor();
             } catch (Exception e) {
-                log.debug("等待输入框超时: {}", e.getMessage());
+                log.error("等待输入框超时: {}", e.getMessage());
             }
             page.waitForTimeout(1500);
             
@@ -60,7 +61,7 @@ public class OpenAIReasonerConfig implements OpenAIModelConfig {
                     thinkingEnabled = true;
                 }
             } catch (Exception e) {
-                log.debug("检查思考模式状态时出错: {}", e.getMessage());
+                log.error("检查思考模式状态时出错: {}", e.getMessage());
             }
             
             if (!thinkingEnabled) {
@@ -92,7 +93,7 @@ public class OpenAIReasonerConfig implements OpenAIModelConfig {
                             }
                         }
                     } catch (Exception e) {
-                        log.debug("Locator 方法失败: {}", e.getMessage());
+                        log.error("Locator 方法失败: {}", e.getMessage());
                     }
                     
                     // JavaScript 备选方案
@@ -140,7 +141,7 @@ public class OpenAIReasonerConfig implements OpenAIModelConfig {
                                 }
                             }
                         } catch (Exception e) {
-                            log.debug("JavaScript 方法失败: {}", e.getMessage());
+                            log.error("JavaScript 方法失败: {}", e.getMessage());
                         }
                     }
                 }
@@ -180,7 +181,9 @@ public class OpenAIReasonerConfig implements OpenAIModelConfig {
 
         boolean doneDetected = false;
         int doneWaitCount = 0;
-        int maxDoneWaitCount = 15; // 检测到完成标记后，最多等待 3 秒（30 * 100ms）
+        
+        // 用于调试：记录所有接收到的原始 SSE 数据
+        SseDataLogger sseLogger = new SseDataLogger(request.getModel(), request);
         
         while (!finished) {
             try {
@@ -194,6 +197,9 @@ public class OpenAIReasonerConfig implements OpenAIModelConfig {
                     if (doneDetected) {
                         doneWaitCount = 0; // 重置完成等待计数，因为还有新数据
                     }
+                    
+                    // 记录完整的原始 SSE 响应数据（用于调试）
+                    sseLogger.logSseChunk(sseData);
                     
                     // 解析包含思考内容的 SSE
                     ModelConfig.SseParseResult result = extractContentFromSse(sseData);
@@ -223,13 +229,35 @@ public class OpenAIReasonerConfig implements OpenAIModelConfig {
                 } else {
                     noDataCount++;
                     
-                    // 如果已检测到完成标记，等待一段时间确保所有数据都被读取
+                    // 如果已检测到完成标记，检查是否还有数据在缓冲区
                     if (doneDetected) {
+                        // 再次尝试读取，确保没有遗漏的数据
+                        String remainingData = handler.getSseData(page, "__openaiSseData");
+                        if (remainingData != null && !remainingData.isEmpty()) {
+                            // 记录剩余数据的原始 SSE 响应
+                            sseLogger.logSseChunk(remainingData, "剩余数据");
+                            ModelConfig.SseParseResult result = extractContentFromSse(remainingData);
+                            if (result.thinkingContent() != null && !result.thinkingContent().isEmpty()) {
+                                collectedThinkingText.append(result.thinkingContent());
+                                handler.sendThinking(emitter, id, result.thinkingContent(), request.getModel());
+                                log.info("检测到完成标记后，读取到额外思考内容，长度: {}", result.thinkingContent().length());
+                            }
+                            if (result.responseContent() != null && !result.responseContent().isEmpty()) {
+                                collectedText.append(result.responseContent());
+                                handler.sendChunk(emitter, id, result.responseContent(), request.getModel());
+                                log.info("检测到完成标记后，读取到额外回复内容，长度: {}", result.responseContent().length());
+                            }
+                            if (result.thinkingContent() != null || result.responseContent() != null) {
+                                noDataCount = 0; // 重置计数
+                                continue; // 继续循环
+                            }
+                        }
+                        
                         doneWaitCount++;
-                        // 等待最多 3 秒（30 次循环）确保所有数据都被读取
-                        if (doneWaitCount >= maxDoneWaitCount) {
+                        // 等待最多 1 秒（10 次循环）确保所有数据都被读取
+                        if (doneWaitCount >= 10) {
                             finished = true;
-                            log.info("SSE 流已完成（等待 {} 次后结束，共 {}ms）", maxDoneWaitCount, maxDoneWaitCount * 100);
+                            log.info("SSE 流已完成（等待 {} 次后结束，共 {}ms）", doneWaitCount, doneWaitCount * 100);
                         }
                     } else if (noDataCount > 200) {
                         finished = true;
@@ -253,6 +281,9 @@ public class OpenAIReasonerConfig implements OpenAIModelConfig {
                 throw e;
             }
         }
+
+        // 记录完整的原始 SSE 响应数据汇总（用于调试）
+        sseLogger.logSummary(collectedText.length() + collectedThinkingText.length());
 
         handler.sendUrlAndComplete(page, emitter, request);
     }
@@ -303,7 +334,7 @@ public class OpenAIReasonerConfig implements OpenAIModelConfig {
                         }
                     }
                 } catch (Exception e) {
-                    log.debug("读取思考内容时出错: {}", e.getMessage());
+                    log.error("读取思考内容时出错: {}", e.getMessage());
                 }
                 
                 // 检查回复内容
@@ -327,7 +358,7 @@ public class OpenAIReasonerConfig implements OpenAIModelConfig {
                         }
                     }
                 } catch (Exception e) {
-                    log.debug("DOM 查询时出错: {}", e.getMessage());
+                    log.error("DOM 查询时出错: {}", e.getMessage());
                 }
 
                 if (noChangeCount >= 20) break;
@@ -421,24 +452,25 @@ public class OpenAIReasonerConfig implements OpenAIModelConfig {
                 // 或 {"p": "/message/content/parts/0", "o": "append", "v": "回复内容"}
                 // 或 {"p": "/message/content/thoughts/0/content", "o": "append", "v": "思考内容"}
                 // 或 {"p": "/message/content/thoughts", "o": "append", "v": [{"summary": "...", "content": "...", ...}]}
+                // 注意：只处理 append 操作，patch 操作由格式3处理
                 if (json.has("p") && json.has("o") && json.has("v")) {
-                    String path = json.get("p").asText();
-                    String operation = json.get("o").asText();
+                    String path = json.get("p").asString();
+                    String operation = json.get("o").asString();
                     
                     if (path != null && "append".equals(operation)) {
                         // 处理文本内容
-                        if (json.get("v").isTextual()) {
-                            String content = json.get("v").asText();
+                        if (json.get("v").isString()) {
+                            String content = json.get("v").asString();
                             if (content != null && !content.isEmpty()) {
                                 // 判断是思考内容还是回复内容
                                 if (path.contains("/reasoning_content") || 
                                     path.contains("/reasoning") ||
                                     (path.contains("/thoughts/") && path.contains("/content"))) {
                                     thinkingText.append(content);
-                                    log.trace("提取思考内容 (路径格式): {}", content);
+                                    log.info("提取思考内容 (路径格式, path={}): {}", path, content);
                                 } else if (path.contains("/message/content/parts/")) {
                                     responseText.append(content);
-                                    log.trace("提取回复内容 (路径格式): {}", content);
+                                    log.info("提取回复内容 (路径格式, path={}): {}", path, content);
                                 }
                             }
                         }
@@ -446,17 +478,18 @@ public class OpenAIReasonerConfig implements OpenAIModelConfig {
                         else if (json.get("v").isArray() && path.contains("/thoughts") && !path.contains("/content")) {
                             var thoughtsArray = json.get("v");
                             for (var thought : thoughtsArray) {
-                                if (thought.has("content") && thought.get("content").isTextual()) {
-                                    String thoughtContent = thought.get("content").asText();
+                                if (thought.has("content") && thought.get("content").isString()) {
+                                    String thoughtContent = thought.get("content").asString();
                                     if (thoughtContent != null && !thoughtContent.isEmpty()) {
                                         thinkingText.append(thoughtContent);
-                                        log.trace("提取思考内容 (thoughts数组初始化): {}", thoughtContent);
+                                        log.info("提取思考内容 (thoughts数组初始化): {}", thoughtContent);
                                     }
                                 }
                             }
                         }
+                        continue; // 只有 append 操作处理完才跳过
                     }
-                    continue;
+                    // 注意：如果 operation 不是 "append"（如 "patch", "add", "replace"），不要 continue，让后续逻辑处理
                 }
                 
                 // 格式2: {"v": "内容"} 或 {"v": [...]} 或 {"v": {对象}} - 不依赖 event（可能跨批次）
@@ -464,32 +497,32 @@ public class OpenAIReasonerConfig implements OpenAIModelConfig {
                     var vNode = json.get("v");
                     
                     // 如果是文本，通常是回复内容的增量更新
-                    if (vNode.isTextual()) {
-                        String content = vNode.asText();
+                    if (vNode.isString()) {
+                        String content = vNode.asString();
                         if (content != null && !content.isEmpty()) {
                             // 简单格式的文本通常是回复内容
                             responseText.append(content);
-                            log.trace("提取回复内容 (简单格式): {}", content);
+                            log.info("提取回复内容 (简单格式): {}", content);
                         }
                     }
                     // 如果是数组，可能是批量更新: {"v": [{"p": "/message/content/thoughts/0/content", "o": "append", "v": "说"}, ...]}
                     else if (vNode.isArray()) {
                         for (var item : vNode) {
                             if (item.has("p") && item.has("o") && item.has("v")) {
-                                String itemPath = item.get("p").asText();
-                                String itemOp = item.get("o").asText();
+                                String itemPath = item.get("p").asString();
+                                String itemOp = item.get("o").asString();
                                 
                                 if (itemPath != null && "append".equals(itemOp)) {
-                                    if (item.get("v").isTextual()) {
-                                        String content = item.get("v").asText();
+                                    if (item.get("v").isString()) {
+                                        String content = item.get("v").asString();
                                         if (content != null && !content.isEmpty()) {
                                             // 判断是思考内容还是回复内容
                                             if (itemPath.contains("/thoughts/") && itemPath.contains("/content")) {
                                                 thinkingText.append(content);
-                                                log.trace("提取思考内容 (批量数组格式): {}", content);
+                                                log.info("提取思考内容 (批量数组格式, path={}): {}", itemPath, content);
                                             } else if (itemPath.contains("/message/content/parts/")) {
                                                 responseText.append(content);
-                                                log.trace("提取回复内容 (批量数组格式): {}", content);
+                                                log.info("提取回复内容 (批量数组格式, path={}): {}", itemPath, content);
                                             }
                                         }
                                     }
@@ -506,27 +539,27 @@ public class OpenAIReasonerConfig implements OpenAIModelConfig {
                                 var content = message.get("content");
                                 
                                 // 处理思考内容: content_type = "thoughts"
-                                if (content.has("content_type") && "thoughts".equals(content.get("content_type").asText())) {
+                                if (content.has("content_type") && "thoughts".equals(content.get("content_type").asString())) {
                                     if (content.has("thoughts") && content.get("thoughts").isArray()) {
                                         var thoughtsArray = content.get("thoughts");
                                         for (var thought : thoughtsArray) {
-                                            if (thought.has("content") && thought.get("content").isTextual()) {
-                                                String thoughtContent = thought.get("content").asText();
+                                            if (thought.has("content") && thought.get("content").isString()) {
+                                                String thoughtContent = thought.get("content").asString();
                                                 if (thoughtContent != null && !thoughtContent.isEmpty()) {
                                                     thinkingText.append(thoughtContent);
-                                                    log.trace("提取思考内容 (thoughts数组): {}", thoughtContent);
+                                                    log.info("提取思考内容 (thoughts数组): {}", thoughtContent);
                                                 }
                                             }
                                         }
                                     } else {
                                         // thoughts 数组为空，这是正常的，表示没有思考内容
-                                        log.trace("检测到思考消息，但 thoughts 数组为空");
+                                        log.debug("检测到思考消息，但 thoughts 数组为空");
                                     }
                                 }
                                 // 处理思考总结: content_type = "reasoning_recap" (可以忽略，只是状态信息)
-                                else if (content.has("content_type") && "reasoning_recap".equals(content.get("content_type").asText())) {
+                                else if (content.has("content_type") && "reasoning_recap".equals(content.get("content_type").asString())) {
                                     // 这是思考总结，通常显示"已思考若干秒"，不需要发送
-                                    log.trace("检测到思考总结: {}", content.has("content") ? content.get("content").asText() : "");
+                                    log.debug("检测到思考总结: {}", content.has("content") ? content.get("content").asString() : "");
                                 }
                             }
                         }
@@ -535,42 +568,48 @@ public class OpenAIReasonerConfig implements OpenAIModelConfig {
                 }
                 
                 // 格式3: {"p": "", "o": "patch", "v": [...]} - 批量更新
-                if (json.has("p") && json.has("o") && "patch".equals(json.get("o").asText())) {
+                if (json.has("p") && json.has("o") && "patch".equals(json.get("o").asString())) {
                     if (json.has("v") && json.get("v").isArray()) {
                         var patchArray = json.get("v");
+                        int patchItemCount = 0;
+                        log.info("处理 patch 格式，包含 {} 个操作项", patchArray.size());
                         for (var patchItem : patchArray) {
                             if (patchItem.has("p") && patchItem.has("o") && patchItem.has("v")) {
-                                String itemPath = patchItem.get("p").asText();
-                                String itemOp = patchItem.get("o").asText();
+                                String itemPath = patchItem.get("p").asString();
+                                String itemOp = patchItem.get("o").asString();
                                 
                                 if (itemPath != null && "append".equals(itemOp)) {
-                                    if (patchItem.get("v").isTextual()) {
-                                        String content = patchItem.get("v").asText();
+                                    if (patchItem.get("v").isString()) {
+                                        String content = patchItem.get("v").asString();
                                         if (content != null && !content.isEmpty()) {
+                                            patchItemCount++;
                                             if (itemPath.contains("/reasoning_content") || 
                                                 itemPath.contains("/reasoning") ||
                                                 (itemPath.contains("/thoughts/") && itemPath.contains("/content"))) {
                                                 thinkingText.append(content);
-                                                log.trace("提取思考内容 (patch格式): {}", content);
+                                                log.info("提取思考内容 (patch格式, path={}): {}", itemPath, content);
                                             } else if (itemPath.contains("/message/content/parts/")) {
                                                 responseText.append(content);
-                                                log.trace("提取回复内容 (patch格式): {}", content);
+                                                log.info("提取回复内容 (patch格式, path={}): {}", itemPath, content);
                                             }
                                         }
                                     }
                                 }
                             }
                         }
+                        if (patchItemCount > 0) {
+                            log.info("patch 格式处理完成，提取了 {} 个内容项", patchItemCount);
+                        }
                     }
                     continue;
                 }
             } catch (Exception e) {
-                log.debug("解析 SSE 数据行失败: {}", e.getMessage());
+                log.error("解析 SSE 数据行失败: {}", e.getMessage());
             }
         }
         
         if (log.isDebugEnabled() && (thinkingText.length() > 0 || responseText.length() > 0)) {
-            log.debug("SSE 解析结果: thinking={} chars, response={} chars, finished={}", 
+            log.info("SSE 解析结果: thinking={} chars, response={} chars, finished={}", 
                     thinkingText.length(), responseText.length(), finished);
         }
         

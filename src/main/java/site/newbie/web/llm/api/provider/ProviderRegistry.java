@@ -6,6 +6,8 @@ import site.newbie.web.llm.api.model.ModelResponse;
 
 import jakarta.annotation.PostConstruct;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Semaphore;
 import java.util.stream.Collectors;
 
 /**
@@ -20,6 +22,9 @@ public class ProviderRegistry {
     private final Map<String, LLMProvider> modelToProvider = new HashMap<>();
     private final Map<String, LLMProvider> providerNameMap = new HashMap<>();
     
+    // 每个提供器的并发锁：同一提供器同一时间只允许一个对话
+    private final ConcurrentHashMap<String, Semaphore> providerLocks = new ConcurrentHashMap<>();
+    
     public ProviderRegistry(List<LLMProvider> providers) {
         this.providers = providers != null ? providers : new ArrayList<>();
     }
@@ -30,6 +35,9 @@ public class ProviderRegistry {
         for (LLMProvider provider : providers) {
             String providerName = provider.getProviderName();
             providerNameMap.put(providerName, provider);
+            
+            // 为每个提供器创建锁
+            providerLocks.put(providerName, new Semaphore(1));
             
             // 注册该提供者支持的所有模型
             for (String model : provider.getSupportedModels()) {
@@ -45,6 +53,51 @@ public class ProviderRegistry {
      */
     public LLMProvider getProviderByModel(String model) {
         return modelToProvider.get(model);
+    }
+    
+    /**
+     * 尝试获取提供器的锁
+     * @param providerName 提供器名称
+     * @return true 如果成功获取锁，false 如果锁已被占用
+     */
+    public boolean tryAcquireLock(String providerName) {
+        Semaphore lock = providerLocks.get(providerName);
+        if (lock == null) {
+            log.warn("未找到提供器 {} 的锁", providerName);
+            return true; // 如果没有锁，默认允许
+        }
+        boolean acquired = lock.tryAcquire();
+        if (acquired) {
+            log.info("提供器 {} 已获取锁", providerName);
+        } else {
+            log.warn("提供器 {} 正忙，锁已被占用", providerName);
+        }
+        return acquired;
+    }
+    
+    /**
+     * 释放提供器的锁
+     * @param providerName 提供器名称
+     */
+    public void releaseLock(String providerName) {
+        Semaphore lock = providerLocks.get(providerName);
+        if (lock != null) {
+            lock.release();
+            log.info("提供器 {} 已释放锁", providerName);
+        }
+    }
+    
+    /**
+     * 检查提供器是否正忙
+     * @param providerName 提供器名称
+     * @return true 如果提供器正忙（锁被占用）
+     */
+    public boolean isProviderBusy(String providerName) {
+        Semaphore lock = providerLocks.get(providerName);
+        if (lock == null) {
+            return false;
+        }
+        return lock.availablePermits() == 0;
     }
     
     /**

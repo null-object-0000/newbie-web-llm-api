@@ -214,7 +214,7 @@ public class DeepSeekProvider implements LLMProvider {
         }
         
         // 创建新页面
-        page = browserManager.newPage();
+        page = browserManager.newPage(getProviderName());
         modelPages.put(model, page);
         page.navigate(url);
         page.waitForLoadState();
@@ -233,7 +233,7 @@ public class DeepSeekProvider implements LLMProvider {
         }
         
         // 创建新页面
-        Page page = browserManager.newPage();
+        Page page = browserManager.newPage(getProviderName());
         modelPages.put(model, page);
         page.navigate("https://chat.deepseek.com/");
         page.waitForLoadState();
@@ -255,15 +255,15 @@ public class DeepSeekProvider implements LLMProvider {
             }
         }
         
-        // 检查所有 tab
+        // 检查该提供器的所有 tab
         try {
-            for (Page page : browserManager.getAllPages()) {
+            for (Page page : browserManager.getAllPages(getProviderName())) {
                 if (page != null && !page.isClosed() && targetUrl.equals(page.url())) {
                     return page;
                 }
             }
         } catch (Exception e) {
-            log.warn("检查 tab 时出错: {}", e.getMessage());
+            log.error("检查 tab 时出错: {}", e.getMessage());
         }
         
         return null;
@@ -298,7 +298,20 @@ public class DeepSeekProvider implements LLMProvider {
         
         log.info("发送消息: {}", message);
         inputBox.fill(message);
-        page.keyboard().press("Enter");
+        
+        // 点击发送按钮
+        page.waitForTimeout(300);
+        Locator sendButton = page.locator("div.ds-icon-button").filter(
+                new Locator.FilterOptions().setHas(page.locator("svg path[d*='M8.3125 0.981587']"))
+        );
+        if (sendButton.count() > 0) {
+            sendButton.first().click();
+            log.info("已点击发送按钮");
+        } else {
+            // 备用方案：在输入框中按 Enter 键发送
+            log.warn("未找到发送按钮，使用输入框 Enter 键发送");
+            inputBox.press("Enter");
+        }
         page.waitForTimeout(500);
     }
     
@@ -316,7 +329,7 @@ public class DeepSeekProvider implements LLMProvider {
         try {
             page.evaluate(String.format("() => { window.%s = []; }", SSE_DATA_VAR));
         } catch (Exception e) {
-            log.debug("初始化 SSE 数据存储失败: {}", e.getMessage());
+            log.error("初始化 SSE 数据存储失败: {}", e.getMessage());
         }
 
         StringBuilder urlCondition = new StringBuilder();
@@ -458,7 +471,7 @@ public class DeepSeekProvider implements LLMProvider {
                 }
             }
         } catch (Exception e) {
-            log.debug("处理联网搜索时出错: {}", e.getMessage());
+            log.error("处理联网搜索时出错: {}", e.getMessage());
         }
     }
     
@@ -512,7 +525,7 @@ public class DeepSeekProvider implements LLMProvider {
                 }
             }
         } catch (Exception e) {
-            log.warn("发送对话 URL 时出错: {}", e.getMessage());
+            log.error("发送对话 URL 时出错: {}", e.getMessage());
         }
         emitter.send(SseEmitter.event().data("[DONE]", MediaType.TEXT_PLAIN));
         emitter.complete();
@@ -596,7 +609,7 @@ public class DeepSeekProvider implements LLMProvider {
                             if (fragment.has("content")) {
                                 String content = fragment.get("content").asString();
                                 if (content != null && !content.isEmpty()) {
-                                    log.debug("Fragment {} 初始内容: {}", nextIndex, content.length() > 50 ? content.substring(0, 50) + "..." : content);
+                                    log.info("Fragment {} 初始内容: {}", nextIndex, content.length() > 50 ? content.substring(0, 50) + "..." : content);
                                     if ("THINK".equals(type)) thinkingText.append(content);
                                     else if ("RESPONSE".equals(type)) responseText.append(content);
                                 }
@@ -622,7 +635,7 @@ public class DeepSeekProvider implements LLMProvider {
                             }
                         }
                     } else {
-                        log.debug("无法从路径提取索引: {}", path);
+                        log.info("无法从路径提取索引: {}", path);
                     }
                 }
                 // 简单格式 - 只有 v 字段，没有 p 字段
@@ -688,12 +701,12 @@ public class DeepSeekProvider implements LLMProvider {
                     }
                 }
             } catch (Exception e) {
-                log.debug("解析 SSE 数据行时出错: {}, line: {}", e.getMessage(), line.length() > 100 ? line.substring(0, 100) + "..." : line);
+                log.info("解析 SSE 数据行时出错: {}, line: {}", e.getMessage(), line.length() > 100 ? line.substring(0, 100) + "..." : line);
             }
         }
         
         if (log.isDebugEnabled() && (thinkingText.length() > 0 || responseText.length() > 0)) {
-            log.debug("SSE 解析结果: thinking={} chars, response={} chars, finished={}", 
+            log.info("SSE 解析结果: thinking={} chars, response={} chars, finished={}", 
                     thinkingText.length(), responseText.length(), finished);
         }
         
@@ -721,7 +734,7 @@ public class DeepSeekProvider implements LLMProvider {
                 return Integer.parseInt(indexStr);
             }
         } catch (Exception e) {
-            log.debug("提取 fragment 索引失败: path={}", path);
+            log.info("提取 fragment 索引失败: path={}", path);
         }
         return null;
     }

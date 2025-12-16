@@ -7,6 +7,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import site.newbie.web.llm.api.model.ChatCompletionRequest;
 import site.newbie.web.llm.api.provider.ModelConfig;
+import site.newbie.web.llm.api.provider.SseDataLogger;
 
 import java.io.IOException;
 import java.util.UUID;
@@ -38,7 +39,7 @@ public class DeepSeekReasonerConfig implements DeepSeekModelConfig {
             try {
                 page.locator("textarea").waitFor();
             } catch (Exception e) {
-                log.debug("等待输入框超时: {}", e.getMessage());
+                log.error("等待输入框超时: {}", e.getMessage());
             }
             page.waitForTimeout(1500);
             
@@ -80,7 +81,7 @@ public class DeepSeekReasonerConfig implements DeepSeekModelConfig {
                         thinkingEnabled = true;
                     }
                 } catch (Exception e) {
-                    log.debug("Locator 方法失败: {}", e.getMessage());
+                    log.error("Locator 方法失败: {}", e.getMessage());
                 }
                 
                 if (!thinkingEnabled) {
@@ -116,7 +117,7 @@ public class DeepSeekReasonerConfig implements DeepSeekModelConfig {
                             log.info("通过 JavaScript 处理深度思考模式: {}", result);
                         }
                     } catch (Exception e) {
-                        log.debug("JavaScript 方法失败: {}", e.getMessage());
+                        log.error("JavaScript 方法失败: {}", e.getMessage());
                     }
                 }
             }
@@ -125,7 +126,7 @@ public class DeepSeekReasonerConfig implements DeepSeekModelConfig {
                 log.warn("无法启用深度思考模式");
             }
         } catch (Exception e) {
-            log.warn("启用深度思考模式时出错: {}", e.getMessage());
+            log.error("启用深度思考模式时出错: {}", e.getMessage());
         }
     }
 
@@ -155,6 +156,9 @@ public class DeepSeekReasonerConfig implements DeepSeekModelConfig {
         
         java.util.Map<Integer, String> fragmentTypeMap = new ConcurrentHashMap<>();
         Integer lastActiveFragmentIndex = null;
+        
+        // 用于调试：记录所有接收到的原始 SSE 数据
+        SseDataLogger sseLogger = new SseDataLogger(request.getModel(), request);
 
         while (!finished) {
             try {
@@ -164,6 +168,9 @@ public class DeepSeekReasonerConfig implements DeepSeekModelConfig {
                 
                 if (sseData != null && !sseData.isEmpty()) {
                     noDataCount = 0;
+                    
+                    // 记录完整的原始 SSE 响应数据（用于调试）
+                    sseLogger.logSseChunk(sseData);
                     
                     ModelConfig.ParseResultWithIndex parseResult = handler.parseSseIncremental(sseData, fragmentTypeMap, lastActiveFragmentIndex);
                     ModelConfig.SseParseResult result = parseResult.result();
@@ -206,7 +213,7 @@ public class DeepSeekReasonerConfig implements DeepSeekModelConfig {
                                 }
                             }
                         } catch (Exception e) {
-                            log.debug("检查完成标记时出错: {}", e.getMessage());
+                            log.error("检查完成标记时出错: {}", e.getMessage());
                         }
                         
                         if (!finished && noDataCount > 200) {
@@ -229,9 +236,12 @@ public class DeepSeekReasonerConfig implements DeepSeekModelConfig {
             }
         }
 
+        // 记录完整的原始 SSE 响应数据汇总（用于调试）
+        sseLogger.logSummary(collectedResponseText.length() + collectedThinkingText.length());
+
         handler.sendUrlAndComplete(page, emitter, request);
     }
-
+    
     private void monitorResponseHybrid(DeepSeekContext context) throws IOException, InterruptedException {
         Page page = context.page();
         SseEmitter emitter = context.emitter();
@@ -279,7 +289,7 @@ public class DeepSeekReasonerConfig implements DeepSeekModelConfig {
                         }
                     }
                 } catch (Exception e) {
-                    log.debug("读取思考内容时出错: {}", e.getMessage());
+                    log.error("读取思考内容时出错: {}", e.getMessage());
                 }
                     
                 // 检查回复内容
@@ -303,7 +313,7 @@ public class DeepSeekReasonerConfig implements DeepSeekModelConfig {
                         }
                     }
                 } catch (Exception e) {
-                    log.debug("DOM 查询时出错: {}", e.getMessage());
+                    log.error("DOM 查询时出错: {}", e.getMessage());
                 }
 
                 if (!sseFinished) {
@@ -374,7 +384,7 @@ public class DeepSeekReasonerConfig implements DeepSeekModelConfig {
                 handler.sendReplace(emitter, id, finalText, model);
             }
         } catch (Exception e) {
-            log.warn("获取最终回复时出错: {}", e.getMessage());
+            log.error("获取最终回复时出错: {}", e.getMessage());
         }
     }
     

@@ -7,6 +7,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import site.newbie.web.llm.api.model.ChatCompletionRequest;
 import site.newbie.web.llm.api.provider.ModelConfig;
+import site.newbie.web.llm.api.provider.SseDataLogger;
 
 import java.io.IOException;
 import java.util.UUID;
@@ -80,7 +81,7 @@ public class DeepSeekChatConfig implements DeepSeekModelConfig {
                 }
             }
         } catch (Exception e) {
-            log.debug("关闭深度思考模式时出错: {}", e.getMessage());
+            log.error("关闭深度思考模式时出错: {}", e.getMessage());
         }
     }
 
@@ -109,6 +110,9 @@ public class DeepSeekChatConfig implements DeepSeekModelConfig {
         
         java.util.Map<Integer, String> fragmentTypeMap = new ConcurrentHashMap<>();
         Integer lastActiveFragmentIndex = null;
+        
+        // 用于调试：记录所有接收到的原始 SSE 数据
+        SseDataLogger sseLogger = new SseDataLogger(request.getModel(), request);
 
         while (!finished) {
             try {
@@ -122,6 +126,9 @@ public class DeepSeekChatConfig implements DeepSeekModelConfig {
                 if (sseData != null && !sseData.isEmpty()) {
                     noDataCount = 0;
                     
+                    // 记录完整的原始 SSE 响应数据（用于调试）
+                    sseLogger.logSseChunk(sseData);
+                    
                     ModelConfig.ParseResultWithIndex parseResult = handler.parseSseIncremental(sseData, fragmentTypeMap, lastActiveFragmentIndex);
                     ModelConfig.SseParseResult result = parseResult.result();
                     lastActiveFragmentIndex = parseResult.lastActiveFragmentIndex();
@@ -129,7 +136,7 @@ public class DeepSeekChatConfig implements DeepSeekModelConfig {
                     // 只发送回复内容，忽略思考内容
                     if (result.responseContent() != null && !result.responseContent().isEmpty()) {
                         collectedResponseText.append(result.responseContent());
-                        log.debug("发送回复内容增量，长度: {}", result.responseContent().length());
+                        log.info("发送回复内容增量，长度: {}", result.responseContent().length());
                         handler.sendChunk(emitter, id, result.responseContent(), request.getModel());
                     }
                     
@@ -159,7 +166,7 @@ public class DeepSeekChatConfig implements DeepSeekModelConfig {
                                 }
                             }
                         } catch (Exception e) {
-                            log.debug("检查完成标记时出错: {}", e.getMessage());
+                            log.error("检查完成标记时出错: {}", e.getMessage());
                         }
                         
                         if (!finished && noDataCount > 200) {
@@ -186,6 +193,9 @@ public class DeepSeekChatConfig implements DeepSeekModelConfig {
                 throw e;
             }
         }
+
+        // 记录完整的原始 SSE 响应数据汇总（用于调试）
+        sseLogger.logSummary(collectedResponseText.length());
 
         handler.sendUrlAndComplete(page, emitter, request);
     }
@@ -242,7 +252,7 @@ public class DeepSeekChatConfig implements DeepSeekModelConfig {
                         }
                     }
                 } catch (Exception e) {
-                    log.debug("DOM 查询时出错: {}", e.getMessage());
+                    log.error("DOM 查询时出错: {}", e.getMessage());
                 }
 
                 if (!sseFinished) {
@@ -313,7 +323,7 @@ public class DeepSeekChatConfig implements DeepSeekModelConfig {
                 handler.sendReplace(emitter, id, finalText, model);
             }
         } catch (Exception e) {
-            log.warn("获取最终回复时出错: {}", e.getMessage());
+            log.error("获取最终回复时出错: {}", e.getMessage());
         }
     }
     
