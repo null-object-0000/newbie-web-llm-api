@@ -287,7 +287,7 @@ public class DeepSeekProvider implements LLMProvider {
     }
     
     private void sendMessage(Page page, ChatCompletionRequest request) {
-        Locator inputBox = page.locator("textarea");
+        Locator inputBox = page.locator("textarea.ds-scroll-area");
         inputBox.waitFor();
         
         String message = request.getMessages().stream()
@@ -298,6 +298,15 @@ public class DeepSeekProvider implements LLMProvider {
         
         log.info("发送消息: {}", message);
         inputBox.fill(message);
+
+        // 验证是否填充完成
+        page.waitForTimeout(200);
+        String filledText = inputBox.inputValue();
+
+        if (!filledText.equals(message)) {
+            log.warn("输入框内容与预期不符，重试填充");
+            inputBox.fill(message);
+        }
         
         // 点击发送按钮
         page.waitForTimeout(300);
