@@ -247,7 +247,7 @@ LLMProvider (接口)
     │   ├── sendSseChunk() - 发送 SSE 数据块
     │   ├── sendSseReplace() - 发送整体替换消息
     │   ├── sendThinkingContent() - 发送思考内容
-    │   └── sendConversationUrl() - 发送对话 URL
+    │   └── sendConversationId() - 发送对话 ID
     │
     └── DeepSeekProvider (DeepSeek 实现)
         ├── streamChat() - 流式聊天

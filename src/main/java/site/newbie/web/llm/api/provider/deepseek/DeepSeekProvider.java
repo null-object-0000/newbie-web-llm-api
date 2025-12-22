@@ -5,16 +5,20 @@ import com.microsoft.playwright.Page;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
-import org.springframework.http.MediaType;
 import site.newbie.web.llm.api.manager.BrowserManager;
 import site.newbie.web.llm.api.model.ChatCompletionRequest;
 import site.newbie.web.llm.api.model.ChatCompletionResponse;
 import site.newbie.web.llm.api.provider.LLMProvider;
+import site.newbie.web.llm.api.model.LoginInfo;
+import site.newbie.web.llm.api.manager.LoginSessionManager;
 import site.newbie.web.llm.api.provider.ModelConfig;
+import site.newbie.web.llm.api.provider.ProviderRegistry;
+import org.springframework.context.annotation.Lazy;
 import site.newbie.web.llm.api.provider.deepseek.model.DeepSeekModelConfig;
-import site.newbie.web.llm.api.provider.deepseek.model.DeepSeekModelConfig.*;
+import site.newbie.web.llm.api.provider.deepseek.model.DeepSeekModelConfig.DeepSeekContext;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
@@ -40,6 +44,8 @@ public class DeepSeekProvider implements LLMProvider {
     private final BrowserManager browserManager;
     private final ObjectMapper objectMapper;
     private final Map<String, DeepSeekModelConfig> modelConfigs;
+    private final ProviderRegistry providerRegistry;
+    private final LoginSessionManager loginSessionManager;
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
     
     // 页面管理
@@ -95,9 +101,12 @@ public class DeepSeekProvider implements LLMProvider {
     };
 
     public DeepSeekProvider(BrowserManager browserManager, ObjectMapper objectMapper, 
-                           List<DeepSeekModelConfig> configs) {
+                           List<DeepSeekModelConfig> configs, @Lazy ProviderRegistry providerRegistry,
+                           LoginSessionManager loginSessionManager) {
         this.browserManager = browserManager;
         this.objectMapper = objectMapper;
+        this.providerRegistry = providerRegistry;
+        this.loginSessionManager = loginSessionManager;
         this.modelConfigs = configs.stream()
                 .collect(Collectors.toMap(DeepSeekModelConfig::getModelName, Function.identity()));
         log.info("DeepSeekProvider 初始化完成，支持的模型: {}", modelConfigs.keySet());
@@ -114,6 +123,366 @@ public class DeepSeekProvider implements LLMProvider {
     }
 
     @Override
+    public boolean checkLoginStatus(Page page) {
+        try {
+            if (page == null || page.isClosed()) {
+                log.warn("页面为空或已关闭，无法检查登录状态");
+                return false;
+            }
+            
+            // 等待页面加载完成
+            page.waitForLoadState();
+            page.waitForTimeout(1000);
+            
+            // 检查是否存在聊天输入框（已登录会有聊天输入框）
+            // DeepSeek 的聊天输入框通常是 textarea 元素
+            Locator chatInputBox = page.locator("textarea")
+                    .or(page.locator("textarea[placeholder*='输入']"))
+                    .or(page.locator("textarea[placeholder*='输入消息']"))
+                    .or(page.locator("textarea.ds-scroll-area"));
+            
+            if (chatInputBox.count() > 0) {
+                // 检查输入框是否可见和可用
+                Locator visibleInput = chatInputBox.first();
+                if (visibleInput.isVisible() && visibleInput.isEnabled()) {
+                    log.info("检测到聊天输入框，判断为已登录");
+                    return true;
+                }
+            }
+            
+            // 如果没有聊天输入框，说明未登录
+            log.info("未检测到聊天输入框，判断为未登录");
+            return false;
+        } catch (Exception e) {
+            log.error("检查登录状态时出错: {}", e.getMessage(), e);
+            return false;
+        }
+    }
+    
+    @Override
+    public LoginInfo getLoginInfo(Page page) {
+        boolean loggedIn = checkLoginStatus(page);
+        if (!loggedIn) {
+            return LoginInfo.notLoggedIn();
+        }
+        
+        return LoginInfo.loggedIn();
+    }
+    
+    @Override
+    public boolean handleLogin(ChatCompletionRequest request, SseEmitter emitter, 
+                               LoginSessionManager.LoginSession session) {
+        Page page = null;
+        try {
+            log.info("开始处理 DeepSeek 登录流程，登录方式: {}", session.getLoginMethod());
+            
+            // 获取或创建登录页面
+            page = getOrCreateLoginPage();
+            
+            // 等待页面加载
+            page.waitForLoadState();
+            page.waitForTimeout(1000);
+            
+            // 根据登录方式处理
+            if (session.getLoginMethod() == LoginSessionManager.LoginMethod.ACCOUNT_PASSWORD) {
+                return handleAccountPasswordLogin(page, session);
+            } else {
+                log.warn("不支持的登录方式: {}", session.getLoginMethod());
+                return false;
+            }
+        } catch (Exception e) {
+            log.error("处理登录时出错: {}", e.getMessage(), e);
+            return false;
+        } finally {
+            // 注意：登录页面不关闭，保持登录状态
+            if (page != null && !page.isClosed()) {
+                // 登录成功后，页面可以保留用于后续聊天
+                log.info("登录页面已保留");
+            }
+        }
+    }
+    
+    /**
+     * 获取或创建登录页面
+     */
+    private Page getOrCreateLoginPage() {
+        // 查找是否已有登录页面
+        for (Page existingPage : modelPages.values()) {
+            if (existingPage != null && !existingPage.isClosed()) {
+                String url = existingPage.url();
+                if (url.contains("chat.deepseek.com")) {
+                    // 检查是否是登录页面（没有聊天输入框说明是登录页面）
+                    try {
+                        Locator chatInput = existingPage.locator("textarea")
+                                .or(existingPage.locator("textarea[placeholder*='输入']"))
+                                .or(existingPage.locator("textarea.ds-scroll-area"));
+                        if (chatInput.count() == 0) {
+                            log.info("找到现有登录页面（未检测到聊天输入框）");
+                            return existingPage;
+                        }
+                    } catch (Exception e) {
+                        // 忽略错误，继续创建新页面
+                    }
+                }
+            }
+        }
+        
+        // 创建新的登录页面
+        log.info("创建新的登录页面");
+        Page page = browserManager.newPage(getProviderName());
+        page.navigate("https://chat.deepseek.com/");
+        page.waitForLoadState();
+        return page;
+    }
+    
+    /**
+     * 处理账号+密码登录
+     */
+    private boolean handleAccountPasswordLogin(Page page, LoginSessionManager.LoginSession session) {
+        try {
+            log.info("开始账号+密码登录，账号: {}", session.getAccount());
+            
+            // 设置登录接口拦截器，监听登录响应
+            setupLoginInterceptor(page);
+            
+            // 1. 切换到"密码登录"标签
+            Locator passwordTab = page.locator(".ds-tab:has-text('密码登录')");
+            if (passwordTab.count() == 0) {
+                // 尝试英文
+                passwordTab = page.locator(".ds-tab:has-text('Password')");
+            }
+            
+            if (passwordTab.count() > 0) {
+                passwordTab.first().click();
+                page.waitForTimeout(500);
+                log.info("已切换到密码登录标签");
+            } else {
+                log.warn("未找到密码登录标签，可能已经在密码登录模式");
+            }
+            
+            // 2. 等待登录表单加载
+            page.waitForTimeout(500);
+            
+            // 3. 输入账号（可能是邮箱或用户名）
+            Locator accountInput = page.locator("input[placeholder*='账号']")
+                    .or(page.locator("input[placeholder*='邮箱']"))
+                    .or(page.locator("input[placeholder*='用户名']"))
+                    .or(page.locator("input[type='text']"))
+                    .or(page.locator("input[type='email']"));
+            
+            if (accountInput.count() == 0) {
+                log.error("未找到账号输入框");
+                return false;
+            }
+            
+            accountInput.first().click();
+            page.waitForTimeout(200);
+            accountInput.first().fill(session.getAccount());
+            page.waitForTimeout(300);
+            log.info("已输入账号");
+            
+            // 4. 输入密码
+            Locator passwordInput = page.locator("input[type='password']");
+            if (passwordInput.count() == 0) {
+                log.error("未找到密码输入框");
+                return false;
+            }
+            
+            passwordInput.first().click();
+            page.waitForTimeout(200);
+            passwordInput.first().fill(session.getPassword());
+            page.waitForTimeout(300);
+            log.info("已输入密码");
+            
+            // 5. 点击登录按钮
+            Locator loginButton = page.locator(".ds-sign-up-form__register-button")
+                    .or(page.locator("button:has-text('登录')"))
+                    .or(page.locator("button:has-text('Login')"));
+            
+            if (loginButton.count() == 0) {
+                log.error("未找到登录按钮");
+                return false;
+            }
+            
+            loginButton.first().click();
+            log.info("已点击登录按钮");
+            
+            // 6. 等待登录接口响应（最多等待5秒）
+            String loginResponse = null;
+            for (int i = 0; i < 10; i++) {
+                page.waitForTimeout(500);
+                loginResponse = getLoginResponse(page);
+                if (loginResponse != null && !loginResponse.isEmpty()) {
+                    log.info("获取到登录接口响应");
+                    break;
+                }
+            }
+            
+            // 检查登录接口响应
+            if (loginResponse != null && !loginResponse.isEmpty()) {
+                LoginResponseResult result = parseLoginResponse(loginResponse);
+                if (result != null) {
+                    if (!result.success()) {
+                        log.warn("登录失败: biz_code={}, biz_msg={}", result.bizCode(), result.bizMsg());
+                        // 将错误信息保存到 session 中，供 Controller 使用
+                        session.setLoginError(result.bizMsg());
+                        return false;
+                    } else {
+                        log.info("登录接口返回成功: biz_code={}", result.bizCode());
+                    }
+                }
+            } else {
+                log.warn("未获取到登录接口响应，继续等待页面变化");
+            }
+            
+            // 7. 等待登录完成（检查聊天输入框是否出现）
+            // 等待最多10秒，检查是否登录成功
+            for (int i = 0; i < 10; i++) {
+                page.waitForTimeout(1000);
+                
+                // 检查聊天输入框是否出现（已登录会有聊天输入框）
+                Locator chatInput = page.locator("textarea")
+                        .or(page.locator("textarea[placeholder*='输入']"))
+                        .or(page.locator("textarea[placeholder*='输入消息']"))
+                        .or(page.locator("textarea.ds-scroll-area"));
+                
+                if (chatInput.count() > 0) {
+                    // 检查输入框是否可见和可用
+                    Locator visibleInput = chatInput.first();
+                    if (visibleInput.isVisible() && visibleInput.isEnabled()) {
+                        log.info("登录成功！检测到聊天输入框");
+                        return true;
+                    }
+                }
+                
+                // 检查是否有错误提示
+                Locator errorMsg = page.locator("[class*='error'], [class*='Error']")
+                        .or(page.locator(":has-text('错误')"))
+                        .or(page.locator(":has-text('失败')"));
+                if (errorMsg.count() > 0) {
+                    String errorText = errorMsg.first().textContent();
+                    log.warn("检测到错误提示: {}", errorText);
+                    // 不立即返回false，继续等待
+                }
+            }
+            
+            // 最终检查登录状态
+            Locator chatInput = page.locator("textarea.ds-scroll-area");
+            if (chatInput.count() > 0) {
+                log.info("登录成功！");
+                return true;
+            } else {
+                log.warn("登录超时或失败");
+                return false;
+            }
+        } catch (Exception e) {
+            log.error("账号+密码登录过程中出错: {}", e.getMessage(), e);
+            return false;
+        }
+    }
+
+    /**
+         * 登录响应结果
+         */
+        private record LoginResponseResult(boolean success, int bizCode, String bizMsg) {
+    }
+    
+    /**
+     * 设置登录接口拦截器
+     */
+    private void setupLoginInterceptor(Page page) {
+        try {
+            // 清空旧的登录响应数据
+            page.evaluate("() => { window.__deepseekLoginResponse = null; }");
+            
+            String jsCode = """
+                (function() {
+                    if (window.__deepseekLoginInterceptorSet) return;
+                    window.__deepseekLoginInterceptorSet = true;
+                    
+                    const originalFetch = window.fetch;
+                    window.fetch = function(...args) {
+                        const url = args[0];
+                        if (typeof url === 'string' && url.includes('/api/v0/users/login')) {
+                            return originalFetch.apply(this, args).then(async response => {
+                                try {
+                                    const clonedResponse = response.clone();
+                                    const responseData = await clonedResponse.json();
+                                    window.__deepseekLoginResponse = JSON.stringify(responseData);
+                                    console.log('登录接口响应:', responseData);
+                                } catch (e) {
+                                    console.error('解析登录响应失败:', e);
+                                }
+                                return response;
+                            }).catch(err => {
+                                console.error('登录请求失败:', err);
+                                return originalFetch.apply(this, args);
+                            });
+                        }
+                        return originalFetch.apply(this, args);
+                    };
+                })();
+                """;
+            
+            page.evaluate(jsCode);
+            log.info("已设置登录接口拦截器");
+        } catch (Exception e) {
+            log.error("设置登录接口拦截器失败: {}", e.getMessage(), e);
+        }
+    }
+    
+    /**
+     * 获取登录接口响应
+     */
+    private String getLoginResponse(Page page) {
+        try {
+            if (page.isClosed()) return null;
+            Object result = page.evaluate("() => window.__deepseekLoginResponse || null");
+            return result != null ? result.toString() : null;
+        } catch (Exception e) {
+            log.warn("获取登录响应时出错: {}", e.getMessage());
+            return null;
+        }
+    }
+    
+    /**
+     * 解析登录响应
+     */
+    private LoginResponseResult parseLoginResponse(String responseJson) {
+        try {
+            JsonNode json = objectMapper.readTree(responseJson);
+            
+            // 检查 code 字段
+            int code = json.has("code") ? json.get("code").asInt() : -1;
+            
+            // 检查 data 字段
+            if (json.has("data") && json.get("data").isObject()) {
+                JsonNode data = json.get("data");
+                int bizCode = data.has("biz_code") ? data.get("biz_code").asInt() : 0;
+                String bizMsg = "";
+                if (data.has("biz_msg")) {
+                    JsonNode bizMsgNode = data.get("biz_msg");
+                    if (bizMsgNode != null && bizMsgNode.isString()) {
+                        bizMsg = bizMsgNode.asString();
+                    }
+                }
+                
+                // biz_code 为 0 表示成功，非 0 表示失败
+                boolean success = (code == 0 && bizCode == 0);
+                
+                return new LoginResponseResult(success, bizCode, bizMsg);
+            }
+            
+            // 如果没有 data 字段，根据 code 判断
+            boolean success = (code == 0);
+            return new LoginResponseResult(success, code, code == 0 ? "成功" : "失败");
+        } catch (Exception e) {
+            log.error("解析登录响应失败: {}", e.getMessage(), e);
+            return null;
+        }
+    }
+
+    @Override
     public void streamChat(ChatCompletionRequest request, SseEmitter emitter) {
         executor.submit(() -> {
             Page page = null;
@@ -127,6 +496,30 @@ public class DeepSeekProvider implements LLMProvider {
 
                 // 1. 获取或创建页面
                 page = getOrCreatePage(request);
+                
+                // 1.5. 检查登录状态（在创建页面后再次检查，因为页面创建时可能检测到登录状态丢失）
+                if (!checkLoginStatus(page)) {
+                    log.warn("检测到未登录状态，发送登录提示");
+                    // 注意：不在这里更新 providerRegistry 的状态，避免循环依赖
+                    // 状态更新由 Controller 层处理
+                    
+                    // 获取或生成对话ID
+                    String conversationId = getConversationId(request);
+                    if (conversationId == null || conversationId.isEmpty()) {
+                        conversationId = "login-" + UUID.randomUUID();
+                    }
+                    
+                    // 创建登录会话
+                    LoginSessionManager.LoginSession session = loginSessionManager.getOrCreateSession(getProviderName(), conversationId);
+                    session.setConversationId(conversationId);
+                    session.setState(LoginSessionManager.LoginSessionState.WAITING_LOGIN_METHOD);
+                    // 保存会话（确保状态被持久化）
+                    loginSessionManager.saveSession(getProviderName(), conversationId, session);
+                    
+                    // 发送登录方式选择提示
+                    sendLoginMethodSelection(emitter, request.getModel(), getProviderName(), conversationId);
+                    return;
+                }
                 
                 // 2. 设置 SSE 拦截器
                 setupSseInterceptor(page);
@@ -170,11 +563,12 @@ public class DeepSeekProvider implements LLMProvider {
     
     private Page getOrCreatePage(ChatCompletionRequest request) {
         String model = request.getModel();
-        String conversationUrl = getConversationUrl(request);
+        String conversationId = getConversationId(request);
         boolean isNewConversation = isNewConversation(request);
         
         Page page;
-        if (!isNewConversation && conversationUrl != null) {
+        if (!isNewConversation && conversationId != null) {
+            String conversationUrl = buildUrlFromConversationId(conversationId);
             page = findOrCreatePageForUrl(conversationUrl, model);
         } else {
             page = createNewConversationPage(model);
@@ -183,17 +577,23 @@ public class DeepSeekProvider implements LLMProvider {
         return page;
     }
     
-    private String getConversationUrl(ChatCompletionRequest request) {
-        String url = request.getConversationUrl();
-        if ((url == null || url.isEmpty()) && request.getMessages() != null) {
-            url = extractUrlFromHistory(request);
+    private String getConversationId(ChatCompletionRequest request) {
+        // 首先尝试从请求中获取
+        String conversationId = request.getConversationId();
+        if (conversationId != null && !conversationId.isEmpty()) {
+            return conversationId;
         }
-        return url;
+        
+        // 从历史消息中提取
+        if (request.getMessages() != null) {
+            conversationId = extractConversationIdFromHistory(request);
+        }
+        return conversationId;
     }
     
     private boolean isNewConversation(ChatCompletionRequest request) {
-        String url = getConversationUrl(request);
-        return url == null || url.isEmpty() || !url.contains("chat.deepseek.com");
+        String conversationId = getConversationId(request);
+        return conversationId == null || conversationId.isEmpty() || conversationId.startsWith("login-");
     }
     
     private Page findOrCreatePageForUrl(String url, String model) {
@@ -207,6 +607,8 @@ public class DeepSeekProvider implements LLMProvider {
             if (!currentUrl.equals(url)) {
                 page.navigate(url);
                 page.waitForLoadState();
+                // 检测登录状态是否丢失
+                checkLoginStatusLost(page);
             }
             modelPages.put(model, page);
             pageUrls.put(model, url);
@@ -220,6 +622,8 @@ public class DeepSeekProvider implements LLMProvider {
         page.waitForLoadState();
         pageUrls.put(model, url);
         log.info("已导航到对话 URL: {}", url);
+        // 检测登录状态是否丢失
+        checkLoginStatusLost(page);
         return page;
     }
     
@@ -238,7 +642,39 @@ public class DeepSeekProvider implements LLMProvider {
         page.navigate("https://chat.deepseek.com/");
         page.waitForLoadState();
         pageUrls.put(model, page.url());
+        // 检测登录状态是否丢失
+        checkLoginStatusLost(page);
         return page;
+    }
+    
+    /**
+     * 检测登录状态是否丢失（通过检查是否有登录按钮）
+     * 如果检测到登录按钮，说明登录状态丢失
+     * 注意：不在这里更新 providerRegistry 的状态，避免循环依赖
+     */
+    private void checkLoginStatusLost(Page page) {
+        try {
+            if (page == null || page.isClosed()) {
+                return;
+            }
+            
+            // 等待页面加载完成
+            page.waitForLoadState();
+            page.waitForTimeout(1000);
+            
+            // 检查是否有登录按钮（登录状态丢失时会出现登录按钮）
+            Locator loginButton = page.locator(".ds-sign-up-form__register-button")
+                    .or(page.locator("button:has-text('登录')"))
+                    .or(page.locator("button:has-text('Login')"));
+            
+            if (loginButton.count() > 0 && loginButton.first().isVisible()) {
+                log.warn("检测到登录按钮，说明登录状态已丢失");
+                // 注意：不在这里更新 providerRegistry 的状态，避免循环依赖
+                // 状态更新由 Controller 层处理
+            }
+        } catch (Exception e) {
+            log.warn("检测登录状态丢失时出错: {}", e.getMessage());
+        }
     }
     
     private Page findPageByUrl(String targetUrl) {
@@ -489,6 +925,64 @@ public class DeepSeekProvider implements LLMProvider {
     // UTF-8 编码的 MediaType，确保中文和 emoji 正确传输
     private static final MediaType APPLICATION_JSON_UTF8 = new MediaType("application", "json", StandardCharsets.UTF_8);
     
+    /**
+     * 发送登录方式选择提示
+     */
+    private void sendLoginMethodSelection(SseEmitter emitter, String model, String providerName, String conversationId) {
+        try {
+            StringBuilder message = new StringBuilder();
+            message.append("```nwla-system-message\n");
+            message.append("当前未登录，请选择登录方式：\n\n");
+            message.append("1. 手机号+验证码登录\n");
+            message.append("2. 账号+密码登录\n");
+            message.append("3. 微信扫码登录\n\n");
+            message.append("请输入对应的数字（1、2、3）来选择登录方式。");
+            message.append("\n```");
+            
+            // 如果提供了对话ID，在消息中包含对话ID信息
+            if (conversationId != null && !conversationId.isEmpty()) {
+                message.append("\n\n```nwla-conversation-id\n");
+                message.append(conversationId);
+                message.append("\n```");
+            }
+            
+            String id = UUID.randomUUID().toString();
+            ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
+                    .delta(ChatCompletionResponse.Delta.builder().content(message.toString()).build())
+                    .index(0).build();
+            ChatCompletionResponse response = ChatCompletionResponse.builder()
+                    .id(id).object("chat.completion.chunk")
+                    .created(System.currentTimeMillis() / 1000)
+                    .model(model).choices(List.of(choice)).build();
+            
+            emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(response), APPLICATION_JSON_UTF8));
+            emitter.send(SseEmitter.event().data("[DONE]", MediaType.TEXT_PLAIN));
+            emitter.complete();
+            
+            // 释放锁
+            if (providerName != null) {
+                new Thread(() -> {
+                    try {
+                        Thread.sleep(100);
+                        providerRegistry.releaseLock(providerName);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }).start();
+            }
+        } catch (Exception e) {
+            log.error("发送登录方式选择提示时出错", e);
+            try {
+                emitter.completeWithError(e);
+            } catch (Exception ex) {
+                // 忽略
+            }
+            if (providerName != null) {
+                providerRegistry.releaseLock(providerName);
+            }
+        }
+    }
+    
     private void sendSseChunk(SseEmitter emitter, String id, String content, String model) throws IOException {
         ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
                 .delta(ChatCompletionResponse.Delta.builder().content(content).build())
@@ -529,19 +1023,24 @@ public class DeepSeekProvider implements LLMProvider {
                 String url = page.url();
                 if (url.contains("chat.deepseek.com")) {
                     pageUrls.put(request.getModel(), url);
-                    sendConversationUrl(emitter, UUID.randomUUID().toString(), url, request.getModel());
-                    log.info("已发送对话 URL: {}", url);
+                    String conversationId = extractConversationIdFromUrl(url);
+                    if (conversationId != null && !conversationId.isEmpty()) {
+                        sendConversationId(emitter, UUID.randomUUID().toString(), conversationId, request.getModel());
+                        log.info("已发送对话 ID: {} (从 URL: {})", conversationId, url);
+                    } else {
+                        log.warn("无法从 URL 中提取对话 ID: {}", url);
+                    }
                 }
             }
         } catch (Exception e) {
-            log.error("发送对话 URL 时出错: {}", e.getMessage());
+            log.error("发送对话 ID 时出错: {}", e.getMessage());
         }
         emitter.send(SseEmitter.event().data("[DONE]", MediaType.TEXT_PLAIN));
         emitter.complete();
     }
     
-    private void sendConversationUrl(SseEmitter emitter, String id, String url, String model) throws IOException {
-        String content = "\n\n__CONVERSATION_URL_START__\n" + url + "\n__CONVERSATION_URL_END__\n\n";
+    private void sendConversationId(SseEmitter emitter, String id, String conversationId, String model) throws IOException {
+        String content = "\n\n```nwla-conversation-id\n" + conversationId + "\n```\n\n";
         ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
                 .delta(ChatCompletionResponse.Delta.builder().content(content).build())
                 .index(0).build();
@@ -748,21 +1247,113 @@ public class DeepSeekProvider implements LLMProvider {
         return null;
     }
     
-    // ==================== URL 提取 ====================
+    // ==================== 对话 ID 提取 ====================
     
-    private String extractUrlFromHistory(ChatCompletionRequest request) {
+    /**
+     * 从 URL 中提取对话 ID
+     * 支持格式：
+     * - https://chat.deepseek.com/a/chat/s/{id}
+     * - https://chat.deepseek.com/chat/{id}
+     * - https://chat.deepseek.com/chat/{id}?...
+     */
+    private String extractConversationIdFromUrl(String url) {
+        if (url == null || !url.contains("chat.deepseek.com")) {
+            return null;
+        }
+        
+        try {
+            // 优先尝试匹配格式: https://chat.deepseek.com/a/chat/s/{id}
+            int sChatIdx = url.indexOf("/a/chat/s/");
+            if (sChatIdx >= 0) {
+                String afterSChat = url.substring(sChatIdx + "/a/chat/s/".length());
+                // 移除查询参数和片段
+                int queryIdx = afterSChat.indexOf('?');
+                int fragmentIdx = afterSChat.indexOf('#');
+                int endIdx = afterSChat.length();
+                if (queryIdx >= 0) endIdx = Math.min(endIdx, queryIdx);
+                if (fragmentIdx >= 0) endIdx = Math.min(endIdx, fragmentIdx);
+                
+                String id = afterSChat.substring(0, endIdx).trim();
+                if (!id.isEmpty()) {
+                    return id;
+                }
+            }
+            
+            // 尝试匹配格式: https://chat.deepseek.com/chat/{id}
+            int chatIdx = url.indexOf("/chat/");
+            if (chatIdx >= 0) {
+                String afterChat = url.substring(chatIdx + "/chat/".length());
+                // 移除查询参数和片段
+                int queryIdx = afterChat.indexOf('?');
+                int fragmentIdx = afterChat.indexOf('#');
+                int endIdx = afterChat.length();
+                if (queryIdx >= 0) endIdx = Math.min(endIdx, queryIdx);
+                if (fragmentIdx >= 0) endIdx = Math.min(endIdx, fragmentIdx);
+                
+                String id = afterChat.substring(0, endIdx).trim();
+                // 如果提取的 ID 包含 s/ 前缀，去掉它
+                if (id.startsWith("s/")) {
+                    id = id.substring(2);
+                }
+                if (!id.isEmpty()) {
+                    return id;
+                }
+            }
+        } catch (Exception e) {
+            log.warn("从 URL 提取对话 ID 失败: url={}, error={}", url, e.getMessage());
+        }
+        
+        return null;
+    }
+    
+    /**
+     * 从对话 ID 构建 URL
+     */
+    private String buildUrlFromConversationId(String conversationId) {
+        if (conversationId == null || conversationId.isEmpty()) {
+            return null;
+        }
+        // 使用新的 URL 格式: /a/chat/s/{id}
+        return "https://chat.deepseek.com/a/chat/s/" + conversationId;
+    }
+    
+    /**
+     * 从历史消息中提取对话 ID
+     */
+    private String extractConversationIdFromHistory(ChatCompletionRequest request) {
         if (request.getMessages() == null) return null;
         
         for (int i = request.getMessages().size() - 1; i >= 0; i--) {
             ChatCompletionRequest.Message msg = request.getMessages().get(i);
             if ("assistant".equals(msg.getRole()) && msg.getContent() != null) {
                 String content = msg.getContent();
-                int start = content.indexOf("__CONVERSATION_URL_START__");
-                int end = content.indexOf("__CONVERSATION_URL_END__");
-                if (start != -1 && end != -1 && end > start) {
-                    String url = content.substring(start + "__CONVERSATION_URL_START__".length(), end).trim();
-                    url = url.lines().filter(l -> !l.isEmpty()).findFirst().orElse("").trim();
-                    if (url.contains("chat.deepseek.com")) return url;
+                
+                // 检查标记格式：```nwla-conversation-id\n{id}\n```
+                String marker = "```nwla-conversation-id";
+                int startIdx = content.indexOf(marker);
+                if (startIdx != -1) {
+                    // 找到开始标记，查找结束标记 ```
+                    int afterMarker = startIdx + marker.length();
+                    // 跳过可能的换行
+                    while (afterMarker < content.length() && 
+                           (content.charAt(afterMarker) == '\n' || content.charAt(afterMarker) == '\r')) {
+                        afterMarker++;
+                    }
+                    // 查找结束的 ```
+                    int endIdx = content.indexOf("```", afterMarker);
+                    if (endIdx != -1 && endIdx > afterMarker) {
+                        String extractedId = content.substring(afterMarker, endIdx).trim();
+                        // 提取第一行非空内容
+                        extractedId = extractedId.lines()
+                            .filter(line -> !line.trim().isEmpty() && !line.contains("```") && !line.contains("nwla-conversation-id"))
+                            .findFirst()
+                            .orElse("")
+                            .trim();
+                        if (!extractedId.isEmpty() && !extractedId.startsWith("login-")) {
+                            // 不是登录对话 ID，返回提取的 ID
+                            return extractedId;
+                        }
+                    }
                 }
             }
         }

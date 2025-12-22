@@ -33,8 +33,8 @@ public class ChatCompletionRequest {
     @Builder.Default
     private Boolean webSearch = false;
     
-    // 对话 URL（用于继续特定对话）
-    private String conversationUrl;
+    // 对话 ID（用于继续特定对话）
+    private String conversationId;
     
     // 便捷方法：确保返回非 null 值
     public boolean isStream() {

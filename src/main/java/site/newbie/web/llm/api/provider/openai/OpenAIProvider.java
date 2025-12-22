@@ -5,16 +5,20 @@ import com.microsoft.playwright.Page;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
-import org.springframework.http.MediaType;
 import site.newbie.web.llm.api.manager.BrowserManager;
 import site.newbie.web.llm.api.model.ChatCompletionRequest;
 import site.newbie.web.llm.api.model.ChatCompletionResponse;
 import site.newbie.web.llm.api.provider.LLMProvider;
+import site.newbie.web.llm.api.model.LoginInfo;
 import site.newbie.web.llm.api.provider.ModelConfig;
+import site.newbie.web.llm.api.provider.ProviderRegistry;
+import org.springframework.context.annotation.Lazy;
+import site.newbie.web.llm.api.manager.LoginSessionManager;
 import site.newbie.web.llm.api.provider.openai.model.OpenAIModelConfig;
-import site.newbie.web.llm.api.provider.openai.model.OpenAIModelConfig.*;
+import site.newbie.web.llm.api.provider.openai.model.OpenAIModelConfig.OpenAIContext;
 import tools.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
@@ -39,6 +43,8 @@ public class OpenAIProvider implements LLMProvider {
     private final BrowserManager browserManager;
     private final ObjectMapper objectMapper;
     private final Map<String, OpenAIModelConfig> modelConfigs;
+    private final ProviderRegistry providerRegistry;
+    private final LoginSessionManager loginSessionManager;
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
     
     private final ConcurrentHashMap<String, Page> modelPages = new ConcurrentHashMap<>();
@@ -90,9 +96,12 @@ public class OpenAIProvider implements LLMProvider {
     };
 
     public OpenAIProvider(BrowserManager browserManager, ObjectMapper objectMapper, 
-                         List<OpenAIModelConfig> configs) {
+                         List<OpenAIModelConfig> configs, @Lazy ProviderRegistry providerRegistry,
+                         LoginSessionManager loginSessionManager) {
         this.browserManager = browserManager;
         this.objectMapper = objectMapper;
+        this.providerRegistry = providerRegistry;
+        this.loginSessionManager = loginSessionManager;
         this.modelConfigs = configs.stream()
                 .collect(Collectors.toMap(OpenAIModelConfig::getModelName, Function.identity()));
         log.info("OpenAIProvider 初始化完成，支持的模型: {}", modelConfigs.keySet());
@@ -109,6 +118,69 @@ public class OpenAIProvider implements LLMProvider {
     }
 
     @Override
+    public boolean checkLoginStatus(Page page) {
+        try {
+            if (page == null || page.isClosed()) {
+                log.warn("页面为空或已关闭，无法检查登录状态");
+                return false;
+            }
+            
+            // 等待页面加载完成
+            page.waitForLoadState();
+            page.waitForTimeout(1000);
+            
+            // 检查URL：如果URL包含登录相关路径，说明未登录
+            String url = page.url();
+            if (url.contains("/login") || url.contains("/signin") || url.contains("/auth") || url.contains("/u/login")) {
+                log.info("检测到登录页面URL: {}", url);
+                return false;
+            }
+            
+            // 检查是否存在输入框（已登录会有输入框）
+            Locator inputBox = page.locator("div.ProseMirror[id='prompt-textarea']")
+                    .or(page.locator("div[contenteditable='true'][id='prompt-textarea']"));
+            if (inputBox.count() > 0) {
+                log.info("检测到输入框，判断为已登录");
+                return true;
+            }
+            
+            // 检查是否存在登录按钮（未登录会有登录按钮）
+            Locator loginButton = page.locator("button:has-text('登录')")
+                    .or(page.locator("button:has-text('Log in')"))
+                    .or(page.locator("a:has-text('登录')"))
+                    .or(page.locator("a:has-text('Log in')"))
+                    .or(page.locator("a[href*='login']"));
+            if (loginButton.count() > 0) {
+                log.info("检测到登录按钮，判断为未登录");
+                return false;
+            }
+            
+            // 如果URL是聊天页面且没有登录按钮，认为已登录
+            if (url.contains("chatgpt.com") || url.contains("chat.openai.com")) {
+                log.info("在聊天页面且未检测到登录按钮，判断为已登录");
+                return true;
+            }
+            
+            // 默认返回false（保守策略）
+            log.warn("无法确定登录状态，默认返回未登录");
+            return false;
+        } catch (Exception e) {
+            log.error("检查登录状态时出错: {}", e.getMessage(), e);
+            return false;
+        }
+    }
+    
+    @Override
+    public LoginInfo getLoginInfo(Page page) {
+        boolean loggedIn = checkLoginStatus(page);
+        if (!loggedIn) {
+            return LoginInfo.notLoggedIn();
+        }
+        
+        return LoginInfo.loggedIn();
+    }
+
+    @Override
     public void streamChat(ChatCompletionRequest request, SseEmitter emitter) {
         executor.submit(() -> {
             Page page = null;
@@ -121,6 +193,31 @@ public class OpenAIProvider implements LLMProvider {
                 }
 
                 page = getOrCreatePage(request);
+                
+                // 检查登录状态（在创建页面后再次检查，因为页面创建时可能检测到登录状态丢失）
+                if (!checkLoginStatus(page)) {
+                    log.warn("检测到未登录状态，发送登录提示");
+                    // 注意：不在这里更新 providerRegistry 的状态，避免循环依赖
+                    // 状态更新由 Controller 层处理
+                    
+                    // 获取或生成对话ID
+                    String conversationId = getConversationId(request);
+                    if (conversationId == null || conversationId.isEmpty()) {
+                        conversationId = "login-" + UUID.randomUUID();
+                    }
+                    
+                    // 创建登录会话
+                    LoginSessionManager.LoginSession session = loginSessionManager.getOrCreateSession(getProviderName(), conversationId);
+                    session.setConversationId(conversationId);
+                    session.setState(LoginSessionManager.LoginSessionState.WAITING_LOGIN_METHOD);
+                    // 保存会话（确保状态被持久化）
+                    loginSessionManager.saveSession(getProviderName(), conversationId, session);
+                    
+                    // 发送登录方式选择提示
+                    sendLoginMethodSelection(emitter, request.getModel(), getProviderName(), conversationId);
+                    return;
+                }
+                
                 setupSseInterceptor(page);
                 
                 if (isNewConversation(request)) {
@@ -150,29 +247,34 @@ public class OpenAIProvider implements LLMProvider {
     
     private Page getOrCreatePage(ChatCompletionRequest request) {
         String model = request.getModel();
-        String conversationUrl = getConversationUrl(request);
+        String conversationId = getConversationId(request);
         boolean isNew = isNewConversation(request);
         
-        if (!isNew && conversationUrl != null) {
+        if (!isNew && conversationId != null) {
+            String conversationUrl = buildUrlFromConversationId(conversationId);
             return findOrCreatePageForUrl(conversationUrl, model);
         } else {
             return createNewConversationPage(model);
         }
     }
     
-    private String getConversationUrl(ChatCompletionRequest request) {
-        String url = request.getConversationUrl();
-        if ((url == null || url.isEmpty()) && request.getMessages() != null) {
-            url = extractUrlFromHistory(request, "chatgpt.com");
-            if (url == null) url = extractUrlFromHistory(request, "chat.openai.com");
+    private String getConversationId(ChatCompletionRequest request) {
+        // 首先尝试从请求中获取
+        String conversationId = request.getConversationId();
+        if (conversationId != null && !conversationId.isEmpty()) {
+            return conversationId;
         }
-        return url;
+        
+        // 从历史消息中提取
+        if (request.getMessages() != null) {
+            conversationId = extractConversationIdFromHistory(request);
+        }
+        return conversationId;
     }
     
     private boolean isNewConversation(ChatCompletionRequest request) {
-        String url = getConversationUrl(request);
-        return url == null || url.isEmpty() || 
-               (!url.contains("chatgpt.com") && !url.contains("chat.openai.com"));
+        String conversationId = getConversationId(request);
+        return conversationId == null || conversationId.isEmpty() || conversationId.startsWith("login-");
     }
     
     private Page findOrCreatePageForUrl(String url, String model) {
@@ -181,6 +283,8 @@ public class OpenAIProvider implements LLMProvider {
             if (!page.url().equals(url)) {
                 page.navigate(url);
                 page.waitForLoadState();
+                // 检测登录状态是否丢失
+                checkLoginStatusLost(page);
             }
             modelPages.put(model, page);
             pageUrls.put(model, url);
@@ -192,6 +296,8 @@ public class OpenAIProvider implements LLMProvider {
         page.navigate(url);
         page.waitForLoadState();
         pageUrls.put(model, url);
+        // 检测登录状态是否丢失
+        checkLoginStatusLost(page);
         return page;
     }
     
@@ -206,7 +312,40 @@ public class OpenAIProvider implements LLMProvider {
         page.navigate("https://chatgpt.com/");
         page.waitForLoadState();
         pageUrls.put(model, page.url());
+        // 检测登录状态是否丢失
+        checkLoginStatusLost(page);
         return page;
+    }
+    
+    /**
+     * 检测登录状态是否丢失（通过检查是否有登录按钮）
+     * 如果检测到登录按钮，说明登录状态丢失
+     * 注意：不在这里更新 providerRegistry 的状态，避免循环依赖
+     */
+    private void checkLoginStatusLost(Page page) {
+        try {
+            if (page == null || page.isClosed()) {
+                return;
+            }
+            
+            // 等待页面加载完成
+            page.waitForLoadState();
+            page.waitForTimeout(1000);
+            
+            // 检查是否有登录按钮（登录状态丢失时会出现登录按钮）
+            Locator loginButton = page.locator("button:has-text('登录')")
+                    .or(page.locator("button:has-text('Login')"))
+                    .or(page.locator("button:has-text('Log in')"))
+                    .or(page.locator("button:has-text('Sign in')"));
+            
+            if (loginButton.count() > 0 && loginButton.first().isVisible()) {
+                log.warn("检测到登录按钮，说明登录状态已丢失");
+                // 注意：不在这里更新 providerRegistry 的状态，避免循环依赖
+                // 状态更新由 Controller 层处理
+            }
+        } catch (Exception e) {
+            log.warn("检测登录状态丢失时出错: {}", e.getMessage());
+        }
     }
     
     private Page findPageByUrl(String targetUrl) {
@@ -436,15 +575,21 @@ public class OpenAIProvider implements LLMProvider {
                 String url = page.url();
                 if (url.contains("chatgpt.com") || url.contains("chat.openai.com")) {
                     pageUrls.put(request.getModel(), url);
-                    String content = "\n\n__CONVERSATION_URL_START__\n" + url + "\n__CONVERSATION_URL_END__\n\n";
-                    ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
-                            .delta(ChatCompletionResponse.Delta.builder().content(content).build())
-                            .index(0).build();
-                    ChatCompletionResponse response = ChatCompletionResponse.builder()
-                            .id(UUID.randomUUID().toString()).object("chat.completion.chunk")
-                            .created(System.currentTimeMillis() / 1000)
-                            .model(request.getModel()).choices(List.of(choice)).build();
-                    emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(response), APPLICATION_JSON_UTF8));
+                    String conversationId = extractConversationIdFromUrl(url);
+                    if (conversationId != null && !conversationId.isEmpty()) {
+                        String content = "\n\n```nwla-conversation-id\n" + conversationId + "\n```\n\n";
+                        ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
+                                .delta(ChatCompletionResponse.Delta.builder().content(content).build())
+                                .index(0).build();
+                        ChatCompletionResponse response = ChatCompletionResponse.builder()
+                                .id(UUID.randomUUID().toString()).object("chat.completion.chunk")
+                                .created(System.currentTimeMillis() / 1000)
+                                .model(request.getModel()).choices(List.of(choice)).build();
+                        emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(response), APPLICATION_JSON_UTF8));
+                        log.info("已发送对话 ID: {} (从 URL: {})", conversationId, url);
+                    } else {
+                        log.warn("无法从 URL 中提取对话 ID: {}", url);
+                    }
                 }
             }
         } catch (Exception e) {
@@ -454,6 +599,64 @@ public class OpenAIProvider implements LLMProvider {
         emitter.complete();
     }
     
+    /**
+     * 发送登录方式选择提示
+     */
+    private void sendLoginMethodSelection(SseEmitter emitter, String model, String providerName, String conversationId) {
+        try {
+            StringBuilder message = new StringBuilder();
+            message.append("```nwla-system-message\n");
+            message.append("当前未登录，请选择登录方式：\n\n");
+            message.append("1. 手机号+验证码登录\n");
+            message.append("2. 账号+密码登录\n");
+            message.append("3. 微信扫码登录\n\n");
+            message.append("请输入对应的数字（1、2、3）来选择登录方式。");
+            message.append("\n```");
+            
+            // 如果提供了对话ID，在消息中包含对话ID信息
+            if (conversationId != null && !conversationId.isEmpty()) {
+                message.append("\n\n```nwla-conversation-id\n");
+                message.append(conversationId);
+                message.append("\n```");
+            }
+            
+            String id = UUID.randomUUID().toString();
+            ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
+                    .delta(ChatCompletionResponse.Delta.builder().content(message.toString()).build())
+                    .index(0).build();
+            ChatCompletionResponse response = ChatCompletionResponse.builder()
+                    .id(id).object("chat.completion.chunk")
+                    .created(System.currentTimeMillis() / 1000)
+                    .model(model).choices(List.of(choice)).build();
+            
+            emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(response), APPLICATION_JSON_UTF8));
+            emitter.send(SseEmitter.event().data("[DONE]", MediaType.TEXT_PLAIN));
+            emitter.complete();
+            
+            // 释放锁
+            if (providerName != null) {
+                new Thread(() -> {
+                    try {
+                        Thread.sleep(100);
+                        providerRegistry.releaseLock(providerName);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }).start();
+            }
+        } catch (Exception e) {
+            log.error("发送登录方式选择提示时出错", e);
+            try {
+                emitter.completeWithError(e);
+            } catch (Exception ex) {
+                // 忽略
+            }
+            if (providerName != null) {
+                providerRegistry.releaseLock(providerName);
+            }
+        }
+    }
+    
     private String extractTextFromSse(String sseData) {
         if (sseData == null) return null;
         StringBuilder text = new StringBuilder();
@@ -461,77 +664,78 @@ public class OpenAIProvider implements LLMProvider {
         String[] lines = sseData.split("\n");
         int processedCount = 0;
         int skippedCount = 0;
-        
-        for (int i = 0; i < lines.length; i++) {
-            String line = lines[i].trim();
-            
+
+        for (String s : lines) {
+            String line = s.trim();
+
             // 跳过 event 行（不再需要跟踪状态，因为简单格式不依赖 event）
             if (line.startsWith("event: ")) {
                 continue;
             }
-            
+
             // 只处理 data 行
             if (!line.startsWith("data: ")) {
                 continue;
             }
-            
+
             // 跳过完成标记（但先处理完当前批次的其他数据）
             if (line.contains("[DONE]")) {
                 // 注意：不立即 continue，让循环继续处理其他行
                 // 因为 [DONE] 可能在数据中间
                 continue;
             }
-            
+
             String jsonStr = line.substring(6).trim();
             if (jsonStr.isEmpty() || jsonStr.equals("{}")) {
                 continue;
             }
-            
+
+            String liteJSONStr = jsonStr.length() > 100 ? jsonStr.substring(0, 100) + "..." : jsonStr;
             try {
                 var json = objectMapper.readTree(jsonStr);
-                
+
                 // 处理纯字符串的情况（可能是版本号等元数据，但先记录）
-                if (json.isTextual()) {
+                if (json.isString()) {
                     skippedCount++;
-                    log.debug("跳过纯字符串数据: {}", jsonStr.length() > 100 ? jsonStr.substring(0, 100) + "..." : jsonStr);
+                    log.debug("跳过纯字符串数据: {}", liteJSONStr);
                     continue;
                 }
-                
+
                 // 必须是对象节点
                 if (!json.isObject()) {
                     skippedCount++;
-                    log.debug("跳过非对象数据: {}", jsonStr.length() > 100 ? jsonStr.substring(0, 100) + "..." : jsonStr);
+                    log.debug("跳过非对象数据: {}", liteJSONStr);
                     continue;
                 }
-                
+
                 // 跳过有 type 字段的元数据（如 resume_conversation_token, input_message 等）
                 if (json.has("type")) {
                     skippedCount++;
-                    String type = json.get("type").asText();
+                    String type = json.get("type").asString();
                     // 记录重要的元数据类型，帮助调试
                     if (!"message_stream_complete".equals(type) && !"conversation_detail_metadata".equals(type)) {
                         log.info("跳过元数据: {}", type);
                     }
                     continue;
                 }
-                
+
                 // 格式1: {"p": "/message/content/parts/0", "o": "append", "v": "内容"}
                 // 注意：只处理 append 操作，patch 操作由格式3处理
                 if (json.has("p") && json.has("o") && json.has("v")) {
-                    String path = json.get("p").asText();
-                    String operation = json.get("o").asText();
-                    
+                    String path = json.get("p").asString();
+                    String operation = json.get("o").asString();
+
                     // 处理内容路径的 append 操作
                     // 支持多种可能的内容路径格式
                     if (path != null && "append".equals(operation)) {
                         boolean isContentPath = path.contains("/message/content/parts/") ||
-                                              path.contains("/content/parts/") ||
-                                              path.contains("/content") ||
-                                              path.endsWith("/content") ||
-                                              path.contains("content");
-                        
-                        if (isContentPath && json.get("v").isTextual()) {
-                            String content = json.get("v").asText();
+                                path.contains("/content/parts/") ||
+                                path.contains("/content") ||
+                                path.endsWith("/content") ||
+                                path.contains("content");
+
+                        if (isContentPath && json.get("v").isString()) {
+                            String content = json.get("v").asString();
                             if (content != null && !content.isEmpty()) {
                                 text.append(content);
                                 processedCount++;
@@ -546,13 +750,13 @@ public class OpenAIProvider implements LLMProvider {
                     }
                     // 注意：如果 operation 不是 "append"（如 "patch", "add", "replace"），不要 continue，让后续逻辑处理
                 }
-                
+
                 // 格式2: {"v": "内容"} - 简单格式，直接追加（不依赖 event，因为可能跨批次）
                 // 注意：只处理纯文本内容，跳过对象和数组
                 if (json.has("v") && !json.has("p") && !json.has("o")) {
                     var vNode = json.get("v");
-                    if (vNode.isTextual()) {
-                        String content = vNode.asText();
+                    if (vNode.isString()) {
+                        String content = vNode.asString();
                         if (content != null && !content.isEmpty()) {
                             text.append(content);
                             processedCount++;
@@ -561,9 +765,9 @@ public class OpenAIProvider implements LLMProvider {
                     }
                     continue;
                 }
-                
+
                 // 格式3: {"p": "", "o": "patch", "v": [...]} - 批量更新
-                if (json.has("p") && json.has("o") && "patch".equals(json.get("o").asText())) {
+                if (json.has("p") && json.has("o") && "patch".equals(json.get("o").asString())) {
                     if (json.has("v") && json.get("v").isArray()) {
                         var patchArray = json.get("v");
                         int patchItemCount = 0;
@@ -571,19 +775,19 @@ public class OpenAIProvider implements LLMProvider {
                         log.info("处理 patch 格式，包含 {} 个操作项", totalPatchItems);
                         for (var patchItem : patchArray) {
                             if (patchItem.has("p") && patchItem.has("o") && patchItem.has("v")) {
-                                String itemPath = patchItem.get("p").asText();
-                                String itemOp = patchItem.get("o").asText();
-                                
+                                String itemPath = patchItem.get("p").asString();
+                                String itemOp = patchItem.get("o").asString();
+
                                 // 处理内容路径的 append 操作，支持更多路径格式
                                 if (itemPath != null && "append".equals(itemOp)) {
                                     boolean isContentPath = itemPath.contains("/message/content/parts/") ||
-                                                          itemPath.contains("/content/parts/") ||
-                                                          itemPath.contains("/content") ||
-                                                          itemPath.endsWith("/content") ||
-                                                          itemPath.contains("content");
-                                    
-                                    if (isContentPath && patchItem.get("v").isTextual()) {
-                                        String content = patchItem.get("v").asText();
+                                            itemPath.contains("/content/parts/") ||
+                                            itemPath.contains("/content") ||
+                                            itemPath.endsWith("/content") ||
+                                            itemPath.contains("content");
+
+                                    if (isContentPath && patchItem.get("v").isString()) {
+                                        String content = patchItem.get("v").asString();
                                         if (content != null && !content.isEmpty()) {
                                             text.append(content);
                                             patchItemCount++;
@@ -612,7 +816,7 @@ public class OpenAIProvider implements LLMProvider {
                     }
                     continue;
                 }
-                
+
                 // 如果都没有匹配，记录未处理的格式
                 skippedCount++;
                 // 检查是否是消息对象（可能包含内容）
@@ -622,8 +826,8 @@ public class OpenAIProvider implements LLMProvider {
                         log.debug("跳过消息对象（可能是初始化消息）");
                     } else {
                         // 尝试从消息对象中提取内容
-                        if (vObj.has("content") && vObj.get("content").isTextual()) {
-                            String content = vObj.get("content").asText();
+                        if (vObj.has("content") && vObj.get("content").isString()) {
+                            String content = vObj.get("content").asString();
                             if (content != null && !content.isEmpty()) {
                                 text.append(content);
                                 processedCount++;
@@ -631,21 +835,21 @@ public class OpenAIProvider implements LLMProvider {
                                 continue;
                             }
                         }
-                        log.warn("未处理的 JSON 格式（包含 v 对象）: {}", jsonStr.length() > 300 ? jsonStr.substring(0, 300) + "..." : jsonStr);
+                        log.warn("未处理的 JSON 格式（包含 v 对象）: {}", liteJSONStr);
                     }
                 } else {
-                    log.warn("未处理的 JSON 格式: {}", jsonStr.length() > 300 ? jsonStr.substring(0, 300) + "..." : jsonStr);
+                    log.warn("未处理的 JSON 格式: {}", liteJSONStr);
                 }
             } catch (Exception e) {
                 skippedCount++;
-                log.error("解析 SSE 数据行失败: {} - {}", e.getMessage(), jsonStr.length() > 100 ? jsonStr.substring(0, 100) + "..." : jsonStr);
+                log.error("解析 SSE 数据行失败: {} - {}", e.getMessage(), liteJSONStr);
             }
         }
         
         if (text.length() > 0) {
             log.info("从 SSE 提取到 {} 字符，处理了 {} 条数据，跳过了 {} 条", text.length(), processedCount, skippedCount);
             if (log.isDebugEnabled() && text.length() < 100) {
-                log.debug("提取的内容预览: {}", text.toString());
+                log.debug("提取的内容预览: {}", text);
             }
             return text.toString();
         } else if (processedCount > 0 || skippedCount > 0) {
@@ -657,18 +861,96 @@ public class OpenAIProvider implements LLMProvider {
         return null;
     }
     
-    private String extractUrlFromHistory(ChatCompletionRequest request, String domain) {
+    /**
+     * 从 URL 中提取对话 ID
+     * 支持格式：
+     * - https://chatgpt.com/c/{id}
+     * - https://chat.openai.com/c/{id}
+     */
+    private String extractConversationIdFromUrl(String url) {
+        if (url == null || url.isEmpty()) {
+            return null;
+        }
+        
+        boolean isChatGpt = url.contains("chatgpt.com");
+        boolean isChatOpenai = url.contains("chat.openai.com");
+        if (!isChatGpt && !isChatOpenai) {
+            return null;
+        }
+        
+        try {
+            // 尝试从路径中提取 ID
+            // 格式: https://chatgpt.com/c/{id} 或 https://chat.openai.com/c/{id}
+            int cIdx = url.indexOf("/c/");
+            if (cIdx >= 0) {
+                String afterC = url.substring(cIdx + "/c/".length());
+                // 移除查询参数和片段
+                int queryIdx = afterC.indexOf('?');
+                int fragmentIdx = afterC.indexOf('#');
+                int endIdx = afterC.length();
+                if (queryIdx >= 0) endIdx = Math.min(endIdx, queryIdx);
+                if (fragmentIdx >= 0) endIdx = Math.min(endIdx, fragmentIdx);
+                
+                String id = afterC.substring(0, endIdx).trim();
+                if (!id.isEmpty()) {
+                    return id;
+                }
+            }
+        } catch (Exception e) {
+            log.warn("从 URL 提取对话 ID 失败: url={}, error={}", url, e.getMessage());
+        }
+        
+        return null;
+    }
+    
+    /**
+     * 从对话 ID 构建 URL
+     */
+    private String buildUrlFromConversationId(String conversationId) {
+        if (conversationId == null || conversationId.isEmpty()) {
+            return null;
+        }
+        // 默认使用 chatgpt.com，如果需要可以扩展为支持 chat.openai.com
+        return "https://chatgpt.com/c/" + conversationId;
+    }
+    
+    /**
+     * 从历史消息中提取对话 ID
+     */
+    private String extractConversationIdFromHistory(ChatCompletionRequest request) {
         if (request.getMessages() == null) return null;
+        
         for (int i = request.getMessages().size() - 1; i >= 0; i--) {
             ChatCompletionRequest.Message msg = request.getMessages().get(i);
             if ("assistant".equals(msg.getRole()) && msg.getContent() != null) {
                 String content = msg.getContent();
-                int start = content.indexOf("__CONVERSATION_URL_START__");
-                int end = content.indexOf("__CONVERSATION_URL_END__");
-                if (start != -1 && end != -1 && end > start) {
-                    String url = content.substring(start + "__CONVERSATION_URL_START__".length(), end).trim();
-                    url = url.lines().filter(l -> !l.isEmpty()).findFirst().orElse("").trim();
-                    if (url.contains(domain)) return url;
+                
+                // 检查标记格式：```nwla-conversation-id\n{id}\n```
+                String marker = "```nwla-conversation-id";
+                int startIdx = content.indexOf(marker);
+                if (startIdx != -1) {
+                    // 找到开始标记，查找结束标记 ```
+                    int afterMarker = startIdx + marker.length();
+                    // 跳过可能的换行
+                    while (afterMarker < content.length() && 
+                           (content.charAt(afterMarker) == '\n' || content.charAt(afterMarker) == '\r')) {
+                        afterMarker++;
+                    }
+                    // 查找结束的 ```
+                    int endIdx = content.indexOf("```", afterMarker);
+                    if (endIdx != -1 && endIdx > afterMarker) {
+                        String extractedId = content.substring(afterMarker, endIdx).trim();
+                        // 提取第一行非空内容
+                        extractedId = extractedId.lines()
+                            .filter(line -> !line.trim().isEmpty() && !line.contains("```") && !line.contains("nwla-conversation-id"))
+                            .findFirst()
+                            .orElse("")
+                            .trim();
+                        if (!extractedId.isEmpty() && !extractedId.startsWith("login-")) {
+                            // 不是登录对话 ID，返回提取的 ID
+                            return extractedId;
+                        }
+                    }
                 }
             }
         }

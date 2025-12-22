@@ -1,11 +1,16 @@
 package site.newbie.web.llm.api.provider;
 
+import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
+import site.newbie.web.llm.api.manager.LoginStorageService;
+import site.newbie.web.llm.api.model.LoginInfo;
 import site.newbie.web.llm.api.model.ModelResponse;
 
-import jakarta.annotation.PostConstruct;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
 import java.util.stream.Collectors;
@@ -13,6 +18,7 @@ import java.util.stream.Collectors;
 /**
  * 提供者注册表
  * 管理所有 LLM 提供者，并根据模型名称路由到对应的提供者
+ * 使用本地存储持久化登录状态
  */
 @Slf4j
 @Component
@@ -21,12 +27,14 @@ public class ProviderRegistry {
     private final List<LLMProvider> providers;
     private final Map<String, LLMProvider> modelToProvider = new HashMap<>();
     private final Map<String, LLMProvider> providerNameMap = new HashMap<>();
+    private final LoginStorageService storageService;
     
     // 每个提供器的并发锁：同一提供器同一时间只允许一个对话
     private final ConcurrentHashMap<String, Semaphore> providerLocks = new ConcurrentHashMap<>();
     
-    public ProviderRegistry(List<LLMProvider> providers) {
+    public ProviderRegistry(List<LLMProvider> providers, LoginStorageService storageService) {
         this.providers = providers != null ? providers : new ArrayList<>();
+        this.storageService = storageService;
     }
     
     @PostConstruct
@@ -46,6 +54,10 @@ public class ProviderRegistry {
             }
         }
         log.info("提供者注册完成，共 {} 个提供者，{} 个模型", providers.size(), modelToProvider.size());
+        
+        // 从本地存储加载登录状态
+        Map<String, LoginInfo> loadedStatus = storageService.getAllLoginStatus();
+        log.info("已从本地存储加载 {} 个提供器的登录状态", loadedStatus.size());
     }
     
     /**
@@ -152,6 +164,71 @@ public class ProviderRegistry {
                 .object("list")
                 .data(modelDataList)
                 .build();
+    }
+    
+    /**
+     * 检查提供器的登录状态（每个提供器在程序运行过程中只检查一次）
+     * @param providerName 提供器名称
+     * @param checkLoginFunction 检查登录状态的函数，接收Page参数，返回boolean
+     * @return true 如果已登录，false 如果未登录
+     */
+    public boolean checkLoginStatus(String providerName, java.util.function.Function<com.microsoft.playwright.Page, Boolean> checkLoginFunction) {
+        // 如果已经检查过，直接返回缓存的结果
+        LoginInfo loginInfo = storageService.getLoginStatus(providerName);
+        if (loginInfo != null) {
+            log.info("提供器 {} 的登录状态已缓存: {}", providerName, loginInfo.isLoggedIn() ? "已登录" : "未登录");
+            return loginInfo.isLoggedIn();
+        }
+        
+        // 如果未检查过，执行检查并缓存结果
+        log.info("首次检查提供器 {} 的登录状态", providerName);
+        // 注意：这里不创建页面，由调用者传入页面或创建函数
+        // 返回false表示未登录（保守策略），实际检查由调用者完成
+        return false;
+    }
+    
+    /**
+     * 设置提供器的登录状态（持久化到本地存储）
+     * @param providerName 提供器名称
+     * @param isLoggedIn 是否已登录
+     */
+    public void setLoginStatus(String providerName, boolean isLoggedIn) {
+        LoginInfo loginInfo = isLoggedIn ? LoginInfo.loggedIn() : LoginInfo.notLoggedIn();
+        storageService.saveLoginStatus(providerName, loginInfo);
+        log.info("已保存提供器 {} 的登录状态到本地存储: {}", providerName, isLoggedIn ? "已登录" : "未登录");
+    }
+    
+    /**
+     * 设置提供器的登录状态（持久化到本地存储）
+     * @param providerName 提供器名称
+     * @param loginInfo 登录信息
+     */
+    public void setLoginStatus(String providerName, LoginInfo loginInfo) {
+        storageService.saveLoginStatus(providerName, loginInfo);
+        log.info("已保存提供器 {} 的登录状态到本地存储: {}", providerName, 
+            loginInfo.isLoggedIn() ? "已登录" : "未登录");
+    }
+    
+    /**
+     * 获取提供器的登录状态（从本地存储）
+     * @param providerName 提供器名称
+     * @return null 如果未检查过，true 如果已登录，false 如果未登录
+     */
+    public Boolean getLoginStatus(String providerName) {
+        LoginInfo loginInfo = storageService.getLoginStatus(providerName);
+        if (loginInfo == null) {
+            return null;
+        }
+        return loginInfo.isLoggedIn();
+    }
+    
+    /**
+     * 获取提供器的登录信息（从本地存储）
+     * @param providerName 提供器名称
+     * @return LoginInfo 如果存在，null 如果不存在
+     */
+    public LoginInfo getLoginInfo(String providerName) {
+        return storageService.getLoginStatus(providerName);
     }
 }
 

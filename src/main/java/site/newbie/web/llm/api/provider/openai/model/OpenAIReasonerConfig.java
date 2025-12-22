@@ -411,10 +411,10 @@ public class OpenAIReasonerConfig implements OpenAIModelConfig {
         boolean finished = false;
         
         String[] lines = sseData.split("\n");
-        
-        for (int i = 0; i < lines.length; i++) {
-            String line = lines[i].trim();
-            
+
+        for (String s : lines) {
+            String line = s.trim();
+
             // 检测 event: done
             if (line.startsWith("event: ")) {
                 String event = line.substring(7).trim();
@@ -423,31 +423,31 @@ public class OpenAIReasonerConfig implements OpenAIModelConfig {
                 }
                 continue;
             }
-            
+
             // 只处理 data 行
             if (!line.startsWith("data: ")) {
                 continue;
             }
-            
+
             // 跳过完成标记
             if (line.contains("[DONE]")) {
                 finished = true;
                 continue;
             }
-            
+
             String jsonStr = line.substring(6).trim();
             if (jsonStr.isEmpty() || jsonStr.equals("{}")) {
                 continue;
             }
-            
+
             try {
                 var json = objectMapper.readTree(jsonStr);
-                
+
                 // 跳过有 type 字段的元数据
                 if (json.has("type")) {
                     continue;
                 }
-                
+
                 // 格式1: {"p": "/message/reasoning_content", "o": "append", "v": "思考内容"}
                 // 或 {"p": "/message/content/parts/0", "o": "append", "v": "回复内容"}
                 // 或 {"p": "/message/content/thoughts/0/content", "o": "append", "v": "思考内容"}
@@ -456,16 +456,16 @@ public class OpenAIReasonerConfig implements OpenAIModelConfig {
                 if (json.has("p") && json.has("o") && json.has("v")) {
                     String path = json.get("p").asString();
                     String operation = json.get("o").asString();
-                    
+
                     if (path != null && "append".equals(operation)) {
                         // 处理文本内容
                         if (json.get("v").isString()) {
                             String content = json.get("v").asString();
                             if (content != null && !content.isEmpty()) {
                                 // 判断是思考内容还是回复内容
-                                if (path.contains("/reasoning_content") || 
-                                    path.contains("/reasoning") ||
-                                    (path.contains("/thoughts/") && path.contains("/content"))) {
+                                if (path.contains("/reasoning_content") ||
+                                        path.contains("/reasoning") ||
+                                        (path.contains("/thoughts/") && path.contains("/content"))) {
                                     thinkingText.append(content);
                                     log.info("提取思考内容 (路径格式, path={}): {}", path, content);
                                 } else if (path.contains("/message/content/parts/")) {
@@ -491,11 +491,11 @@ public class OpenAIReasonerConfig implements OpenAIModelConfig {
                     }
                     // 注意：如果 operation 不是 "append"（如 "patch", "add", "replace"），不要 continue，让后续逻辑处理
                 }
-                
+
                 // 格式2: {"v": "内容"} 或 {"v": [...]} 或 {"v": {对象}} - 不依赖 event（可能跨批次）
                 if (json.has("v") && !json.has("p") && !json.has("o")) {
                     var vNode = json.get("v");
-                    
+
                     // 如果是文本，通常是回复内容的增量更新
                     if (vNode.isString()) {
                         String content = vNode.asString();
@@ -511,7 +511,7 @@ public class OpenAIReasonerConfig implements OpenAIModelConfig {
                             if (item.has("p") && item.has("o") && item.has("v")) {
                                 String itemPath = item.get("p").asString();
                                 String itemOp = item.get("o").asString();
-                                
+
                                 if (itemPath != null && "append".equals(itemOp)) {
                                     if (item.get("v").isString()) {
                                         String content = item.get("v").asString();
@@ -537,7 +537,7 @@ public class OpenAIReasonerConfig implements OpenAIModelConfig {
                             var message = vNode.get("message");
                             if (message.has("content")) {
                                 var content = message.get("content");
-                                
+
                                 // 处理思考内容: content_type = "thoughts"
                                 if (content.has("content_type") && "thoughts".equals(content.get("content_type").asString())) {
                                     if (content.has("thoughts") && content.get("thoughts").isArray()) {
@@ -566,7 +566,7 @@ public class OpenAIReasonerConfig implements OpenAIModelConfig {
                     }
                     continue;
                 }
-                
+
                 // 格式3: {"p": "", "o": "patch", "v": [...]} - 批量更新
                 if (json.has("p") && json.has("o") && "patch".equals(json.get("o").asString())) {
                     if (json.has("v") && json.get("v").isArray()) {
@@ -577,15 +577,15 @@ public class OpenAIReasonerConfig implements OpenAIModelConfig {
                             if (patchItem.has("p") && patchItem.has("o") && patchItem.has("v")) {
                                 String itemPath = patchItem.get("p").asString();
                                 String itemOp = patchItem.get("o").asString();
-                                
+
                                 if (itemPath != null && "append".equals(itemOp)) {
                                     if (patchItem.get("v").isString()) {
                                         String content = patchItem.get("v").asString();
                                         if (content != null && !content.isEmpty()) {
                                             patchItemCount++;
-                                            if (itemPath.contains("/reasoning_content") || 
-                                                itemPath.contains("/reasoning") ||
-                                                (itemPath.contains("/thoughts/") && itemPath.contains("/content"))) {
+                                            if (itemPath.contains("/reasoning_content") ||
+                                                    itemPath.contains("/reasoning") ||
+                                                    (itemPath.contains("/thoughts/") && itemPath.contains("/content"))) {
                                                 thinkingText.append(content);
                                                 log.info("提取思考内容 (patch格式, path={}): {}", itemPath, content);
                                             } else if (itemPath.contains("/message/content/parts/")) {
@@ -601,7 +601,6 @@ public class OpenAIReasonerConfig implements OpenAIModelConfig {
                             log.info("patch 格式处理完成，提取了 {} 个内容项", patchItemCount);
                         }
                     }
-                    continue;
                 }
             } catch (Exception e) {
                 log.error("解析 SSE 数据行失败: {}", e.getMessage());

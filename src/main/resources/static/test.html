@@ -825,8 +825,8 @@
         checkbox.checked = btn.classList.contains('active');
     };
 
-    // 从历史对话中提取 URL（检查最后一条 assistant 消息是否包含 URL 标记）
-    function extractUrlFromHistory() {
+    // 从历史对话中提取对话 ID（检查最后一条 assistant 消息是否包含 ID 标记）
+    function extractConversationIdFromHistory() {
         if (conversationHistory.length === 0) return '';
         
         // 从后往前查找最后一条 assistant 消息
@@ -835,26 +835,61 @@
             if (msg.role === 'assistant' && msg.content) {
                 const content = msg.content;
                 
-                // 检查新的 URL 标记格式
-                const startIdx = content.indexOf('__CONVERSATION_URL_START__');
-                const endIdx = content.indexOf('__CONVERSATION_URL_END__');
-                if (startIdx !== -1 && endIdx !== -1) {
-                    const url = content.substring(startIdx + '__CONVERSATION_URL_START__'.length, endIdx)
-                        .trim()
-                        .split('\n')
-                        .filter(line => line.trim() && !line.includes('__CONVERSATION_URL'))
-                        .join('')
-                        .trim();
-                    if (url) return url;
-                }
-                
-                // 向后兼容：检查旧的 __URL__ 标记格式
-                if (content.includes('__URL__')) {
-                    const urlMatch = content.match(/__URL__([^\n]+)/);
-                    if (urlMatch && urlMatch[1]) {
-                        return urlMatch[1].trim();
+                // 检查标记格式：```nwla-conversation-id\n{id}\n```
+                const marker = '```nwla-conversation-id';
+                const startIdx = content.indexOf(marker);
+                if (startIdx !== -1) {
+                    let afterMarker = startIdx + marker.length;
+                    // 跳过可能的换行
+                    while (afterMarker < content.length && 
+                           (content[afterMarker] === '\n' || content[afterMarker] === '\r')) {
+                        afterMarker++;
+                    }
+                    // 查找结束的 ```
+                    const endIdx = content.indexOf('```', afterMarker);
+                    if (endIdx !== -1 && endIdx > afterMarker) {
+                        const id = content.substring(afterMarker, endIdx)
+                            .trim()
+                            .split('\n')
+                            .filter(line => line.trim() && !line.includes('```') && !line.includes('nwla-conversation-id'))
+                            .find(line => line.trim()) || '';
+                        if (id.trim()) return id.trim();
                     }
                 }
+            }
+        }
+        
+        return '';
+    }
+    
+    // 从 URL 中提取对话 ID
+    function extractIdFromUrl(url) {
+        if (!url) return '';
+        
+        // DeepSeek: https://chat.deepseek.com/a/chat/s/{id} 或 https://chat.deepseek.com/chat/{id}
+        if (url.includes('chat.deepseek.com')) {
+            // 优先匹配新格式: /a/chat/s/{id}
+            let match = url.match(/\/a\/chat\/s\/([^?#]+)/);
+            if (match && match[1]) {
+                return match[1].trim();
+            }
+            // 向后兼容旧格式: /chat/{id}
+            match = url.match(/\/chat\/([^?#]+)/);
+            if (match && match[1]) {
+                let id = match[1].trim();
+                // 如果包含 s/ 前缀，去掉它
+                if (id.startsWith('s/')) {
+                    id = id.substring(2);
+                }
+                return id;
+            }
+        }
+        
+        // OpenAI: https://chatgpt.com/c/{id} 或 https://chat.openai.com/c/{id}
+        if (url.includes('chatgpt.com') || url.includes('chat.openai.com')) {
+            const match = url.match(/\/c\/([^?#]+)/);
+            if (match && match[1]) {
+                return match[1].trim();
             }
         }
         
@@ -869,32 +904,32 @@
         const conversations = loadConversations();
         const currentConv = currentConversationId ? conversations[currentConversationId] : null;
         
-        // 根据后端新逻辑：只有传递了 conversationUrl 才复用，否则开启新对话
-        // 如果当前对话是新对话（没有历史消息），则不发送 URL，让后端开启新对话
+        // 根据后端新逻辑：只有传递了 conversationId 才复用，否则开启新对话
+        // 如果当前对话是新对话（没有历史消息），则不发送 ID，让后端开启新对话
         const isNewConversation = conversationHistory.length === 0;
         
-        // 优先使用保存的 URL，如果没有则从历史对话中提取
-        let conversationUrl = '';
+        // 优先使用保存的对话 ID，如果没有则从历史对话中提取
+        let conversationId = '';
         if (!isNewConversation) {
-            // 先尝试从保存的对话中获取 URL
-            if (currentConv?.url) {
-                conversationUrl = currentConv.url;
+            // 先尝试从保存的对话中获取 ID
+            if (currentConv?.conversationId) {
+                conversationId = currentConv.conversationId;
             } else {
-                // 如果保存的对话中没有 URL，从历史对话中提取
-                conversationUrl = extractUrlFromHistory();
-                // 如果提取到了 URL，保存到对话中
-                if (conversationUrl && currentConversationId) {
+                // 如果保存的对话中没有 ID，从历史对话中提取
+                conversationId = extractConversationIdFromHistory();
+                // 如果提取到了 ID，保存到对话中
+                if (conversationId && currentConversationId) {
                     if (!currentConv) {
                         conversations[currentConversationId] = {
                             id: currentConversationId,
                             title: '新对话',
                             messages: [...conversationHistory],
-                            url: conversationUrl,
+                            conversationId: conversationId,
                             createdAt: Date.now(),
                             updatedAt: Date.now()
                         };
                     } else {
-                        currentConv.url = conversationUrl;
+                        currentConv.conversationId = conversationId;
                     }
                     saveConversations(conversations);
                 }
@@ -903,19 +938,19 @@
         
         let headers = new Headers(options.headers || {});
         headers.set('X-Web-Search', String(webSearch));
-        // 只有在有 conversationUrl 时才发送，让后端复用对话
-        // 如果没有 conversationUrl，后端会自动开启新对话
-        if (conversationUrl && conversationUrl.includes('chat.deepseek.com')) {
-            headers.set('X-Conversation-URL', conversationUrl);
+        // 只有在有 conversationId 时才发送，让后端复用对话
+        // 如果没有 conversationId，后端会自动开启新对话
+        if (conversationId && !conversationId.startsWith('login-')) {
+            headers.set('X-Conversation-ID', conversationId);
         }
         
         if (options.method === 'POST' && options.body) {
             try {
                 const body = JSON.parse(options.body);
                 body.webSearch = webSearch;
-                // 在请求体中也可以设置 conversationUrl（如果后端支持）
-                if (conversationUrl && conversationUrl.includes('chat.deepseek.com')) {
-                    body.conversationUrl = conversationUrl;
+                // 在请求体中也可以设置 conversationId
+                if (conversationId && !conversationId.startsWith('login-')) {
+                    body.conversationId = conversationId;
                 }
                 options.body = JSON.stringify(body);
             } catch (e) {}
@@ -1323,14 +1358,14 @@
         const { msgDiv, textEl } = appendMessage('assistant', '', true);
         let fullText = '';
         let thinkingEl = null;
-        // 用于累积 URL 标记内容（因为 URL 是分多次发送的）
-        let urlBuffer = '';
+        // 用于累积 ID 标记内容（因为 ID 是分多次发送的）
+        let idBuffer = '';
 
         isGenerating = true;
         sendBtn.disabled = true;
 
         try {
-            // 不再需要设置 window._currentNewConversation，因为后端完全根据 conversationUrl 判断是否新对话
+            // 不再需要设置 window._currentNewConversation，因为后端完全根据 conversationId 判断是否新对话
             const stream = await openai.chat.completions.create({
                 model,
                 messages: [...conversationHistory],
@@ -1357,57 +1392,73 @@
                 const content = delta.content;
                 if (!content) continue;
 
-                // 累积 URL 标记内容（因为 URL 是分多次发送的）
-                if (content.includes('__CONVERSATION_URL_START__') || 
-                    content.includes('__CONVERSATION_URL_END__') || 
-                    urlBuffer.length > 0) {
-                    urlBuffer += content;
+                // 累积 ID 标记内容（因为 ID 是分多次发送的）
+                if (content.includes('```nwla-conversation-id') || idBuffer.length > 0) {
+                    idBuffer += content;
                     
-                    // 检查是否已经接收到完整的 URL 标记
-                    const startIdx = urlBuffer.indexOf('__CONVERSATION_URL_START__');
-                    const endIdx = urlBuffer.indexOf('__CONVERSATION_URL_END__');
-                    
-                    if (startIdx !== -1 && endIdx !== -1) {
-                        // 提取 URL（在开始标记和结束标记之间）
-                        const url = urlBuffer.substring(startIdx + '__CONVERSATION_URL_START__'.length, endIdx)
-                            .trim()
-                            .split('\n')
-                            .filter(line => line.trim() && !line.includes('__CONVERSATION_URL'))
-                            .join('')
-                            .trim();
-                        if (url && currentConversationId) {
-                            const conversations = loadConversations();
-                            if (conversations[currentConversationId]) {
-                                conversations[currentConversationId].url = url;
-                                saveConversations(conversations);
-                            }
+                    // 检查标记格式：```nwla-conversation-id\n{id}\n```
+                    const marker = '```nwla-conversation-id';
+                    const startIdx = idBuffer.indexOf(marker);
+                    if (startIdx !== -1) {
+                        let afterMarker = startIdx + marker.length;
+                        // 跳过可能的换行
+                        while (afterMarker < idBuffer.length && 
+                               (idBuffer[afterMarker] === '\n' || idBuffer[afterMarker] === '\r')) {
+                            afterMarker++;
                         }
-                        // 清空缓冲区
-                        urlBuffer = '';
+                        // 查找结束的 ```
+                        const endIdx = idBuffer.indexOf('```', afterMarker);
+                        if (endIdx !== -1 && endIdx > afterMarker) {
+                            const id = idBuffer.substring(afterMarker, endIdx)
+                                .trim()
+                                .split('\n')
+                                .filter(line => line.trim() && !line.includes('```') && !line.includes('nwla-conversation-id'))
+                                .find(line => line.trim()) || '';
+                            if (id.trim() && currentConversationId && !id.trim().startsWith('login-')) {
+                                const conversations = loadConversations();
+                                if (conversations[currentConversationId]) {
+                                    conversations[currentConversationId].conversationId = id.trim();
+                                    saveConversations(conversations);
+                                }
+                            }
+                            // 清空缓冲区
+                            idBuffer = '';
+                            // 不显示 ID 标记内容，直接跳过
+                            continue;
+                        }
                     }
-                    // 不显示 URL 标记内容，直接跳过
+                }
+                
+                // 检查是否是系统消息标记，如果是则不显示
+                if (content.includes('```nwla-system-message')) {
+                    // 系统消息标记，不显示，但需要累积以完整提取
+                    if (!idBuffer.includes('```nwla-system-message')) {
+                        idBuffer = content;
+                    } else {
+                        idBuffer += content;
+                    }
+                    // 检查是否完整接收了系统消息
+                    const systemStartIdx = idBuffer.indexOf('```nwla-system-message');
+                    if (systemStartIdx !== -1) {
+                        let afterMarker = systemStartIdx + '```nwla-system-message'.length;
+                        while (afterMarker < idBuffer.length && 
+                               (idBuffer[afterMarker] === '\n' || idBuffer[afterMarker] === '\r')) {
+                            afterMarker++;
+                        }
+                        const systemEndIdx = idBuffer.indexOf('```', afterMarker);
+                        if (systemEndIdx !== -1 && systemEndIdx > afterMarker) {
+                            // 系统消息完整接收，提取内容并显示
+                            const systemContent = idBuffer.substring(afterMarker, systemEndIdx).trim();
+                            fullText += systemContent;
+                            textEl.textContent = fullText;
+                            chatContainer.scrollTop = chatContainer.scrollHeight;
+                            idBuffer = '';
+                        }
+                    }
                     continue;
                 }
                 
-                // 向后兼容：支持旧的 __URL__ 标记格式
-                if (content.startsWith('__URL__')) {
-                    const url = content.substring(7);
-                    if (currentConversationId && url) {
-                        const conversations = loadConversations();
-                        if (conversations[currentConversationId]) {
-                            conversations[currentConversationId].url = url;
-                            saveConversations(conversations);
-                        }
-                    }
-                    continue;
-                } else if (content.startsWith('__THINKING__')) {
-                    // 向后兼容：支持旧的 __THINKING__ 标记格式
-                    const thinkingContent = content.substring(12);
-                    if (!thinkingEl) {
-                        thinkingEl = createThinkingBlock(msgDiv);
-                    }
-                    thinkingEl.textContent += thinkingContent;
-                } else if (content.startsWith('__REPLACE__')) {
+                if (content.startsWith('__REPLACE__')) {
                     fullText = content.substring(11);
                     renderContent(textEl, fullText);
                 } else {

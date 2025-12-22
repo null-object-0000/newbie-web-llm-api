@@ -1,10 +1,10 @@
 package site.newbie.web.llm.api.provider;
 
-import tools.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import site.newbie.web.llm.api.model.ChatCompletionRequest;
+import tools.jackson.databind.ObjectMapper;
 
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
@@ -47,15 +47,18 @@ public class SseDataLogger {
         try {
             String requestJson = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(request);
             String requestLog = String.format(
-                "\n\n" +
-                "================================================================================\n" +
-                "SSE 会话开始 - Session ID: %s\n" +
-                "时间: %s\n" +
-                "模型: %s\n" +
-                "================================================================================\n" +
-                "完整原始请求:\n" +
-                "%s\n" +
-                "================================================================================\n",
+                    """
+                            
+                            
+                            ================================================================================
+                            SSE 会话开始 - Session ID: %s
+                            时间: %s
+                            模型: %s
+                            ================================================================================
+                            完整原始请求:
+                            %s
+                            ================================================================================
+                            """,
                 sessionId,
                 startTime.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")),
                 modelName,
@@ -132,24 +135,28 @@ public class SseDataLogger {
         
         if (allRawSseData.length() > 0) {
             String summaryLog = String.format(
-                "\n\n" +
-                "================================================================================\n" +
-                "SSE 会话结束 - Session ID: %s\n" +
-                "开始时间: %s\n" +
-                "结束时间: %s\n" +
-                "持续时间: %d ms\n" +
-                "模型: %s\n" +
-                "================================================================================\n" +
-                "统计信息:\n" +
-                "  - 总共接收数据块数: %d\n" +
-                "  - 累计原始数据长度: %d 字符\n" +
-                "  - 最终提取文本长度: %d 字符\n" +
-                "================================================================================\n" +
-                "完整原始 SSE 响应数据:\n" +
-                "%s\n" +
-                "================================================================================\n" +
-                "SSE 会话结束 - Session ID: %s\n" +
-                "================================================================================\n\n",
+                    """
+                            
+                            
+                            ================================================================================
+                            SSE 会话结束 - Session ID: %s
+                            开始时间: %s
+                            结束时间: %s
+                            持续时间: %d ms
+                            模型: %s
+                            ================================================================================
+                            统计信息:
+                              - 总共接收数据块数: %d
+                              - 累计原始数据长度: %d 字符
+                              - 最终提取文本长度: %d 字符
+                            ================================================================================
+                            完整原始 SSE 响应数据:
+                            %s
+                            ================================================================================
+                            SSE 会话结束 - Session ID: %s
+                            ================================================================================
+                            
+                            """,
                 sessionId,
                 startTime.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")),
                 endTime.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")),
@@ -158,7 +165,7 @@ public class SseDataLogger {
                 sseDataChunkCount,
                 allRawSseData.length(),
                 extractedTextLength,
-                allRawSseData.toString(),
+                    allRawSseData,
                 sessionId
             );
             
@@ -170,18 +177,22 @@ public class SseDataLogger {
                     modelName, sseDataChunkCount, allRawSseData.length(), extractedTextLength);
         } else {
             String emptySummaryLog = String.format(
-                "\n\n" +
-                "================================================================================\n" +
-                "SSE 会话结束 - Session ID: %s\n" +
-                "开始时间: %s\n" +
-                "结束时间: %s\n" +
-                "持续时间: %d ms\n" +
-                "模型: %s\n" +
-                "================================================================================\n" +
-                "警告: 未接收到任何 SSE 数据\n" +
-                "================================================================================\n" +
-                "SSE 会话结束 - Session ID: %s\n" +
-                "================================================================================\n\n",
+                    """
+                            
+                            
+                            ================================================================================
+                            SSE 会话结束 - Session ID: %s
+                            开始时间: %s
+                            结束时间: %s
+                            持续时间: %d ms
+                            模型: %s
+                            ================================================================================
+                            警告: 未接收到任何 SSE 数据
+                            ================================================================================
+                            SSE 会话结束 - Session ID: %s
+                            ================================================================================
+                            
+                            """,
                 sessionId,
                 startTime.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")),
                 endTime.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")),
