@@ -81,13 +81,13 @@ public class BrowserManager {
         // 配置启动选项
         BrowserType.LaunchPersistentContextOptions options = new BrowserType.LaunchPersistentContextOptions()
                 .setHeadless(headless)
-                .setViewportSize(1280, 720)
+                .setViewportSize(1920, 1080)  // 使用常见的桌面浏览器窗口大小
                 .setArgs(List.of(
                         "--disable-blink-features=AutomationControlled",
                         "--no-sandbox",
                         "--disable-setuid-sandbox"
                 ))
-                .setUserAgent("Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Mobile Safari/537.36");
+                .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
 
         BrowserContext context = playwright.chromium().launchPersistentContext(
                 Paths.get(providerDataDir), options);

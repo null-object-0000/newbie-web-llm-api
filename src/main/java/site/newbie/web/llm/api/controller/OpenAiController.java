@@ -21,6 +21,7 @@ import site.newbie.web.llm.api.provider.LLMProvider;
 import site.newbie.web.llm.api.model.LoginInfo;
 import site.newbie.web.llm.api.manager.LoginSessionManager;
 import site.newbie.web.llm.api.provider.ProviderRegistry;
+import site.newbie.web.llm.api.util.ConversationIdUtils;
 import tools.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
@@ -121,7 +122,7 @@ public class OpenAiController {
         // 只从历史消息中提取登录对话ID
         String conversationId = null;
         if (request.getMessages() != null) {
-            conversationId = extractConversationIdFromHistory(request.getMessages());
+            conversationId = ConversationIdUtils.extractConversationIdFromMessages(request.getMessages(), false);
             if (conversationId != null && !conversationId.isEmpty()) {
                 log.debug("从历史消息中提取到对话ID: {}", conversationId);
             }
@@ -347,6 +348,7 @@ public class OpenAiController {
         return switch (providerName) {
             case "deepseek" -> "https://chat.deepseek.com/";
             case "openai" -> "https://chatgpt.com/";
+            case "gemini" -> "https://gemini.google.com/app";
             case "example" ->
                 // 示例提供者不需要登录
                     null;
@@ -369,7 +371,7 @@ public class OpenAiController {
         // 只从历史消息中提取对话ID
         String conversationId = null;
         if (request.getMessages() != null) {
-            conversationId = extractConversationIdFromHistory(request.getMessages());
+            conversationId = ConversationIdUtils.extractConversationIdFromMessages(request.getMessages(), false);
         }
         
         // 如果没有对话ID，生成一个登录对话ID
@@ -641,53 +643,6 @@ public class OpenAiController {
         }
     }
 
-    /**
-     * 从历史消息中提取对话ID
-     * 支持格式：```nwla-conversation-id\n{id}\n```
-     */
-    private String extractConversationIdFromHistory(List<ChatCompletionRequest.Message> messages) {
-        if (messages == null || messages.isEmpty()) {
-            return null;
-        }
-        
-        // 从后往前查找最后一条 assistant 消息
-        for (int i = messages.size() - 1; i >= 0; i--) {
-            ChatCompletionRequest.Message msg = messages.get(i);
-            if ("assistant".equals(msg.getRole()) && msg.getContent() != null) {
-                String content = msg.getContent();
-                
-                // 检查标记格式：```nwla-conversation-id\n{id}\n```
-                String marker = "```nwla-conversation-id";
-                int startIdx = content.indexOf(marker);
-                if (startIdx != -1) {
-                    // 找到开始标记，查找结束标记 ```
-                    int afterMarker = startIdx + marker.length();
-                    // 跳过可能的换行
-                    while (afterMarker < content.length() && 
-                           (content.charAt(afterMarker) == '\n' || content.charAt(afterMarker) == '\r')) {
-                        afterMarker++;
-                    }
-                    // 查找结束的 ```
-                    int endIdx = content.indexOf("```", afterMarker);
-                    if (endIdx != -1 && endIdx > afterMarker) {
-                        String extractedId = content.substring(afterMarker, endIdx).trim();
-                        // 提取第一行非空内容
-                        extractedId = extractedId.lines()
-                            .filter(line -> !line.trim().isEmpty() && !line.contains("```") && !line.contains("nwla-conversation-id"))
-                            .findFirst()
-                            .orElse("")
-                            .trim();
-                        if (!extractedId.isEmpty()) {
-                            log.debug("从历史消息中提取到对话ID: {}", extractedId);
-                            return extractedId;
-                        }
-                    }
-                }
-            }
-        }
-        
-        return null;
-    }
     
     /**
      * 解析用户选择的登录方式

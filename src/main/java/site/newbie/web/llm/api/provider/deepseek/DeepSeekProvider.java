@@ -20,6 +20,7 @@ import site.newbie.web.llm.api.provider.ProviderRegistry;
 import org.springframework.context.annotation.Lazy;
 import site.newbie.web.llm.api.provider.deepseek.model.DeepSeekModelConfig;
 import site.newbie.web.llm.api.provider.deepseek.model.DeepSeekModelConfig.DeepSeekContext;
+import site.newbie.web.llm.api.util.ConversationIdUtils;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
@@ -971,7 +972,7 @@ public class DeepSeekProvider implements LLMProvider {
         
         // 从历史消息中提取
         if (request.getMessages() != null) {
-            conversationId = extractConversationIdFromHistory(request);
+            conversationId = ConversationIdUtils.extractConversationIdFromRequest(request, true);
         }
         return conversationId;
     }
@@ -1721,48 +1722,6 @@ public class DeepSeekProvider implements LLMProvider {
         return "https://chat.deepseek.com/a/chat/s/" + conversationId;
     }
     
-    /**
-     * 从历史消息中提取对话 ID
-     */
-    private String extractConversationIdFromHistory(ChatCompletionRequest request) {
-        if (request.getMessages() == null) return null;
-        
-        for (int i = request.getMessages().size() - 1; i >= 0; i--) {
-            ChatCompletionRequest.Message msg = request.getMessages().get(i);
-            if ("assistant".equals(msg.getRole()) && msg.getContent() != null) {
-                String content = msg.getContent();
-                
-                // 检查标记格式：```nwla-conversation-id\n{id}\n```
-                String marker = "```nwla-conversation-id";
-                int startIdx = content.indexOf(marker);
-                if (startIdx != -1) {
-                    // 找到开始标记，查找结束标记 ```
-                    int afterMarker = startIdx + marker.length();
-                    // 跳过可能的换行
-                    while (afterMarker < content.length() && 
-                           (content.charAt(afterMarker) == '\n' || content.charAt(afterMarker) == '\r')) {
-                        afterMarker++;
-                    }
-                    // 查找结束的 ```
-                    int endIdx = content.indexOf("```", afterMarker);
-                    if (endIdx != -1 && endIdx > afterMarker) {
-                        String extractedId = content.substring(afterMarker, endIdx).trim();
-                        // 提取第一行非空内容
-                        extractedId = extractedId.lines()
-                            .filter(line -> !line.trim().isEmpty() && !line.contains("```") && !line.contains("nwla-conversation-id"))
-                            .findFirst()
-                            .orElse("")
-                            .trim();
-                        if (!extractedId.isEmpty() && !extractedId.startsWith("login-")) {
-                            // 不是登录对话 ID，返回提取的 ID
-                            return extractedId;
-                        }
-                    }
-                }
-            }
-        }
-        return null;
-    }
     
     @PreDestroy
     public void cleanup() {

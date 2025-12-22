@@ -1,4 +1,4 @@
-package site.newbie.web.llm.api.provider.openai;
+package site.newbie.web.llm.api.provider.gemini;
 
 import com.microsoft.playwright.Locator;
 import com.microsoft.playwright.Page;
@@ -17,8 +17,8 @@ import site.newbie.web.llm.api.provider.ModelConfig;
 import site.newbie.web.llm.api.provider.ProviderRegistry;
 import org.springframework.context.annotation.Lazy;
 import site.newbie.web.llm.api.manager.LoginSessionManager;
-import site.newbie.web.llm.api.provider.openai.model.OpenAIModelConfig;
-import site.newbie.web.llm.api.provider.openai.model.OpenAIModelConfig.OpenAIContext;
+import site.newbie.web.llm.api.provider.gemini.model.GeminiModelConfig;
+import site.newbie.web.llm.api.provider.gemini.model.GeminiModelConfig.GeminiContext;
 import site.newbie.web.llm.api.util.ConversationIdUtils;
 import tools.jackson.databind.ObjectMapper;
 
@@ -34,16 +34,16 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
- * OpenAI 统一提供者
- * 通过依赖 OpenAIModelConfig 实现不同模型的差异化处理
+ * Gemini 统一提供者
+ * 通过依赖 GeminiModelConfig 实现不同模型的差异化处理
  */
 @Slf4j
 @Component
-public class OpenAIProvider implements LLMProvider {
+public class GeminiProvider implements LLMProvider {
 
     private final BrowserManager browserManager;
     private final ObjectMapper objectMapper;
-    private final Map<String, OpenAIModelConfig> modelConfigs;
+    private final Map<String, GeminiModelConfig> modelConfigs;
     private final ProviderRegistry providerRegistry;
     private final LoginSessionManager loginSessionManager;
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
@@ -51,66 +51,65 @@ public class OpenAIProvider implements LLMProvider {
     private final ConcurrentHashMap<String, Page> modelPages = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, String> pageUrls = new ConcurrentHashMap<>();
     
-    @Value("${openai.monitor.mode:sse}")
+    @Value("${gemini.monitor.mode:sse}")
     private String monitorMode;
     
-    private static final String SSE_DATA_VAR = "__openaiSseData";
-    private static final String SSE_INTERCEPTOR_VAR = "__openaiSseInterceptorSet";
-    private static final String[] SSE_URL_PATTERNS = {"/api/conversation", "/backend-api"};
+    private static final String SSE_DATA_VAR = "__geminiSseData";
+    private static final String SSE_INTERCEPTOR_VAR = "__geminiSseInterceptorSet";
+    private static final String[] SSE_URL_PATTERNS = {"/api/generate", "/api/chat"};
     
     private final ModelConfig.ResponseHandler responseHandler = new ModelConfig.ResponseHandler() {
         @Override
         public void sendChunk(SseEmitter emitter, String id, String content, String model) throws IOException {
-            OpenAIProvider.this.sendSseChunk(emitter, id, content, model);
+            GeminiProvider.this.sendSseChunk(emitter, id, content, model);
         }
 
         @Override
         public void sendThinking(SseEmitter emitter, String id, String content, String model) throws IOException {
-            OpenAIProvider.this.sendThinkingContent(emitter, id, content, model);
+            GeminiProvider.this.sendThinkingContent(emitter, id, content, model);
         }
 
         @Override
         public void sendReplace(SseEmitter emitter, String id, String content, String model) throws IOException {
-            OpenAIProvider.this.sendSseReplace(emitter, id, content, model);
+            GeminiProvider.this.sendSseReplace(emitter, id, content, model);
         }
 
         @Override
         public void sendUrlAndComplete(Page page, SseEmitter emitter, ChatCompletionRequest request) throws IOException {
-            OpenAIProvider.this.sendUrlAndComplete(page, emitter, request);
+            GeminiProvider.this.sendUrlAndComplete(page, emitter, request);
         }
 
         @Override
         public String getSseData(Page page, String varName) {
-            return OpenAIProvider.this.getSseDataFromPage(page, varName);
+            return GeminiProvider.this.getSseDataFromPage(page, varName);
         }
 
         @Override
         public ModelConfig.ParseResultWithIndex parseSseIncremental(String sseData, Map<Integer, String> fragmentTypeMap, Integer lastActiveFragmentIndex) {
-            // OpenAI 使用简化的解析
-            return new ModelConfig.ParseResultWithIndex(new ModelConfig.SseParseResult(null, null, false), null);
+            return GeminiProvider.this.parseSseIncremental(sseData, fragmentTypeMap, lastActiveFragmentIndex);
         }
 
         @Override
         public String extractTextFromSse(String sseData) {
-            return OpenAIProvider.this.extractTextFromSse(sseData);
+            return GeminiProvider.this.extractTextFromSse(sseData);
         }
     };
 
-    public OpenAIProvider(BrowserManager browserManager, ObjectMapper objectMapper, 
-                         List<OpenAIModelConfig> configs, @Lazy ProviderRegistry providerRegistry,
+    public GeminiProvider(BrowserManager browserManager, ObjectMapper objectMapper, 
+                         List<GeminiModelConfig> configs, @Lazy ProviderRegistry providerRegistry,
                          LoginSessionManager loginSessionManager) {
         this.browserManager = browserManager;
         this.objectMapper = objectMapper;
         this.providerRegistry = providerRegistry;
         this.loginSessionManager = loginSessionManager;
         this.modelConfigs = configs.stream()
-                .collect(Collectors.toMap(OpenAIModelConfig::getModelName, Function.identity()));
-        log.info("OpenAIProvider 初始化完成，支持的模型: {}", modelConfigs.keySet());
+                .collect(Collectors.toMap(GeminiModelConfig::getModelName, Function.identity()));
+        log.info("GeminiProvider 初始化完成，支持的模型: {}", modelConfigs.keySet());
     }
 
     @Override
     public String getProviderName() {
-        return "openai";
+        return "gemini";
     }
 
     @Override
@@ -132,32 +131,37 @@ public class OpenAIProvider implements LLMProvider {
             
             // 检查URL：如果URL包含登录相关路径，说明未登录
             String url = page.url();
-            if (url.contains("/login") || url.contains("/signin") || url.contains("/auth") || url.contains("/u/login")) {
+            if (url.contains("/signin") || url.contains("/login") || url.contains("/auth")) {
                 log.info("检测到登录页面URL: {}", url);
                 return false;
             }
             
             // 检查是否存在输入框（已登录会有输入框）
-            Locator inputBox = page.locator("div.ProseMirror[id='prompt-textarea']")
-                    .or(page.locator("div[contenteditable='true'][id='prompt-textarea']"));
-            if (inputBox.count() > 0) {
+            // 使用 div[role='textbox'] 作为主要选择器
+            Locator inputBox = page.locator("div[role='textbox']")
+                    .or(page.locator("textarea[placeholder*='输入']"))
+                    .or(page.locator("textarea[placeholder*='Enter a prompt']"))
+                    .or(page.locator("textarea[aria-label*='prompt']"));
+            
+            if (inputBox.count() > 0 && inputBox.first().isVisible()) {
                 log.info("检测到输入框，判断为已登录");
                 return true;
             }
             
             // 检查是否存在登录按钮（未登录会有登录按钮）
             Locator loginButton = page.locator("button:has-text('登录')")
-                    .or(page.locator("button:has-text('Log in')"))
+                    .or(page.locator("button:has-text('Sign in')"))
                     .or(page.locator("a:has-text('登录')"))
-                    .or(page.locator("a:has-text('Log in')"))
-                    .or(page.locator("a[href*='login']"));
-            if (loginButton.count() > 0) {
+                    .or(page.locator("a:has-text('Sign in')"))
+                    .or(page.locator("a[href*='signin']"));
+            
+            if (loginButton.count() > 0 && loginButton.first().isVisible()) {
                 log.info("检测到登录按钮，判断为未登录");
                 return false;
             }
             
             // 如果URL是聊天页面且没有登录按钮，认为已登录
-            if (url.contains("chatgpt.com") || url.contains("chat.openai.com")) {
+            if (url.contains("gemini.google.com") || url.contains("ai.google.dev")) {
                 log.info("在聊天页面且未检测到登录按钮，判断为已登录");
                 return true;
             }
@@ -187,7 +191,7 @@ public class OpenAIProvider implements LLMProvider {
             Page page = null;
             try {
                 String model = request.getModel();
-                OpenAIModelConfig config = modelConfigs.get(model);
+                GeminiModelConfig config = modelConfigs.get(model);
                 
                 if (config == null) {
                     throw new IllegalArgumentException("不支持的模型: " + model);
@@ -195,26 +199,20 @@ public class OpenAIProvider implements LLMProvider {
 
                 page = getOrCreatePage(request);
                 
-                // 检查登录状态（在创建页面后再次检查，因为页面创建时可能检测到登录状态丢失）
+                // 检查登录状态
                 if (!checkLoginStatus(page)) {
                     log.warn("检测到未登录状态，发送登录提示");
-                    // 注意：不在这里更新 providerRegistry 的状态，避免循环依赖
-                    // 状态更新由 Controller 层处理
                     
-                    // 获取或生成对话ID
                     String conversationId = getConversationId(request);
                     if (conversationId == null || conversationId.isEmpty()) {
                         conversationId = "login-" + UUID.randomUUID();
                     }
                     
-                    // 创建登录会话
                     LoginSessionManager.LoginSession session = loginSessionManager.getOrCreateSession(getProviderName(), conversationId);
                     session.setConversationId(conversationId);
                     session.setState(LoginSessionManager.LoginSessionState.WAITING_LOGIN_METHOD);
-                    // 保存会话（确保状态被持久化）
                     loginSessionManager.saveSession(getProviderName(), conversationId, session);
                     
-                    // 发送登录方式选择提示
                     sendLoginMethodSelection(emitter, request.getModel(), getProviderName(), conversationId);
                     return;
                 }
@@ -231,7 +229,7 @@ public class OpenAIProvider implements LLMProvider {
                 int messageCountBefore = countMessages(page);
                 verifySseInterceptor(page);
                 
-                OpenAIContext context = new OpenAIContext(
+                GeminiContext context = new GeminiContext(
                         page, emitter, request, messageCountBefore, monitorMode, responseHandler
                 );
                 config.monitorResponse(context);
@@ -260,13 +258,11 @@ public class OpenAIProvider implements LLMProvider {
     }
     
     private String getConversationId(ChatCompletionRequest request) {
-        // 首先尝试从请求中获取
         String conversationId = request.getConversationId();
         if (conversationId != null && !conversationId.isEmpty()) {
             return conversationId;
         }
         
-        // 从历史消息中提取
         if (request.getMessages() != null) {
             conversationId = ConversationIdUtils.extractConversationIdFromRequest(request, true);
         }
@@ -284,7 +280,6 @@ public class OpenAIProvider implements LLMProvider {
             if (!page.url().equals(url)) {
                 page.navigate(url);
                 page.waitForLoadState();
-                // 检测登录状态是否丢失
                 checkLoginStatusLost(page);
             }
             modelPages.put(model, page);
@@ -297,7 +292,6 @@ public class OpenAIProvider implements LLMProvider {
         page.navigate(url);
         page.waitForLoadState();
         pageUrls.put(model, url);
-        // 检测登录状态是否丢失
         checkLoginStatusLost(page);
         return page;
     }
@@ -310,39 +304,36 @@ public class OpenAIProvider implements LLMProvider {
         
         Page page = browserManager.newPage(getProviderName());
         modelPages.put(model, page);
-        page.navigate("https://chatgpt.com/");
+        // 使用 /app 路径
+        page.navigate("https://gemini.google.com/app");
         page.waitForLoadState();
+        // 等待输入框出现，确保页面加载完成
+        try {
+            page.waitForSelector("div[role='textbox']", new Page.WaitForSelectorOptions().setTimeout(30000));
+        } catch (Exception e) {
+            log.warn("等待输入框超时: {}", e.getMessage());
+        }
         pageUrls.put(model, page.url());
-        // 检测登录状态是否丢失
         checkLoginStatusLost(page);
         return page;
     }
     
-    /**
-     * 检测登录状态是否丢失（通过检查是否有登录按钮）
-     * 如果检测到登录按钮，说明登录状态丢失
-     * 注意：不在这里更新 providerRegistry 的状态，避免循环依赖
-     */
     private void checkLoginStatusLost(Page page) {
         try {
             if (page == null || page.isClosed()) {
                 return;
             }
             
-            // 等待页面加载完成
             page.waitForLoadState();
             page.waitForTimeout(1000);
             
-            // 检查是否有登录按钮（登录状态丢失时会出现登录按钮）
             Locator loginButton = page.locator("button:has-text('登录')")
-                    .or(page.locator("button:has-text('Login')"))
-                    .or(page.locator("button:has-text('Log in')"))
-                    .or(page.locator("button:has-text('Sign in')"));
+                    .or(page.locator("button:has-text('Sign in')"))
+                    .or(page.locator("a:has-text('登录')"))
+                    .or(page.locator("a:has-text('Sign in')"));
             
             if (loginButton.count() > 0 && loginButton.first().isVisible()) {
                 log.warn("检测到登录按钮，说明登录状态已丢失");
-                // 注意：不在这里更新 providerRegistry 的状态，避免循环依赖
-                // 状态更新由 Controller 层处理
             }
         } catch (Exception e) {
             log.warn("检测登录状态丢失时出错: {}", e.getMessage());
@@ -370,73 +361,72 @@ public class OpenAIProvider implements LLMProvider {
     private void clickNewChatButton(Page page) {
         try {
             page.waitForTimeout(1000);
-            Boolean result = (Boolean) page.evaluate("""
-                () => {
-                    let button = document.querySelector('a[data-testid="create-new-chat-button"]');
-                    if (!button) {
-                        const links = document.querySelectorAll('a[href="/"]');
-                        for (const link of links) {
-                            if (link.textContent.includes('新聊天') || link.textContent.includes('New chat')) {
-                                button = link;
-                                break;
-                            }
-                        }
-                    }
-                    if (button) {
-                        button.click();
-                        return true;
-                    }
-                    return false;
+            // 优先使用侧边栏的新聊天按钮
+            Locator newChatButton = page.locator("bard-sidenav-container side-navigation-content mat-action-list.top-action-list button.mat-mdc-list-item")
+                    .or(page.locator("button:has-text('新对话')"))
+                    .or(page.locator("button:has-text('New chat')"))
+                    .or(page.locator("a:has-text('新对话')"))
+                    .or(page.locator("a:has-text('New chat')"))
+                    .or(page.locator("[aria-label*='New chat']"))
+                    .or(page.locator("[aria-label*='新对话']"));
+            
+            if (newChatButton.count() > 0) {
+                newChatButton.first().click();
+                // 等待输入框出现，确保新聊天页面加载完成
+                try {
+                    page.waitForSelector("div[role='textbox']", new Page.WaitForSelectorOptions().setTimeout(10000));
+                } catch (Exception e) {
+                    log.warn("等待新聊天页面输入框超时: {}", e.getMessage());
                 }
-            """);
-            if (Boolean.TRUE.equals(result)) {
                 page.waitForTimeout(500);
-                log.info("已点击新聊天按钮");
+                log.info("已点击新对话按钮");
+            } else {
+                log.warn("未找到新对话按钮，可能需要手动创建新对话");
             }
         } catch (Exception e) {
-            log.warn("点击新聊天按钮时出错", e);
+            log.warn("点击新对话按钮时出错", e);
         }
     }
     
     private void sendMessage(Page page, ChatCompletionRequest request) {
-        page.waitForTimeout(1000);
-        Locator inputBox = page.locator("div.ProseMirror[id='prompt-textarea']");
         try {
+            page.waitForTimeout(1000);
+            // 优先使用 div[role='textbox'] 作为输入框选择器
+            Locator inputBox = page.locator("div[role='textbox']")
+                    .or(page.locator("textarea[placeholder*='输入']"))
+                    .or(page.locator("textarea[placeholder*='Enter a prompt']"))
+                    .or(page.locator("textarea[aria-label*='prompt']"));
+            
             inputBox.waitFor();
-        } catch (Exception e) {
-            inputBox = page.locator("div[contenteditable='true'][id='prompt-textarea']");
-            inputBox.waitFor();
-        }
-        
-        String message = request.getMessages().stream()
-                .filter(m -> "user".equals(m.getRole()))
-                .reduce((first, second) -> second)
-                .map(ChatCompletionRequest.Message::getContent)
-                .orElse("Hello");
-        
-        log.info("发送消息: {}", message);
-        inputBox.click();
-        page.waitForTimeout(200);
-        
-        page.evaluate("""
-            (text) => {
-                const input = document.getElementById('prompt-textarea');
-                if (input) {
-                    input.innerHTML = '';
-                    input.appendChild(document.createTextNode(text));
-                    input.dispatchEvent(new Event('input', { bubbles: true }));
-                }
+            
+            String message = request.getMessages().stream()
+                    .filter(m -> "user".equals(m.getRole()))
+                    .reduce((first, second) -> second)
+                    .map(ChatCompletionRequest.Message::getContent)
+                    .orElse("Hello");
+            
+            log.info("发送消息: {}", message);
+            // 直接 fill 然后按 Enter
+            if (inputBox.count() > 0) {
+                inputBox.first().fill(message);
+                page.waitForTimeout(200);
+                inputBox.first().press("Enter");
+                log.info("已发送消息（使用 Enter 键）");
+            } else {
+                throw new RuntimeException("未找到输入框");
             }
-        """, message);
-        
-        page.waitForTimeout(300);
-        page.keyboard().press("Enter");
-        page.waitForTimeout(500);
+            page.waitForTimeout(500);
+        } catch (Exception e) {
+            log.error("发送消息时出错: {}", e.getMessage(), e);
+            throw new RuntimeException("发送消息失败", e);
+        }
     }
     
     private int countMessages(Page page) {
-        Locator locators = page.locator("[data-message-author-role='assistant']")
-                .or(page.locator(".markdown"));
+        // 使用 model-response message-content 作为响应选择器
+        Locator locators = page.locator("model-response message-content")
+                .or(page.locator("[data-message-author-role='model']"))
+                .or(page.locator("[data-author='model']"));
         return locators.count();
     }
     
@@ -450,7 +440,6 @@ public class OpenAIProvider implements LLMProvider {
     // ==================== SSE 拦截器 ====================
     
     private void setupSseInterceptor(Page page) {
-        // 清空旧的 SSE 数据和索引（避免复用页面时读取到旧数据）
         try {
             page.evaluate(String.format("() => { window.%s = []; window.%sIndex = 0; }", SSE_DATA_VAR, SSE_DATA_VAR));
         } catch (Exception e) { }
@@ -496,6 +485,7 @@ public class OpenAIProvider implements LLMProvider {
         
         try {
             page.evaluate(jsCode);
+            log.info("已设置 SSE 拦截器");
         } catch (Exception e) {
             log.error("设置 SSE 拦截器失败: {}", e.getMessage());
         }
@@ -513,7 +503,6 @@ public class OpenAIProvider implements LLMProvider {
     private String getSseDataFromPage(Page page, String varName) {
         try {
             if (page.isClosed()) return null;
-            // 使用索引跟踪已读取的数据，避免清空数组导致数据丢失
             Object result = page.evaluate(String.format("""
                 () => {
                     if (!window.%s) return null;
@@ -534,7 +523,6 @@ public class OpenAIProvider implements LLMProvider {
     
     // ==================== SSE 发送 ====================
     
-    // UTF-8 编码的 MediaType，确保中文和 emoji 正确传输
     private static final MediaType APPLICATION_JSON_UTF8 = new MediaType("application", "json", StandardCharsets.UTF_8);
     
     private void sendSseChunk(SseEmitter emitter, String id, String content, String model) throws IOException {
@@ -560,8 +548,9 @@ public class OpenAIProvider implements LLMProvider {
     }
     
     private void sendSseReplace(SseEmitter emitter, String id, String content, String model) throws IOException {
+        String markedContent = "__REPLACE__" + content;
         ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
-                .delta(ChatCompletionResponse.Delta.builder().content("__REPLACE__" + content).build())
+                .delta(ChatCompletionResponse.Delta.builder().content(markedContent).build())
                 .index(0).build();
         ChatCompletionResponse response = ChatCompletionResponse.builder()
                 .id(id).object("chat.completion.chunk")
@@ -574,19 +563,11 @@ public class OpenAIProvider implements LLMProvider {
         try {
             if (!page.isClosed()) {
                 String url = page.url();
-                if (url.contains("chatgpt.com") || url.contains("chat.openai.com")) {
+                if (url.contains("gemini.google.com") || url.contains("ai.google.dev")) {
                     pageUrls.put(request.getModel(), url);
                     String conversationId = extractConversationIdFromUrl(url);
                     if (conversationId != null && !conversationId.isEmpty()) {
-                        String content = "\n\n```nwla-conversation-id\n" + conversationId + "\n```\n\n";
-                        ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
-                                .delta(ChatCompletionResponse.Delta.builder().content(content).build())
-                                .index(0).build();
-                        ChatCompletionResponse response = ChatCompletionResponse.builder()
-                                .id(UUID.randomUUID().toString()).object("chat.completion.chunk")
-                                .created(System.currentTimeMillis() / 1000)
-                                .model(request.getModel()).choices(List.of(choice)).build();
-                        emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(response), APPLICATION_JSON_UTF8));
+                        sendConversationId(emitter, UUID.randomUUID().toString(), conversationId, request.getModel());
                         log.info("已发送对话 ID: {} (从 URL: {})", conversationId, url);
                     } else {
                         log.warn("无法从 URL 中提取对话 ID: {}", url);
@@ -594,15 +575,24 @@ public class OpenAIProvider implements LLMProvider {
                 }
             }
         } catch (Exception e) {
-            log.warn("发送对话 URL 时出错: {}", e.getMessage());
+            log.error("发送对话 ID 时出错: {}", e.getMessage());
         }
         emitter.send(SseEmitter.event().data("[DONE]", MediaType.TEXT_PLAIN));
         emitter.complete();
     }
     
-    /**
-     * 发送登录方式选择提示
-     */
+    private void sendConversationId(SseEmitter emitter, String id, String conversationId, String model) throws IOException {
+        String content = "\n\n```nwla-conversation-id\n" + conversationId + "\n```\n\n";
+        ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
+                .delta(ChatCompletionResponse.Delta.builder().content(content).build())
+                .index(0).build();
+        ChatCompletionResponse response = ChatCompletionResponse.builder()
+                .id(id).object("chat.completion.chunk")
+                .created(System.currentTimeMillis() / 1000)
+                .model(model).choices(List.of(choice)).build();
+        emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(response), APPLICATION_JSON_UTF8));
+    }
+    
     private void sendLoginMethodSelection(SseEmitter emitter, String model, String providerName, String conversationId) {
         try {
             StringBuilder message = new StringBuilder();
@@ -614,7 +604,6 @@ public class OpenAIProvider implements LLMProvider {
             message.append("请输入对应的数字（1、2、3）来选择登录方式。");
             message.append("\n```");
             
-            // 如果提供了对话ID，在消息中包含对话ID信息
             if (conversationId != null && !conversationId.isEmpty()) {
                 message.append("\n\n```nwla-conversation-id\n");
                 message.append(conversationId);
@@ -634,7 +623,6 @@ public class OpenAIProvider implements LLMProvider {
             emitter.send(SseEmitter.event().data("[DONE]", MediaType.TEXT_PLAIN));
             emitter.complete();
             
-            // 释放锁
             if (providerName != null) {
                 new Thread(() -> {
                     try {
@@ -658,241 +646,96 @@ public class OpenAIProvider implements LLMProvider {
         }
     }
     
+    // ==================== SSE 解析 ====================
+    
     private String extractTextFromSse(String sseData) {
-        if (sseData == null) return null;
+        if (sseData == null || sseData.isEmpty()) return null;
+        
         StringBuilder text = new StringBuilder();
-        
-        String[] lines = sseData.split("\n");
-        int processedCount = 0;
-        int skippedCount = 0;
-
-        for (String s : lines) {
-            String line = s.trim();
-
-            // 跳过 event 行（不再需要跟踪状态，因为简单格式不依赖 event）
-            if (line.startsWith("event: ")) {
-                continue;
-            }
-
-            // 只处理 data 行
-            if (!line.startsWith("data: ")) {
-                continue;
-            }
-
-            // 跳过完成标记（但先处理完当前批次的其他数据）
-            if (line.contains("[DONE]")) {
-                // 注意：不立即 continue，让循环继续处理其他行
-                // 因为 [DONE] 可能在数据中间
-                continue;
-            }
-
-            String jsonStr = line.substring(6).trim();
-            if (jsonStr.isEmpty() || jsonStr.equals("{}")) {
-                continue;
-            }
-
-            String liteJSONStr = jsonStr.length() > 100 ? jsonStr.substring(0, 100) + "..." : jsonStr;
-            try {
-                var json = objectMapper.readTree(jsonStr);
-
-                // 处理纯字符串的情况（可能是版本号等元数据，但先记录）
-                if (json.isString()) {
-                    skippedCount++;
-                    log.debug("跳过纯字符串数据: {}", liteJSONStr);
-                    continue;
-                }
-
-                // 必须是对象节点
-                if (!json.isObject()) {
-                    skippedCount++;
-                    log.debug("跳过非对象数据: {}", liteJSONStr);
-                    continue;
-                }
-
-                // 跳过有 type 字段的元数据（如 resume_conversation_token, input_message 等）
-                if (json.has("type")) {
-                    skippedCount++;
-                    String type = json.get("type").asString();
-                    // 记录重要的元数据类型，帮助调试
-                    if (!"message_stream_complete".equals(type) && !"conversation_detail_metadata".equals(type)) {
-                        log.info("跳过元数据: {}", type);
+        for (String line : sseData.split("\n")) {
+            line = line.trim();
+            if (line.startsWith("data: ")) {
+                String jsonStr = line.substring(6).trim();
+                if (jsonStr.isEmpty() || jsonStr.equals("{}")) continue;
+                try {
+                    var json = objectMapper.readTree(jsonStr);
+                    if (json.has("text") && json.get("text").isString()) {
+                        text.append(json.get("text").asString());
+                    } else if (json.has("content") && json.get("content").isString()) {
+                        text.append(json.get("content").asString());
                     }
-                    continue;
-                }
-
-                // 格式1: {"p": "/message/content/parts/0", "o": "append", "v": "内容"}
-                // 注意：只处理 append 操作，patch 操作由格式3处理
-                if (json.has("p") && json.has("o") && json.has("v")) {
-                    String path = json.get("p").asString();
-                    String operation = json.get("o").asString();
-
-                    // 处理内容路径的 append 操作
-                    // 支持多种可能的内容路径格式
-                    if (path != null && "append".equals(operation)) {
-                        boolean isContentPath = path.contains("/message/content/parts/") ||
-                                path.contains("/content/parts/") ||
-                                path.contains("/content") ||
-                                path.endsWith("/content") ||
-                                path.contains("content");
-
-                        if (isContentPath && json.get("v").isString()) {
-                            String content = json.get("v").asString();
-                            if (content != null && !content.isEmpty()) {
-                                text.append(content);
-                                processedCount++;
-                                log.info("提取内容 (路径格式, path={}): {}", path, content);
-                            }
-                        } else if (isContentPath) {
-                            log.info("内容路径的值不是文本类型: path={}, op={}, v类型={}", path, operation, json.get("v").getNodeType());
-                        } else {
-                            log.trace("跳过非内容路径: path={}, op={}", path, operation);
-                        }
-                        continue; // 只有 append 操作处理完才跳过
-                    }
-                    // 注意：如果 operation 不是 "append"（如 "patch", "add", "replace"），不要 continue，让后续逻辑处理
-                }
-
-                // 格式2: {"v": "内容"} - 简单格式，直接追加（不依赖 event，因为可能跨批次）
-                // 注意：只处理纯文本内容，跳过对象和数组
-                if (json.has("v") && !json.has("p") && !json.has("o")) {
-                    var vNode = json.get("v");
-                    if (vNode.isString()) {
-                        String content = vNode.asString();
-                        if (content != null && !content.isEmpty()) {
-                            text.append(content);
-                            processedCount++;
-                            log.info("提取内容 (简单格式): {}", content);
-                        }
-                    }
-                    continue;
-                }
-
-                // 格式3: {"p": "", "o": "patch", "v": [...]} - 批量更新
-                if (json.has("p") && json.has("o") && "patch".equals(json.get("o").asString())) {
-                    if (json.has("v") && json.get("v").isArray()) {
-                        var patchArray = json.get("v");
-                        int patchItemCount = 0;
-                        int totalPatchItems = patchArray.size();
-                        log.info("处理 patch 格式，包含 {} 个操作项", totalPatchItems);
-                        for (var patchItem : patchArray) {
-                            if (patchItem.has("p") && patchItem.has("o") && patchItem.has("v")) {
-                                String itemPath = patchItem.get("p").asString();
-                                String itemOp = patchItem.get("o").asString();
-
-                                // 处理内容路径的 append 操作，支持更多路径格式
-                                if (itemPath != null && "append".equals(itemOp)) {
-                                    boolean isContentPath = itemPath.contains("/message/content/parts/") ||
-                                            itemPath.contains("/content/parts/") ||
-                                            itemPath.contains("/content") ||
-                                            itemPath.endsWith("/content") ||
-                                            itemPath.contains("content");
-
-                                    if (isContentPath && patchItem.get("v").isString()) {
-                                        String content = patchItem.get("v").asString();
-                                        if (content != null && !content.isEmpty()) {
-                                            text.append(content);
-                                            patchItemCount++;
-                                            log.info("提取内容 (patch格式, path={}): {}", itemPath, content);
-                                        }
-                                    } else if (isContentPath) {
-                                        log.info("patch 项的值不是文本类型: path={}, op={}, v类型={}", itemPath, itemOp, patchItem.get("v").getNodeType());
-                                    } else {
-                                        log.trace("跳过 patch 项（非内容路径）: path={}, op={}", itemPath, itemOp);
-                                    }
-                                } else {
-                                    log.trace("跳过 patch 项（非 append 操作）: path={}, op={}", itemPath, itemOp);
-                                }
-                            } else {
-                                log.info("patch 项格式不完整: {}", patchItem);
-                            }
-                        }
-                        if (patchItemCount > 0) {
-                            processedCount++;
-                            log.info("patch 格式处理完成，提取了 {} 个内容项，共 {} 个操作项", patchItemCount, totalPatchItems);
-                        } else if (totalPatchItems > 0) {
-                            log.info("patch 格式未提取到任何内容，共 {} 个操作项", totalPatchItems);
-                        }
-                    } else {
-                        log.warn("patch 格式的 v 字段不是数组: {}", jsonStr.length() > 200 ? jsonStr.substring(0, 200) + "..." : jsonStr);
-                    }
-                    continue;
-                }
-
-                // 如果都没有匹配，记录未处理的格式
-                skippedCount++;
-                // 检查是否是消息对象（可能包含内容）
-                if (json.has("v") && json.get("v").isObject()) {
-                    var vObj = json.get("v");
-                    if (vObj.has("message")) {
-                        log.debug("跳过消息对象（可能是初始化消息）");
-                    } else {
-                        // 尝试从消息对象中提取内容
-                        if (vObj.has("content") && vObj.get("content").isString()) {
-                            String content = vObj.get("content").asString();
-                            if (content != null && !content.isEmpty()) {
-                                text.append(content);
-                                processedCount++;
-                                log.info("从消息对象中提取内容: {}", content.length() > 50 ? content.substring(0, 50) + "..." : content);
-                                continue;
-                            }
-                        }
-                        log.warn("未处理的 JSON 格式（包含 v 对象）: {}", liteJSONStr);
-                    }
-                } else {
-                    log.warn("未处理的 JSON 格式: {}", liteJSONStr);
-                }
-            } catch (Exception e) {
-                skippedCount++;
-                log.error("解析 SSE 数据行失败: {} - {}", e.getMessage(), liteJSONStr);
+                } catch (Exception e) { }
             }
         }
-        
-        if (text.length() > 0) {
-            log.info("从 SSE 提取到 {} 字符，处理了 {} 条数据，跳过了 {} 条", text.length(), processedCount, skippedCount);
-            if (log.isDebugEnabled() && text.length() < 100) {
-                log.debug("提取的内容预览: {}", text);
-            }
-            return text.toString();
-        } else if (processedCount > 0 || skippedCount > 0) {
-            log.info("SSE 数据已处理但无文本内容，处理了 {} 条，跳过了 {} 条", processedCount, skippedCount);
-            if (log.isDebugEnabled() && sseData.length() < 500) {
-                log.debug("SSE 数据内容: {}", sseData);
-            }
-        }
-        return null;
+        return !text.isEmpty() ? text.toString() : null;
     }
     
-    /**
-     * 从 URL 中提取对话 ID
-     * 支持格式：
-     * - https://chatgpt.com/c/{id}
-     * - https://chat.openai.com/c/{id}
-     */
-    private String extractConversationIdFromUrl(String url) {
-        if (url == null || url.isEmpty()) {
-            return null;
+    private ModelConfig.ParseResultWithIndex parseSseIncremental(String sseData, Map<Integer, String> fragmentTypeMap, 
+                                                     Integer lastActiveFragmentIndex) {
+        if (sseData == null || sseData.isEmpty()) {
+            return new ModelConfig.ParseResultWithIndex(new ModelConfig.SseParseResult(null, null, false), lastActiveFragmentIndex);
         }
         
-        boolean isChatGpt = url.contains("chatgpt.com");
-        boolean isChatOpenai = url.contains("chat.openai.com");
-        if (!isChatGpt && !isChatOpenai) {
+        StringBuilder responseText = new StringBuilder();
+        boolean finished = false;
+        
+        for (String line : sseData.split("\n")) {
+            line = line.trim();
+            
+            if (line.startsWith("event: ")) {
+                String event = line.substring(7).trim();
+                if ("finish".equals(event) || "close".equals(event) || "done".equals(event)) {
+                    finished = true;
+                }
+                continue;
+            }
+            
+            if (!line.startsWith("data: ")) continue;
+            String jsonStr = line.substring(6).trim();
+            if (jsonStr.isEmpty() || jsonStr.equals("{}")) continue;
+            
+            try {
+                var json = objectMapper.readTree(jsonStr);
+                if (json.has("text") && json.get("text").isString()) {
+                    responseText.append(json.get("text").asString());
+                } else if (json.has("content") && json.get("content").isString()) {
+                    responseText.append(json.get("content").asString());
+                } else if (json.has("delta") && json.get("delta").has("text")) {
+                    responseText.append(json.get("delta").get("text").asString());
+                }
+            } catch (Exception e) {
+                log.debug("解析 SSE 数据行时出错: {}", e.getMessage());
+            }
+        }
+        
+        ModelConfig.SseParseResult result = new ModelConfig.SseParseResult(
+                null,
+                responseText.length() > 0 ? responseText.toString() : null,
+                finished
+        );
+        return new ModelConfig.ParseResultWithIndex(result, lastActiveFragmentIndex);
+    }
+    
+    // ==================== 对话 ID 提取 ====================
+    
+    private String extractConversationIdFromUrl(String url) {
+        if (url == null || (!url.contains("gemini.google.com") && !url.contains("ai.google.dev"))) {
             return null;
         }
         
         try {
-            // 尝试从路径中提取 ID
-            // 格式: https://chatgpt.com/c/{id} 或 https://chat.openai.com/c/{id}
-            int cIdx = url.indexOf("/c/");
-            if (cIdx >= 0) {
-                String afterC = url.substring(cIdx + "/c/".length());
-                // 移除查询参数和片段
-                int queryIdx = afterC.indexOf('?');
-                int fragmentIdx = afterC.indexOf('#');
-                int endIdx = afterC.length();
+            // 尝试从 URL 中提取对话 ID
+            // Gemini URL 格式可能类似: https://gemini.google.com/chat/{id}
+            int chatIdx = url.indexOf("/chat/");
+            if (chatIdx >= 0) {
+                String afterChat = url.substring(chatIdx + "/chat/".length());
+                int queryIdx = afterChat.indexOf('?');
+                int fragmentIdx = afterChat.indexOf('#');
+                int endIdx = afterChat.length();
                 if (queryIdx >= 0) endIdx = Math.min(endIdx, queryIdx);
                 if (fragmentIdx >= 0) endIdx = Math.min(endIdx, fragmentIdx);
                 
-                String id = afterC.substring(0, endIdx).trim();
+                String id = afterChat.substring(0, endIdx).trim();
                 if (!id.isEmpty()) {
                     return id;
                 }
@@ -904,15 +747,11 @@ public class OpenAIProvider implements LLMProvider {
         return null;
     }
     
-    /**
-     * 从对话 ID 构建 URL
-     */
     private String buildUrlFromConversationId(String conversationId) {
         if (conversationId == null || conversationId.isEmpty()) {
             return null;
         }
-        // 默认使用 chatgpt.com，如果需要可以扩展为支持 chat.openai.com
-        return "https://chatgpt.com/c/" + conversationId;
+        return "https://gemini.google.com/chat/" + conversationId;
     }
     
     
