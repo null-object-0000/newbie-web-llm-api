@@ -36,6 +36,17 @@ public class BrowserManager {
         log.info("正在启动 Playwright 引擎...");
         log.info("浏览器模式: {}, 基础数据存储路径: {}", headless ? "Headless (无头)" : "Headed (有界面)", userDataDir);
 
+        // 设置系统属性，阻止 Playwright Java 自动下载浏览器
+        // 我们已经通过 Dockerfile 手动安装了 Chromium
+        String browsersPath = System.getenv("PLAYWRIGHT_BROWSERS_PATH");
+        if (browsersPath != null && !browsersPath.isEmpty()) {
+            System.setProperty("playwright.browsers.path", browsersPath);
+            log.info("设置 Playwright 浏览器路径: {}", browsersPath);
+        }
+        
+        // 设置系统属性跳过浏览器下载
+        System.setProperty("playwright.cli.skip.install", "true");
+        
         playwright = Playwright.create();
 
         log.info("Playwright 启动成功！各提供器的 BrowserContext 将按需创建。");

@@ -3,7 +3,6 @@ package site.newbie.web.llm.api.manager;
 import jakarta.annotation.PostConstruct;
 import lombok.Data;
 import lombok.Getter;
-import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
@@ -42,6 +41,8 @@ public class LoginSessionManager {
         WAITING_ACCOUNT,
         /** 等待输入密码 */
         WAITING_PASSWORD,
+        /** 等待微信扫码 */
+        WAITING_WECHAT_SCAN,
         /** 登录中 */
         LOGGING_IN,
         /** 登录完成 */
@@ -91,6 +92,7 @@ public class LoginSessionManager {
         private String password; // 密码或验证码
         private String conversationId; // 对话ID，用于标识登录对话
         private String loginError; // 登录错误信息
+        private String qrCodeImageUrl; // 微信二维码图片URL
 
         public boolean isLoginConversation() {
             return state != LoginSessionState.NOT_STARTED && 

@@ -435,6 +435,33 @@ public class OpenAiController {
                     loginSessionManager.saveSession(providerName, conversationId, currentSession);
                     sendSystemMessage(emitter, request.getModel(), "请输入手机号/邮箱地址：", 
                         true, providerName, conversationId);
+                } else if (method == LoginSessionManager.LoginMethod.WECHAT_SCAN) {
+                    // 选择微信扫码登录
+                    currentSession.setLoginMethod(method);
+                    currentSession.setState(LoginSessionManager.LoginSessionState.WAITING_WECHAT_SCAN);
+                    loginSessionManager.saveSession(providerName, conversationId, currentSession);
+                    
+                    // 立即执行微信登录流程，获取二维码
+                    provider.handleLogin(request, emitter, currentSession);
+                    
+                    // 重新读取最新状态
+                    currentSession = loginSessionManager.getSession(providerName, conversationId);
+                    if (currentSession != null && currentSession.getQrCodeImageUrl() != null) {
+                        // 二维码已获取，等待用户扫码后回复确认
+                        // 状态已经在 handleLogin 中设置为 WAITING_WECHAT_SCAN
+                        log.info("微信登录二维码已获取，等待用户扫码确认");
+                        
+                        // 二维码发送完成，立即释放锁，允许用户发送"已扫码"消息
+                        new Thread(() -> {
+                            try {
+                                Thread.sleep(100); // 稍微延迟，确保消息已发送
+                                providerRegistry.releaseLock(providerName);
+                                log.info("二维码发送完成，已释放锁: {}", providerName);
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                            }
+                        }).start();
+                    }
                 } else {
                     // 其他登录方式暂不支持
                     sendSystemMessage(emitter, request.getModel(), 
@@ -464,6 +491,63 @@ public class OpenAiController {
                 loginSessionManager.saveSession(providerName, conversationId, currentSession);
                 sendSystemMessage(emitter, request.getModel(), "请输入您的密码：",
                     true, providerName, conversationId);
+            } else if (state == LoginSessionManager.LoginSessionState.WAITING_WECHAT_SCAN) {
+                // 等待微信扫码确认
+                // 用户扫码完成后，需要回复指定消息（如"已扫码"或"确认"）来确认登录
+                String trimmed = userInput.trim().toLowerCase();
+                
+                // 检查是否是确认消息
+                if (trimmed.equals("已扫码") || trimmed.equals("确认") || 
+                    trimmed.equals("ok") || trimmed.equals("yes") || 
+                    trimmed.equals("完成") || trimmed.equals("done")) {
+                    
+                    log.info("收到微信扫码确认消息，开始检查登录状态");
+                    currentSession.setState(LoginSessionManager.LoginSessionState.LOGGING_IN);
+                    loginSessionManager.saveSession(providerName, conversationId, currentSession);
+                    
+                    // 执行登录确认（检查是否已登录成功）
+                    boolean loginSuccess = provider.handleLogin(request, emitter, currentSession);
+                    
+                    // 重新读取最新状态
+                    currentSession = loginSessionManager.getSession(providerName, conversationId);
+                    if (currentSession == null) {
+                        log.error("登录后会话丢失，对话ID: {}", conversationId);
+                        return;
+                    }
+                    
+                    if (loginSuccess) {
+                        // 登录成功
+                        currentSession.setState(LoginSessionManager.LoginSessionState.LOGGED_IN);
+                        loginSessionManager.markLoggedIn(provider.getProviderName(), conversationId);
+                        providerRegistry.setLoginStatus(provider.getProviderName(), true);
+                        sendSystemMessage(emitter, request.getModel(), "登录成功！您现在可以使用聊天功能了。",
+                            true, providerName, conversationId);
+                    } else {
+                        // 登录失败
+                        currentSession.setState(LoginSessionManager.LoginSessionState.LOGIN_FAILED);
+                        loginSessionManager.saveSession(providerName, conversationId, currentSession);
+                        
+                        String errorMessage = "登录失败，请重试。";
+                        if (currentSession.getLoginError() != null && !currentSession.getLoginError().isEmpty()) {
+                            String bizMsg = currentSession.getLoginError();
+                            errorMessage = "登录失败：" + bizMsg;
+                        }
+                        sendSystemMessage(emitter, request.getModel(), errorMessage, 
+                            true, providerName, conversationId);
+                        
+                        // 重置状态，允许重新登录
+                        currentSession.setState(LoginSessionManager.LoginSessionState.WAITING_LOGIN_METHOD);
+                        currentSession.setLoginMethod(null);
+                        currentSession.setQrCodeImageUrl(null);
+                        currentSession.setLoginError(null);
+                        loginSessionManager.saveSession(providerName, conversationId, currentSession);
+                    }
+                } else {
+                    // 不是确认消息，提示用户
+                    sendSystemMessage(emitter, request.getModel(), 
+                        "请使用微信扫描上方二维码，扫码完成后请回复\"已扫码\"或\"确认\"来确认登录。", 
+                        true, providerName, conversationId);
+                }
             } else if (state == LoginSessionManager.LoginSessionState.WAITING_PASSWORD) {
                 // 等待输入密码 - 只有明确的登录方式选择（"1"、"2"、"3"）才认为是跳过阶段
                 String trimmed = userInput.trim();
@@ -651,13 +735,6 @@ public class OpenAiController {
         }
         
         return null;
-    }
-    
-    /**
-     * 发送登录方式选择提示
-     */
-    private void sendLoginMethodSelection(SseEmitter emitter, String model) {
-        sendLoginMethodSelection(emitter, model, null, null);
     }
     
     /**

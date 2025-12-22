@@ -1,5 +1,6 @@
 package site.newbie.web.llm.api.provider.deepseek;
 
+import com.microsoft.playwright.Frame;
 import com.microsoft.playwright.Locator;
 import com.microsoft.playwright.Page;
 import jakarta.annotation.PreDestroy;
@@ -22,9 +23,20 @@ import site.newbie.web.llm.api.provider.deepseek.model.DeepSeekModelConfig.DeepS
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
+import java.awt.Graphics2D;
+import java.awt.RenderingHints;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.util.List;
+import javax.imageio.ImageIO;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -186,6 +198,15 @@ public class DeepSeekProvider implements LLMProvider {
             // 根据登录方式处理
             if (session.getLoginMethod() == LoginSessionManager.LoginMethod.ACCOUNT_PASSWORD) {
                 return handleAccountPasswordLogin(page, session);
+            } else if (session.getLoginMethod() == LoginSessionManager.LoginMethod.WECHAT_SCAN) {
+                // 检查当前状态
+                if (session.getState() == LoginSessionManager.LoginSessionState.LOGGING_IN) {
+                    // 用户已确认扫码，检查登录状态
+                    return checkWechatLoginStatus(page, session);
+                } else {
+                    // 首次请求，获取二维码
+                    return handleWechatLogin(page, session, emitter, request);
+                }
             } else {
                 log.warn("不支持的登录方式: {}", session.getLoginMethod());
                 return false;
@@ -377,6 +398,349 @@ public class DeepSeekProvider implements LLMProvider {
             }
         } catch (Exception e) {
             log.error("账号+密码登录过程中出错: {}", e.getMessage(), e);
+            return false;
+        }
+    }
+    
+    /**
+     * 处理微信扫码登录
+     */
+    private boolean handleWechatLogin(Page page, LoginSessionManager.LoginSession session,
+                                     SseEmitter emitter, ChatCompletionRequest request) {
+        try {
+            log.info("开始微信扫码登录流程");
+            
+            // 检查是否已有二维码（用户可能重新请求）
+            if (session.getQrCodeImageUrl() != null) {
+                log.info("二维码已存在，直接发送给用户");
+                sendWechatQrCode(emitter, request.getModel(), 
+                    session.getQrCodeImageUrl(), session.getConversationId());
+                return false; // 返回 false 表示等待用户扫码确认
+            }
+            
+            // 1. 查找并点击微信登录按钮
+            Locator wechatButton = page.locator("button:has-text('微信')")
+                    .or(page.locator("button:has-text('WeChat')"))
+                    .or(page.locator(".ds-sign-in-with-wechat-block"))
+                    .or(page.locator("[class*='wechat']"))
+                    .or(page.locator("[class*='WeChat']"));
+            
+            if (wechatButton.count() == 0) {
+                log.error("未找到微信登录按钮");
+                session.setLoginError("未找到微信登录按钮");
+                return false;
+            }
+            
+            log.info("找到微信登录按钮，准备点击");
+            wechatButton.first().click();
+            page.waitForTimeout(1000);
+            
+            // 2. 等待二维码 iframe 加载
+            log.info("等待微信二维码加载...");
+            page.waitForTimeout(2000);
+            
+            // 3. 查找二维码 iframe
+            Locator qrCodeIframe = page.locator("iframe[src*='weixin.gg']")
+                    .or(page.locator("iframe[src*='wechat']"))
+                    .or(page.locator("iframe#wxLogin"))
+                    .or(page.locator("iframe"));
+            
+            if (qrCodeIframe.count() == 0) {
+                log.error("未找到微信二维码 iframe");
+                session.setLoginError("未找到微信二维码");
+                return false;
+            }
+            
+            log.info("找到微信二维码 iframe");
+            
+            // 4. 获取 iframe 内容
+            Frame iframeFrame = qrCodeIframe.first().elementHandle().contentFrame();
+            if (iframeFrame == null) {
+                log.error("无法获取 iframe 内容");
+                session.setLoginError("无法加载微信二维码");
+                return false;
+            }
+            
+            // 等待 iframe 内容加载
+            iframeFrame.waitForLoadState();
+            try {
+                Thread.sleep(2000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            
+            // 5. 在 iframe 中查找二维码图片
+            // 使用 JavaScript 在 iframe 中查找
+            String qrCodeImageSrc = (String) iframeFrame.evaluate("""
+                () => {
+                    const img = document.querySelector('img.js_qrcode_img') || 
+                                document.querySelector('img.web_qrcode_img') ||
+                                document.querySelector('img[src*="qrcode"]') ||
+                                document.querySelector('img');
+                    return img ? img.src : null;
+                }
+                """);
+            
+            if (qrCodeImageSrc == null || qrCodeImageSrc.isEmpty()) {
+                log.error("未找到二维码图片");
+                session.setLoginError("未找到二维码图片");
+                return false;
+            }
+            
+            // 6. 处理相对路径
+            String qrCodeImageUrl = qrCodeImageSrc;
+            if (qrCodeImageSrc.startsWith("/")) {
+                // 相对路径，需要拼接完整 URL
+                String iframeUrl = iframeFrame.url();
+                if (iframeUrl.contains("weixin.gg") || iframeUrl.contains("wechat")) {
+                    // 从 iframe URL 提取基础 URL
+                    int protocolIndex = iframeUrl.indexOf("://");
+                    int pathIndex = iframeUrl.indexOf("/", protocolIndex + 3);
+                    if (pathIndex > 0) {
+                        String baseUrl = iframeUrl.substring(0, pathIndex);
+                        qrCodeImageUrl = baseUrl + qrCodeImageSrc;
+                    } else {
+                        qrCodeImageUrl = iframeUrl.substring(0, iframeUrl.indexOf("/", protocolIndex + 3)) + qrCodeImageSrc;
+                    }
+                } else {
+                    qrCodeImageUrl = "https://open.weixin.gg.com" + qrCodeImageSrc;
+                }
+            }
+            
+            log.info("获取到二维码图片 URL: {}", qrCodeImageUrl);
+            
+            // 7. 保存二维码信息到会话
+            session.setQrCodeImageUrl(qrCodeImageUrl);
+            session.setState(LoginSessionManager.LoginSessionState.WAITING_WECHAT_SCAN);
+            loginSessionManager.saveSession(getProviderName(), session.getConversationId(), session);
+            
+            // 8. 发送二维码给前端
+            sendWechatQrCode(emitter, request.getModel(), qrCodeImageUrl, 
+                session.getConversationId());
+            
+            log.info("微信二维码已发送，等待用户扫码确认");
+            return false; // 返回 false 表示等待用户扫码确认
+            
+        } catch (Exception e) {
+            log.error("微信扫码登录过程中出错: {}", e.getMessage(), e);
+            session.setLoginError("微信登录出错: " + e.getMessage());
+            return false;
+        }
+    }
+    
+    /**
+     * 下载图片并转换为 base64 编码，同时缩放至 160x160
+     */
+    private String downloadImageAsBase64(String imageUrl) {
+        try {
+            log.info("开始下载二维码图片: {}", imageUrl);
+            HttpClient client = HttpClient.newBuilder()
+                    .followRedirects(HttpClient.Redirect.NORMAL)
+                    .build();
+            
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(imageUrl))
+                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+                    .GET()
+                    .build();
+            
+            HttpResponse<byte[]> response = client.send(request, HttpResponse.BodyHandlers.ofByteArray());
+            
+            if (response.statusCode() == 200) {
+                byte[] originalImageBytes = response.body();
+                
+                // 根据响应头确定图片类型，默认为 png
+                String contentType = response.headers().firstValue("Content-Type").orElse("image/png");
+                String imageType = "png";
+                if (contentType.contains("jpeg") || contentType.contains("jpg")) {
+                    imageType = "jpeg";
+                } else if (contentType.contains("gif")) {
+                    imageType = "gif";
+                } else if (contentType.contains("webp")) {
+                    imageType = "webp";
+                }
+                
+                // 读取原始图片
+                BufferedImage originalImage = ImageIO.read(new ByteArrayInputStream(originalImageBytes));
+                if (originalImage == null) {
+                    log.warn("无法解析图片，使用原始图片");
+                    String base64Image = Base64.getEncoder().encodeToString(originalImageBytes);
+                    return "data:image/" + imageType + ";base64," + base64Image;
+                }
+                
+                int originalWidth = originalImage.getWidth();
+                int originalHeight = originalImage.getHeight();
+                log.info("原始图片尺寸: {}x{}", originalWidth, originalHeight);
+                
+                // 缩放图片至 160x160
+                int targetWidth = 160;
+                int targetHeight = 160;
+                
+                // 使用与原始图片相同的类型，如果是透明图片则保留透明度
+                int bufferedImageType = originalImage.getType();
+                if (bufferedImageType == BufferedImage.TYPE_CUSTOM || bufferedImageType == 0) {
+                    bufferedImageType = originalImage.getColorModel().hasAlpha() ? 
+                        BufferedImage.TYPE_INT_ARGB : BufferedImage.TYPE_INT_RGB;
+                }
+                
+                BufferedImage resizedImage = new BufferedImage(targetWidth, targetHeight, bufferedImageType);
+                Graphics2D g2d = resizedImage.createGraphics();
+                g2d.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+                g2d.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+                g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                // 直接绘制并缩放
+                g2d.drawImage(originalImage, 0, 0, targetWidth, targetHeight, null);
+                g2d.dispose();
+                
+                // 验证缩放后的尺寸
+                int resizedWidth = resizedImage.getWidth();
+                int resizedHeight = resizedImage.getHeight();
+                log.info("缩放后图片尺寸: {}x{}", resizedWidth, resizedHeight);
+                
+                // 将缩放后的图片转换为字节数组
+                // 对于 GIF 和 WebP 格式，统一转换为 PNG 以确保兼容性
+                String outputImageType = imageType;
+                if ("gif".equals(imageType) || "webp".equals(imageType)) {
+                    outputImageType = "png";
+                }
+                
+                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                ImageIO.write(resizedImage, outputImageType, baos);
+                byte[] resizedImageBytes = baos.toByteArray();
+                
+                // 转换为 base64
+                String base64Image = Base64.getEncoder().encodeToString(resizedImageBytes);
+                String dataUri = "data:image/" + outputImageType + ";base64," + base64Image;
+                
+                log.info("二维码图片下载并缩放成功，原始大小: {} bytes, 缩放后大小: {} bytes, 类型: {}", 
+                        originalImageBytes.length, resizedImageBytes.length, imageType);
+                return dataUri;
+            } else {
+                log.warn("下载二维码图片失败，状态码: {}", response.statusCode());
+                return null;
+            }
+        } catch (Exception e) {
+            log.error("下载二维码图片时出错: {}", e.getMessage(), e);
+            return null;
+        }
+    }
+    
+    /**
+     * 发送微信二维码给前端
+     * 发送顺序：1. 系统消息 2. 二维码图片（base64） 3. 对话标记
+     */
+    private void sendWechatQrCode(SseEmitter emitter, String model, 
+                                   String qrCodeImageUrl, String conversationId) {
+        if (emitter == null) {
+            log.warn("Emitter 为 null，无法发送二维码");
+            return;
+        }
+        
+        try {
+            MediaType APPLICATION_JSON_UTF8 = new MediaType("application", "json", StandardCharsets.UTF_8);
+            
+            // 1. 先发送文本提示作为系统消息
+            StringBuilder message = new StringBuilder();
+            message.append("请使用微信扫描下方二维码完成登录。\n\n");
+            message.append("二维码图片地址：").append(qrCodeImageUrl).append("\n\n");
+            message.append("扫码完成后，请回复\"已扫码\"或\"确认\"来确认登录。");
+            
+            // 格式化系统消息
+            String formattedMessage = formatSystemMessage(message.toString());
+            
+            String systemId = UUID.randomUUID().toString();
+            ChatCompletionResponse.Choice systemChoice = ChatCompletionResponse.Choice.builder()
+                    .delta(ChatCompletionResponse.Delta.builder().content(formattedMessage).build())
+                    .index(0).build();
+            ChatCompletionResponse systemResponse = ChatCompletionResponse.builder()
+                    .id(systemId).object("chat.completion.chunk")
+                    .created(System.currentTimeMillis() / 1000)
+                    .model(model).choices(List.of(systemChoice)).build();
+            emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(systemResponse), APPLICATION_JSON_UTF8));
+            emitter.send(SseEmitter.event().data("[DONE]", MediaType.TEXT_PLAIN));
+            
+            // 2. 下载二维码图片并转换为 base64，然后发送作为普通消息
+            String base64Image = downloadImageAsBase64(qrCodeImageUrl);
+            String qrCodeImageMessage;
+            if (base64Image != null) {
+                // 使用 HTML img 标签指定尺寸为 160x160
+                qrCodeImageMessage = "\n\n<img src=\"" + base64Image + "\" width=\"160\" height=\"160\" alt=\"二维码\" />";
+                log.info("使用 base64 格式发送二维码图片（160x160）");
+            } else {
+                // 降级到使用 URL
+                qrCodeImageMessage = "\n\n<img src=\"" + qrCodeImageUrl + "\" width=\"160\" height=\"160\" alt=\"二维码\" />";
+                log.warn("无法下载图片，使用 URL 方式发送二维码（160x160）");
+            }
+            
+            String imageId = UUID.randomUUID().toString();
+            ChatCompletionResponse.Choice imageChoice = ChatCompletionResponse.Choice.builder()
+                    .delta(ChatCompletionResponse.Delta.builder().content(qrCodeImageMessage).build())
+                    .index(0).build();
+            ChatCompletionResponse imageResponse = ChatCompletionResponse.builder()
+                    .id(imageId).object("chat.completion.chunk")
+                    .created(System.currentTimeMillis() / 1000)
+                    .model(model).choices(List.of(imageChoice)).build();
+            emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(imageResponse), APPLICATION_JSON_UTF8));
+            emitter.send(SseEmitter.event().data("[DONE]", MediaType.TEXT_PLAIN));
+            
+            // 3. 发送对话标记
+            if (conversationId != null && !conversationId.isEmpty()) {
+                String conversationIdMessage = "\n\n```nwla-conversation-id\n" + conversationId + "\n```";
+                String conversationIdId = UUID.randomUUID().toString();
+                ChatCompletionResponse.Choice conversationIdChoice = ChatCompletionResponse.Choice.builder()
+                        .delta(ChatCompletionResponse.Delta.builder().content(conversationIdMessage).build())
+                        .index(0).build();
+                ChatCompletionResponse conversationIdResponse = ChatCompletionResponse.builder()
+                        .id(conversationIdId).object("chat.completion.chunk")
+                        .created(System.currentTimeMillis() / 1000)
+                        .model(model).choices(List.of(conversationIdChoice)).build();
+                emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(conversationIdResponse), APPLICATION_JSON_UTF8));
+                emitter.send(SseEmitter.event().data("[DONE]", MediaType.TEXT_PLAIN));
+            }
+            
+            emitter.complete();
+            
+            log.info("微信二维码已发送给前端（图片URL: {}）", qrCodeImageUrl);
+        } catch (Exception e) {
+            log.error("发送微信二维码时出错: {}", e.getMessage(), e);
+            try {
+                emitter.completeWithError(e);
+            } catch (Exception ex) {
+                log.error("完成 emitter 时出错: {}", ex.getMessage());
+            }
+        }
+    }
+    
+    /**
+     * 检查微信登录状态（在用户确认扫码后调用）
+     */
+    private boolean checkWechatLoginStatus(Page page, LoginSessionManager.LoginSession session) {
+        try {
+            log.info("检查微信登录状态");
+            
+            // 刷新页面或重新导航到登录页面，检查是否已登录
+            page.reload();
+            page.waitForLoadState();
+            page.waitForTimeout(2000);
+            
+            // 检查是否出现聊天输入框（已登录会有聊天输入框）
+            Locator chatInput = page.locator("textarea")
+                    .or(page.locator("textarea[placeholder*='输入']"))
+                    .or(page.locator("textarea[placeholder*='输入消息']"))
+                    .or(page.locator("textarea.ds-scroll-area"));
+            
+            if (chatInput.count() > 0) {
+                Locator visibleInput = chatInput.first();
+                if (visibleInput.isVisible() && visibleInput.isEnabled()) {
+                    log.info("微信登录成功！检测到聊天输入框");
+                    return true;
+                }
+            }
+            
+            log.info("微信登录尚未完成，未检测到聊天输入框");
+            return false;
+        } catch (Exception e) {
+            log.error("检查微信登录状态时出错: {}", e.getMessage(), e);
             return false;
         }
     }
@@ -924,6 +1288,25 @@ public class DeepSeekProvider implements LLMProvider {
     
     // UTF-8 编码的 MediaType，确保中文和 emoji 正确传输
     private static final MediaType APPLICATION_JSON_UTF8 = new MediaType("application", "json", StandardCharsets.UTF_8);
+    
+    /**
+     * 格式化系统消息
+     */
+    private String formatSystemMessage(String message) {
+        if (message == null) {
+            return null;
+        }
+        // 如果消息已经包含 nwla-system-message 标记，直接返回
+        if (message.contains("```nwla-system-message")) {
+            return message;
+        }
+        // 如果消息以 __SYSTEM__ 开头，转换为新格式
+        if (message.startsWith("__SYSTEM__")) {
+            message = message.substring("__SYSTEM__".length()).trim();
+        }
+        // 包装为系统消息格式
+        return "```nwla-system-message\n" + message + "\n```";
+    }
     
     /**
      * 发送登录方式选择提示
