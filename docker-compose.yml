@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  newbie-web-llm-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: newbie-web-llm-api
+    ports:
+      - "24753"  # 随机端口映射到容器 24753 端口
+    volumes:
+      # 挂载用户数据目录，保持登录状态
+      - ./user-data:/app/user-data
+      # 可选：挂载日志目录
+      - ./logs:/app/logs
+    environment:
+      - JAVA_OPTS=-Xmx512m -Xms256m
+      - SERVER_PORT=24753
+      - APP_BROWSER_HEADLESS=true
+      - APP_BROWSER_USER_DATA_DIR=./user-data
+      # 阻止 Playwright Java 自动下载浏览器
+      - PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+      - PLAYWRIGHT_BROWSERS_PATH=/root/.cache/ms-playwright
+    restart: unless-stopped
+    # 如果需要访问网络，可能需要网络配置
+    networks:
+      - llm-network
+
+networks:
+  llm-network:
+    driver: bridge
+

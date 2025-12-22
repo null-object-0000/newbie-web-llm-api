@@ -1,0 +1,14 @@
+version: '3.8'
+
+# 用于构建基础镜像的配置文件
+# 使用方法: docker-compose -f docker-compose.build.yml build base-image
+
+services:
+  base-image:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: base  # 只构建到 base 阶段
+    image: newbie-web-llm-api-base:latest
+    # 不启动容器，只构建镜像
+

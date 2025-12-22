@@ -62,6 +62,104 @@ java -jar target/newbie-web-llm-api-0.0.1-SNAPSHOT.jar
 http://localhost:24753/test.html
 ```
 
+### Docker 部署
+
+#### 前置要求
+
+- Docker 20.10+ 和 Docker Compose 2.0+
+- 或仅 Docker（不使用 docker-compose）
+
+#### 使用 Docker Compose（推荐）
+
+1. **构建并启动容器**
+```bash
+docker-compose up -d
+```
+
+2. **查看日志**
+```bash
+docker-compose logs -f
+```
+
+3. **停止容器**
+```bash
+docker-compose down
+```
+
+4. **重新构建镜像**
+```bash
+docker-compose build --no-cache
+docker-compose up -d
+```
+
+#### 使用基础镜像加速构建（推荐）
+
+为了加速构建，项目支持使用预构建的基础镜像（包含 Node.js 和 Chromium）。基础镜像只需要构建一次，之后每次构建应用时都可以复用。
+
+**首次构建基础镜像**（只需要执行一次）：
+```bash
+# 构建基础镜像（包含 Node.js 和 Chromium）
+docker build --target base -t newbie-web-llm-api-base:latest .
+
+# 或者使用 docker-compose
+docker-compose -f docker-compose.build.yml build base-image
+```
+
+**之后构建应用时，Docker 会自动复用基础镜像**，大大加快构建速度：
+```bash
+# 正常构建，会自动使用已存在的基础镜像
+docker-compose build
+docker-compose up -d
+```
+
+**推送到镜像仓库（可选）**：
+如果使用 Docker Hub 或其他镜像仓库，可以推送基础镜像供团队共享：
+```bash
+# 标记镜像
+docker tag newbie-web-llm-api-base:latest your-registry/newbie-web-llm-api-base:latest
+
+# 推送镜像
+docker push your-registry/newbie-web-llm-api-base:latest
+
+# 然后在 Dockerfile 中修改 FROM 语句使用远程镜像
+# FROM your-registry/newbie-web-llm-api-base:latest
+```
+
+#### 使用 Docker 命令
+
+1. **构建镜像**
+```bash
+docker build -t newbie-web-llm-api:latest .
+```
+
+2. **运行容器**
+```bash
+docker run -d \
+  --name newbie-web-llm-api \
+  -p 24753:24753 \
+  -v $(pwd)/user-data:/app/user-data \
+  -v $(pwd)/logs:/app/logs \
+  newbie-web-llm-api:latest
+```
+
+3. **查看日志**
+```bash
+docker logs -f newbie-web-llm-api
+```
+
+4. **停止容器**
+```bash
+docker stop newbie-web-llm-api
+docker rm newbie-web-llm-api
+```
+
+#### Docker 部署注意事项
+
+- **数据持久化**：`user-data` 目录会被挂载到容器中，用于保存浏览器数据和登录会话
+- **首次登录**：首次运行需要在浏览器中登录 DeepSeek 账号，登录状态会保存在 `user-data` 目录
+- **端口映射**：默认端口为 24753，可通过修改 `docker-compose.yml` 或 Docker 命令中的端口映射来更改
+- **资源限制**：建议为容器分配至少 512MB 内存，Playwright 浏览器需要一定资源
+
 ## 🚀 使用方法
 
 ### Web 界面使用

@@ -1,0 +1,49 @@
+# Maven
+target/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+dependency-reduced-pom.xml
+buildNumber.properties
+.mvn/timing.properties
+.mvn/wrapper/maven-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Logs
+logs/
+*.log
+
+# Docker
+Dockerfile
+Dockerfile.base
+.dockerignore
+docker-compose.yml
+docker-compose.build.yml
+
+# Documentation
+README.md
+LICENSE
+
+# User data (will be mounted as volume)
+user-data/
+
+# Test files
+*.test
+*.spec
