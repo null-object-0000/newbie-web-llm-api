@@ -663,13 +663,13 @@ public class DeepSeekProvider implements LLMProvider {
             String base64Image = downloadImageAsBase64(qrCodeImageUrl);
             String qrCodeImageMessage;
             if (base64Image != null) {
-                // 使用 HTML img 标签指定尺寸为 160x160
-                qrCodeImageMessage = "\n\n<img src=\"" + base64Image + "\" width=\"160\" height=\"160\" alt=\"二维码\" />";
+                // 使用 Markdown 语法，图片已在服务器端缩放到 160x160
+                qrCodeImageMessage = "\n\n![二维码](" + base64Image + ")";
                 log.info("使用 base64 格式发送二维码图片（160x160）");
             } else {
                 // 降级到使用 URL
-                qrCodeImageMessage = "\n\n<img src=\"" + qrCodeImageUrl + "\" width=\"160\" height=\"160\" alt=\"二维码\" />";
-                log.warn("无法下载图片，使用 URL 方式发送二维码（160x160）");
+                qrCodeImageMessage = "\n\n![二维码](" + qrCodeImageUrl + ")";
+                log.warn("无法下载图片，使用 URL 方式发送二维码");
             }
             
             String imageId = UUID.randomUUID().toString();
@@ -701,12 +701,33 @@ public class DeepSeekProvider implements LLMProvider {
             emitter.complete();
             
             log.info("微信二维码已发送给前端（图片URL: {}）", qrCodeImageUrl);
+            
+            // 二维码发送完成，立即释放锁，允许用户发送"已扫码"消息
+            String providerName = getProviderName();
+            if (providerName != null) {
+                new Thread(() -> {
+                    try {
+                        Thread.sleep(50); // 稍微延迟，确保消息已发送
+                        providerRegistry.releaseLock(providerName);
+                        log.info("二维码发送完成，已释放锁: {}", providerName);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        // 即使被中断，也要释放锁
+                        providerRegistry.releaseLock(providerName);
+                    }
+                }).start();
+            }
         } catch (Exception e) {
             log.error("发送微信二维码时出错: {}", e.getMessage(), e);
             try {
                 emitter.completeWithError(e);
             } catch (Exception ex) {
                 log.error("完成 emitter 时出错: {}", ex.getMessage());
+            }
+            // 出错时也要释放锁
+            String providerName = getProviderName();
+            if (providerName != null) {
+                providerRegistry.releaseLock(providerName);
             }
         }
     }

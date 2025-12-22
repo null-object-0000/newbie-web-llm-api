@@ -449,18 +449,12 @@ public class OpenAiController {
                     if (currentSession != null && currentSession.getQrCodeImageUrl() != null) {
                         // 二维码已获取，等待用户扫码后回复确认
                         // 状态已经在 handleLogin 中设置为 WAITING_WECHAT_SCAN
+                        // 锁的释放由 sendWechatQrCode 方法负责
                         log.info("微信登录二维码已获取，等待用户扫码确认");
-                        
-                        // 二维码发送完成，立即释放锁，允许用户发送"已扫码"消息
-                        new Thread(() -> {
-                            try {
-                                Thread.sleep(100); // 稍微延迟，确保消息已发送
-                                providerRegistry.releaseLock(providerName);
-                                log.info("二维码发送完成，已释放锁: {}", providerName);
-                            } catch (InterruptedException e) {
-                                Thread.currentThread().interrupt();
-                            }
-                        }).start();
+                    } else {
+                        // 二维码获取失败，需要释放锁
+                        log.warn("微信登录二维码获取失败，释放锁: {}", providerName);
+                        providerRegistry.releaseLock(providerName);
                     }
                 } else {
                     // 其他登录方式暂不支持
