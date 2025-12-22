@@ -655,19 +655,82 @@ public class GeminiProvider implements LLMProvider {
         for (String line : sseData.split("\n")) {
             line = line.trim();
             if (line.startsWith("data: ")) {
-                String jsonStr = line.substring(6).trim();
-                if (jsonStr.isEmpty() || jsonStr.equals("{}")) continue;
+                String dataStr = line.substring(6).trim();
+                if (dataStr.isEmpty() || dataStr.equals("{}")) continue;
                 try {
-                    var json = objectMapper.readTree(jsonStr);
-                    if (json.has("text") && json.get("text").isString()) {
-                        text.append(json.get("text").asString());
-                    } else if (json.has("content") && json.get("content").isString()) {
-                        text.append(json.get("content").asString());
+                    // Gemini 使用数组格式：["wrb.fr",null,"[...]"]
+                    var arrayNode = objectMapper.readTree(dataStr);
+                    if (arrayNode.isArray() && arrayNode.size() > 2) {
+                        var thirdElement = arrayNode.get(2);
+                        if (thirdElement != null && thirdElement.isString()) {
+                            // 第三个元素是 JSON 字符串，需要再次解析
+                            var innerJson = objectMapper.readTree(thirdElement.asString());
+                            String extracted = extractTextFromGeminiJson(innerJson);
+                            if (extracted != null && !extracted.isEmpty()) {
+                                text.append(extracted);
+                            }
+                        }
+                    } else {
+                        // 尝试标准 JSON 格式
+                        var json = objectMapper.readTree(dataStr);
+                        String extracted = extractTextFromGeminiJson(json);
+                        if (extracted != null && !extracted.isEmpty()) {
+                            text.append(extracted);
+                        }
                     }
                 } catch (Exception e) { }
             }
         }
         return !text.isEmpty() ? text.toString() : null;
+    }
+    
+    /**
+     * 从 Gemini JSON 数据中提取文本内容
+     * 支持思考内容和回复内容的提取
+     */
+    private String extractTextFromGeminiJson(tools.jackson.databind.JsonNode json) {
+        if (json == null) return null;
+        
+        StringBuilder text = new StringBuilder();
+        
+        // 查找回复内容：路径通常是 [4][0][1][0] 或类似结构
+        // 根据抓包数据，回复内容在数组的深层结构中
+        try {
+            // 尝试多种可能的路径
+            if (json.isArray() && json.size() > 4) {
+                var item4 = json.get(4);
+                if (item4 != null && item4.isArray() && item4.size() > 0) {
+                    var item0 = item4.get(0);
+                    if (item0 != null && item0.isArray() && item0.size() > 1) {
+                        var item1 = item0.get(1);
+                        if (item1 != null && item1.isArray() && item1.size() > 0) {
+                            var contentArray = item1.get(0);
+                            if (contentArray != null && contentArray.isArray()) {
+                                // 遍历内容数组，提取文本
+                                for (var contentItem : contentArray) {
+                                    if (contentItem != null && contentItem.isArray() && contentItem.size() > 0) {
+                                        var textNode = contentItem.get(0);
+                                        if (textNode != null && textNode.isArray() && textNode.size() > 1) {
+                                            var actualText = textNode.get(1);
+                                            if (actualText != null && actualText.isString()) {
+                                                String content = actualText.asString();
+                                                if (content != null && !content.isEmpty()) {
+                                                    text.append(content);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // 如果路径解析失败，尝试其他方式
+        }
+        
+        return text.length() > 0 ? text.toString() : null;
     }
     
     private ModelConfig.ParseResultWithIndex parseSseIncremental(String sseData, Map<Integer, String> fragmentTypeMap, 
@@ -676,6 +739,7 @@ public class GeminiProvider implements LLMProvider {
             return new ModelConfig.ParseResultWithIndex(new ModelConfig.SseParseResult(null, null, false), lastActiveFragmentIndex);
         }
         
+        StringBuilder thinkingText = new StringBuilder();
         StringBuilder responseText = new StringBuilder();
         boolean finished = false;
         
@@ -691,17 +755,22 @@ public class GeminiProvider implements LLMProvider {
             }
             
             if (!line.startsWith("data: ")) continue;
-            String jsonStr = line.substring(6).trim();
-            if (jsonStr.isEmpty() || jsonStr.equals("{}")) continue;
+            String dataStr = line.substring(6).trim();
+            if (dataStr.isEmpty() || dataStr.equals("{}")) continue;
             
             try {
-                var json = objectMapper.readTree(jsonStr);
-                if (json.has("text") && json.get("text").isString()) {
-                    responseText.append(json.get("text").asString());
-                } else if (json.has("content") && json.get("content").isString()) {
-                    responseText.append(json.get("content").asString());
-                } else if (json.has("delta") && json.get("delta").has("text")) {
-                    responseText.append(json.get("delta").get("text").asString());
+                // Gemini 使用数组格式：["wrb.fr",null,"[...]"]
+                var arrayNode = objectMapper.readTree(dataStr);
+                if (arrayNode.isArray() && arrayNode.size() > 2) {
+                    var thirdElement = arrayNode.get(2);
+                    if (thirdElement != null && thirdElement.isString()) {
+                        // 第三个元素是 JSON 字符串，需要再次解析
+                        var innerJson = objectMapper.readTree(thirdElement.asString());
+                        parseGeminiJsonData(innerJson, thinkingText, responseText);
+                    }
+                } else {
+                    // 尝试标准 JSON 格式
+                    parseGeminiJsonData(arrayNode, thinkingText, responseText);
                 }
             } catch (Exception e) {
                 log.debug("解析 SSE 数据行时出错: {}", e.getMessage());
@@ -709,11 +778,114 @@ public class GeminiProvider implements LLMProvider {
         }
         
         ModelConfig.SseParseResult result = new ModelConfig.SseParseResult(
-                null,
+                thinkingText.length() > 0 ? thinkingText.toString() : null,
                 responseText.length() > 0 ? responseText.toString() : null,
                 finished
         );
         return new ModelConfig.ParseResultWithIndex(result, lastActiveFragmentIndex);
+    }
+    
+    /**
+     * 解析 Gemini JSON 数据，提取思考内容和回复内容
+     * 根据抓包数据，数据结构为：[null,[conversationId,responseId],null,null,[[responseData]],...]
+     * 思考内容在深层嵌套数组中，回复内容也在类似结构中
+     */
+    private void parseGeminiJsonData(tools.jackson.databind.JsonNode json, 
+                                     StringBuilder thinkingText, 
+                                     StringBuilder responseText) {
+        if (json == null || !json.isArray()) return;
+        
+        try {
+            // 查找响应数据：在索引 4 的位置，格式为 [[responseData]]
+            if (json.size() > 4) {
+                var responseDataArray = json.get(4);
+                if (responseDataArray != null && responseDataArray.isArray() && responseDataArray.size() > 0) {
+                    var responseData = responseDataArray.get(0);
+                    if (responseData != null && responseData.isArray() && responseData.size() > 0) {
+                        // responseData[0] 是响应 ID，responseData[1] 是内容数组
+                        if (responseData.size() > 1) {
+                            var contentArray = responseData.get(1);
+                            if (contentArray != null && contentArray.isArray() && contentArray.size() > 0) {
+                                // 内容数组的第一个元素包含思考和回复
+                                var firstContent = contentArray.get(0);
+                                if (firstContent != null && firstContent.isArray()) {
+                                    extractThinkingAndResponse(firstContent, thinkingText, responseText);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.debug("解析 Gemini JSON 数据时出错: {}", e.getMessage());
+        }
+    }
+    
+    /**
+     * 从内容数组中提取思考内容和回复内容
+     * 根据抓包数据，结构为：[[[thinkingTitle, thinkingContent]], [[responseTitle, responseContent]]]
+     * 或者更复杂的嵌套结构
+     */
+    private void extractThinkingAndResponse(tools.jackson.databind.JsonNode contentArray,
+                                           StringBuilder thinkingText,
+                                           StringBuilder responseText) {
+        if (contentArray == null || !contentArray.isArray()) return;
+        
+        try {
+            // 遍历内容数组的每个元素
+            for (var item : contentArray) {
+                if (item == null || !item.isArray()) continue;
+                
+                // 检查是否是包含文本的数组结构
+                // 格式可能是：[[null,[null,0,"文本内容"]]] 或 [null,[null,0,"文本内容"]]
+                extractTextFromNestedArray(item, thinkingText, responseText);
+            }
+        } catch (Exception e) {
+            log.debug("提取思考内容和回复内容时出错: {}", e.getMessage());
+        }
+    }
+    
+    /**
+     * 从嵌套数组中递归提取文本内容
+     */
+    private void extractTextFromNestedArray(tools.jackson.databind.JsonNode node,
+                                           StringBuilder thinkingText,
+                                           StringBuilder responseText) {
+        if (node == null) return;
+        
+        try {
+            if (node.isArray()) {
+                // 如果是数组，递归处理每个元素
+                for (var element : node) {
+                    extractTextFromNestedArray(element, thinkingText, responseText);
+                }
+            } else if (node.isString()) {
+                String text = node.asString();
+                if (text != null && !text.isEmpty()) {
+                    // 判断是思考内容还是回复内容
+                    // 思考内容通常包含英文关键词，回复内容通常是实际对话内容
+                    if (text.contains("Welcoming") || text.contains("Formulating") || 
+                        text.contains("Seeking") || text.contains("I'm starting") ||
+                        text.contains("I'm working") || text.contains("I'm now")) {
+                        // 这是思考内容
+                        if (thinkingText.length() > 0 && !thinkingText.toString().contains(text)) {
+                            thinkingText.append("\n\n");
+                        }
+                        if (!thinkingText.toString().contains(text)) {
+                            thinkingText.append(text);
+                        }
+                    } else if (text.length() > 10) {
+                        // 较长的文本通常是回复内容（思考内容通常较短且包含特定关键词）
+                        // 避免重复添加
+                        if (!responseText.toString().contains(text)) {
+                            responseText.append(text);
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.debug("从嵌套数组提取文本时出错: {}", e.getMessage());
+        }
     }
     
     // ==================== 对话 ID 提取 ====================
@@ -724,8 +896,23 @@ public class GeminiProvider implements LLMProvider {
         }
         
         try {
-            // 尝试从 URL 中提取对话 ID
-            // Gemini URL 格式可能类似: https://gemini.google.com/chat/{id}
+            // Gemini URL 格式: https://gemini.google.com/app/{conversationId}
+            int appIdx = url.indexOf("/app/");
+            if (appIdx >= 0) {
+                String afterApp = url.substring(appIdx + "/app/".length());
+                int queryIdx = afterApp.indexOf('?');
+                int fragmentIdx = afterApp.indexOf('#');
+                int endIdx = afterApp.length();
+                if (queryIdx >= 0) endIdx = Math.min(endIdx, queryIdx);
+                if (fragmentIdx >= 0) endIdx = Math.min(endIdx, fragmentIdx);
+                
+                String id = afterApp.substring(0, endIdx).trim();
+                if (!id.isEmpty()) {
+                    return id;
+                }
+            }
+            
+            // 兼容旧格式: https://gemini.google.com/chat/{id}
             int chatIdx = url.indexOf("/chat/");
             if (chatIdx >= 0) {
                 String afterChat = url.substring(chatIdx + "/chat/".length());
@@ -751,7 +938,8 @@ public class GeminiProvider implements LLMProvider {
         if (conversationId == null || conversationId.isEmpty()) {
             return null;
         }
-        return "https://gemini.google.com/chat/" + conversationId;
+        // 使用 /app/ 路径格式
+        return "https://gemini.google.com/app/" + conversationId;
     }
     
     

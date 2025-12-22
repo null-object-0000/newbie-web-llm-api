@@ -5,7 +5,6 @@ import com.microsoft.playwright.Locator;
 import com.microsoft.playwright.Page;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
@@ -64,9 +63,6 @@ public class DeepSeekProvider implements LLMProvider {
     // 页面管理
     private final ConcurrentHashMap<String, Page> modelPages = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, String> pageUrls = new ConcurrentHashMap<>();
-    
-    @Value("${deepseek.monitor.mode:sse}")
-    private String monitorMode;
     
     // SSE 拦截器配置
     private static final String SSE_DATA_VAR = "__deepseekSseData";
@@ -931,9 +927,9 @@ public class DeepSeekProvider implements LLMProvider {
                 // 8. 验证 SSE 拦截器
                 verifySseInterceptor(page);
                 
-                // 9. 监听响应（由 ModelConfig 实现）
+                // 9. 监听响应（由 ModelConfig 实现，仅支持 SSE 模式）
                 DeepSeekContext context = new DeepSeekContext(
-                        page, emitter, request, messageCountBefore, monitorMode, responseHandler
+                        page, emitter, request, messageCountBefore, responseHandler
                 );
                 config.monitorResponse(context);
 

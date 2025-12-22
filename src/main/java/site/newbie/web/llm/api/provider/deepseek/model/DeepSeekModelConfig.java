@@ -19,7 +19,6 @@ public interface DeepSeekModelConfig extends ModelConfig<DeepSeekModelConfig.Dee
             SseEmitter emitter,
             ChatCompletionRequest request,
             int messageCountBefore,
-            String monitorMode,
             ModelConfig.ResponseHandler responseHandler
     ) {}
 }
