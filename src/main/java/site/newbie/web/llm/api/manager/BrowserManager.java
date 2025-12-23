@@ -78,9 +78,16 @@ public class BrowserManager {
         // 每个提供器有独立的用户数据目录
         String providerDataDir = userDataDir + "/" + providerName;
         
+        // Gemini 和 OpenAI 强制使用 headed 模式（有界面），其他提供器使用配置的模式
+        boolean useHeadless = headless;
+        if ("gemini".equals(providerName) || "openai".equals(providerName)) {
+            useHeadless = false;
+            log.info("提供器 {} 强制使用 Headed 模式（有界面）", providerName);
+        }
+        
         // 配置启动选项
         BrowserType.LaunchPersistentContextOptions options = new BrowserType.LaunchPersistentContextOptions()
-                .setHeadless(headless)
+                .setHeadless(useHeadless)
                 .setViewportSize(1920, 1080)  // 使用常见的桌面浏览器窗口大小
                 .setArgs(List.of(
                         "--disable-blink-features=AutomationControlled",

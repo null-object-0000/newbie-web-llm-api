@@ -57,7 +57,6 @@ public interface ModelConfig<C> {
     interface ResponseHandler {
         void sendChunk(SseEmitter emitter, String id, String content, String model) throws IOException;
         void sendThinking(SseEmitter emitter, String id, String content, String model) throws IOException;
-        void sendReplace(SseEmitter emitter, String id, String content, String model) throws IOException;
         void sendUrlAndComplete(Page page, SseEmitter emitter, ChatCompletionRequest request) throws IOException;
         String getSseData(Page page, String varName);
         ParseResultWithIndex parseSseIncremental(String sseData, Map<Integer, String> fragmentTypeMap, Integer lastActiveFragmentIndex);

@@ -4,7 +4,6 @@ import com.microsoft.playwright.Locator;
 import com.microsoft.playwright.Page;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
@@ -16,7 +15,6 @@ import site.newbie.web.llm.api.model.LoginInfo;
 import site.newbie.web.llm.api.provider.ModelConfig;
 import site.newbie.web.llm.api.provider.ProviderRegistry;
 import org.springframework.context.annotation.Lazy;
-import site.newbie.web.llm.api.manager.LoginSessionManager;
 import site.newbie.web.llm.api.provider.gemini.model.GeminiModelConfig;
 import site.newbie.web.llm.api.provider.gemini.model.GeminiModelConfig.GeminiContext;
 import site.newbie.web.llm.api.util.ConversationIdUtils;
@@ -45,18 +43,13 @@ public class GeminiProvider implements LLMProvider {
     private final ObjectMapper objectMapper;
     private final Map<String, GeminiModelConfig> modelConfigs;
     private final ProviderRegistry providerRegistry;
-    private final LoginSessionManager loginSessionManager;
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
     
     private final ConcurrentHashMap<String, Page> modelPages = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, String> pageUrls = new ConcurrentHashMap<>();
     
-    @Value("${gemini.monitor.mode:sse}")
-    private String monitorMode;
-    
-    private static final String SSE_DATA_VAR = "__geminiSseData";
-    private static final String SSE_INTERCEPTOR_VAR = "__geminiSseInterceptorSet";
-    private static final String[] SSE_URL_PATTERNS = {"/api/generate", "/api/chat"};
+    // Gemini 只支持 DOM 模式
+    private static final String MONITOR_MODE = "dom";
     
     private final ModelConfig.ResponseHandler responseHandler = new ModelConfig.ResponseHandler() {
         @Override
@@ -70,38 +63,34 @@ public class GeminiProvider implements LLMProvider {
         }
 
         @Override
-        public void sendReplace(SseEmitter emitter, String id, String content, String model) throws IOException {
-            GeminiProvider.this.sendSseReplace(emitter, id, content, model);
-        }
-
-        @Override
         public void sendUrlAndComplete(Page page, SseEmitter emitter, ChatCompletionRequest request) throws IOException {
             GeminiProvider.this.sendUrlAndComplete(page, emitter, request);
         }
 
         @Override
         public String getSseData(Page page, String varName) {
-            return GeminiProvider.this.getSseDataFromPage(page, varName);
+            // Gemini 不支持 SSE，返回 null
+            return null;
         }
 
         @Override
         public ModelConfig.ParseResultWithIndex parseSseIncremental(String sseData, Map<Integer, String> fragmentTypeMap, Integer lastActiveFragmentIndex) {
-            return GeminiProvider.this.parseSseIncremental(sseData, fragmentTypeMap, lastActiveFragmentIndex);
+            // Gemini 不支持 SSE，返回空结果
+            return new ModelConfig.ParseResultWithIndex(new ModelConfig.SseParseResult(null, null, false), lastActiveFragmentIndex);
         }
 
         @Override
         public String extractTextFromSse(String sseData) {
-            return GeminiProvider.this.extractTextFromSse(sseData);
+            // Gemini 不支持 SSE，返回 null
+            return null;
         }
     };
 
     public GeminiProvider(BrowserManager browserManager, ObjectMapper objectMapper, 
-                         List<GeminiModelConfig> configs, @Lazy ProviderRegistry providerRegistry,
-                         LoginSessionManager loginSessionManager) {
+                         List<GeminiModelConfig> configs, @Lazy ProviderRegistry providerRegistry) {
         this.browserManager = browserManager;
         this.objectMapper = objectMapper;
         this.providerRegistry = providerRegistry;
-        this.loginSessionManager = loginSessionManager;
         this.modelConfigs = configs.stream()
                 .collect(Collectors.toMap(GeminiModelConfig::getModelName, Function.identity()));
         log.info("GeminiProvider 初始化完成，支持的模型: {}", modelConfigs.keySet());
@@ -136,6 +125,23 @@ public class GeminiProvider implements LLMProvider {
                 return false;
             }
             
+            // 优先检查登录按钮（未登录会有登录按钮）
+            // 如果明确发现登录按钮，直接判断为未登录，优先级高于输入框检查
+            // 根据实际 DOM 结构，登录按钮是 <a> 标签，带有 aria-label="登录" 和 href 包含 ServiceLogin
+            Locator loginButton = page.locator("a[aria-label='登录']")
+                    .or(page.locator("a[aria-label='Sign in']"))
+                    .or(page.locator("a[href*='ServiceLogin']"))
+                    .or(page.locator("button:has-text('登录')"))
+                    .or(page.locator("button:has-text('Sign in')"))
+                    .or(page.locator("a:has-text('登录')"))
+                    .or(page.locator("a:has-text('Sign in')"))
+                    .or(page.locator("a[href*='signin']"));
+            
+            if (loginButton.count() > 0 && loginButton.first().isVisible()) {
+                log.info("检测到登录按钮，判断为未登录");
+                return false;
+            }
+            
             // 检查是否存在输入框（已登录会有输入框）
             // 使用 div[role='textbox'] 作为主要选择器
             Locator inputBox = page.locator("div[role='textbox']")
@@ -146,18 +152,6 @@ public class GeminiProvider implements LLMProvider {
             if (inputBox.count() > 0 && inputBox.first().isVisible()) {
                 log.info("检测到输入框，判断为已登录");
                 return true;
-            }
-            
-            // 检查是否存在登录按钮（未登录会有登录按钮）
-            Locator loginButton = page.locator("button:has-text('登录')")
-                    .or(page.locator("button:has-text('Sign in')"))
-                    .or(page.locator("a:has-text('登录')"))
-                    .or(page.locator("a:has-text('Sign in')"))
-                    .or(page.locator("a[href*='signin']"));
-            
-            if (loginButton.count() > 0 && loginButton.first().isVisible()) {
-                log.info("检测到登录按钮，判断为未登录");
-                return false;
             }
             
             // 如果URL是聊天页面且没有登录按钮，认为已登录
@@ -201,23 +195,18 @@ public class GeminiProvider implements LLMProvider {
                 
                 // 检查登录状态
                 if (!checkLoginStatus(page)) {
-                    log.warn("检测到未登录状态，发送登录提示");
+                    log.warn("检测到未登录状态，发送手动登录提示");
                     
                     String conversationId = getConversationId(request);
                     if (conversationId == null || conversationId.isEmpty()) {
                         conversationId = "login-" + UUID.randomUUID();
                     }
                     
-                    LoginSessionManager.LoginSession session = loginSessionManager.getOrCreateSession(getProviderName(), conversationId);
-                    session.setConversationId(conversationId);
-                    session.setState(LoginSessionManager.LoginSessionState.WAITING_LOGIN_METHOD);
-                    loginSessionManager.saveSession(getProviderName(), conversationId, session);
-                    
-                    sendLoginMethodSelection(emitter, request.getModel(), getProviderName(), conversationId);
+                    sendManualLoginPrompt(emitter, request.getModel(), getProviderName(), conversationId);
                     return;
                 }
                 
-                setupSseInterceptor(page);
+                // Gemini 只支持 DOM 模式，不需要 SSE 拦截器
                 
                 if (isNewConversation(request)) {
                     clickNewChatButton(page);
@@ -227,10 +216,9 @@ public class GeminiProvider implements LLMProvider {
                 sendMessage(page, request);
                 
                 int messageCountBefore = countMessages(page);
-                verifySseInterceptor(page);
                 
                 GeminiContext context = new GeminiContext(
-                        page, emitter, request, messageCountBefore, monitorMode, responseHandler
+                        page, emitter, request, messageCountBefore, MONITOR_MODE, responseHandler
                 );
                 config.monitorResponse(context);
 
@@ -276,24 +264,22 @@ public class GeminiProvider implements LLMProvider {
     
     private Page findOrCreatePageForUrl(String url, String model) {
         Page page = findPageByUrl(url);
-        if (page != null && !page.isClosed()) {
-            if (!page.url().equals(url)) {
-                page.navigate(url);
-                page.waitForLoadState();
-                checkLoginStatusLost(page);
+            if (page != null && !page.isClosed()) {
+                if (!page.url().equals(url)) {
+                    page.navigate(url);
+                    page.waitForLoadState();
+                }
+                modelPages.put(model, page);
+                pageUrls.put(model, url);
+                return page;
             }
+            
+            page = browserManager.newPage(getProviderName());
             modelPages.put(model, page);
+            page.navigate(url);
+            page.waitForLoadState();
             pageUrls.put(model, url);
             return page;
-        }
-        
-        page = browserManager.newPage(getProviderName());
-        modelPages.put(model, page);
-        page.navigate(url);
-        page.waitForLoadState();
-        pageUrls.put(model, url);
-        checkLoginStatusLost(page);
-        return page;
     }
     
     private Page createNewConversationPage(String model) {
@@ -307,37 +293,10 @@ public class GeminiProvider implements LLMProvider {
         // 使用 /app 路径
         page.navigate("https://gemini.google.com/app");
         page.waitForLoadState();
-        // 等待输入框出现，确保页面加载完成
-        try {
-            page.waitForSelector("div[role='textbox']", new Page.WaitForSelectorOptions().setTimeout(30000));
-        } catch (Exception e) {
-            log.warn("等待输入框超时: {}", e.getMessage());
-        }
+        // 等待页面加载完成（不等待输入框，因为可能未登录）
+        page.waitForTimeout(2000);
         pageUrls.put(model, page.url());
-        checkLoginStatusLost(page);
         return page;
-    }
-    
-    private void checkLoginStatusLost(Page page) {
-        try {
-            if (page == null || page.isClosed()) {
-                return;
-            }
-            
-            page.waitForLoadState();
-            page.waitForTimeout(1000);
-            
-            Locator loginButton = page.locator("button:has-text('登录')")
-                    .or(page.locator("button:has-text('Sign in')"))
-                    .or(page.locator("a:has-text('登录')"))
-                    .or(page.locator("a:has-text('Sign in')"));
-            
-            if (loginButton.count() > 0 && loginButton.first().isVisible()) {
-                log.warn("检测到登录按钮，说明登录状态已丢失");
-            }
-        } catch (Exception e) {
-            log.warn("检测登录状态丢失时出错: {}", e.getMessage());
-        }
     }
     
     private Page findPageByUrl(String targetUrl) {
@@ -437,90 +396,6 @@ public class GeminiProvider implements LLMProvider {
         }
     }
     
-    // ==================== SSE 拦截器 ====================
-    
-    private void setupSseInterceptor(Page page) {
-        try {
-            page.evaluate(String.format("() => { window.%s = []; window.%sIndex = 0; }", SSE_DATA_VAR, SSE_DATA_VAR));
-        } catch (Exception e) { }
-
-        StringBuilder urlCondition = new StringBuilder();
-        for (int i = 0; i < SSE_URL_PATTERNS.length; i++) {
-            if (i > 0) urlCondition.append(" || ");
-            urlCondition.append("url.includes('").append(SSE_URL_PATTERNS[i]).append("')");
-        }
-
-        String jsCode = String.format("""
-            (function() {
-                if (window.%s) return;
-                window.%s = true;
-                const originalFetch = window.fetch;
-                window.fetch = function(...args) {
-                    const url = args[0];
-                    if (typeof url === 'string' && (%s)) {
-                        return originalFetch.apply(this, args).then(response => {
-                            const contentType = response.headers.get('content-type');
-                            if (contentType && contentType.includes('text/event-stream')) {
-                                const clonedResponse = response.clone();
-                                const reader = clonedResponse.body.getReader();
-                                const decoder = new TextDecoder();
-                                window.%s = window.%s || [];
-                                function readStream() {
-                                    reader.read().then(({ done, value }) => {
-                                        if (done) return;
-                                        window.%s.push(decoder.decode(value, { stream: true }));
-                                        readStream();
-                                    }).catch(err => {});
-                                }
-                                readStream();
-                            }
-                            return response;
-                        });
-                    }
-                    return originalFetch.apply(this, args);
-                };
-            })();
-            """, SSE_INTERCEPTOR_VAR, SSE_INTERCEPTOR_VAR, urlCondition, 
-            SSE_DATA_VAR, SSE_DATA_VAR, SSE_DATA_VAR);
-        
-        try {
-            page.evaluate(jsCode);
-            log.info("已设置 SSE 拦截器");
-        } catch (Exception e) {
-            log.error("设置 SSE 拦截器失败: {}", e.getMessage());
-        }
-    }
-    
-    private void verifySseInterceptor(Page page) {
-        try {
-            Object status = page.evaluate("() => window." + SSE_INTERCEPTOR_VAR + " || false");
-            if (!Boolean.TRUE.equals(status)) {
-                setupSseInterceptor(page);
-            }
-        } catch (Exception e) { }
-    }
-    
-    private String getSseDataFromPage(Page page, String varName) {
-        try {
-            if (page.isClosed()) return null;
-            Object result = page.evaluate(String.format("""
-                () => {
-                    if (!window.%s) return null;
-                    if (!window.%sIndex) window.%sIndex = 0;
-                    if (window.%s.length > window.%sIndex) {
-                        const newData = window.%s.slice(window.%sIndex);
-                        window.%sIndex = window.%s.length;
-                        return newData.join('\\n');
-                    }
-                    return null;
-                }
-                """, varName, varName, varName, varName, varName, varName, varName, varName, varName));
-            return result != null ? result.toString() : null;
-        } catch (Exception e) {
-            return null;
-        }
-    }
-    
     // ==================== SSE 发送 ====================
     
     private static final MediaType APPLICATION_JSON_UTF8 = new MediaType("application", "json", StandardCharsets.UTF_8);
@@ -539,18 +414,6 @@ public class GeminiProvider implements LLMProvider {
     private void sendThinkingContent(SseEmitter emitter, String id, String content, String model) throws IOException {
         ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
                 .delta(ChatCompletionResponse.Delta.builder().reasoningContent(content).build())
-                .index(0).build();
-        ChatCompletionResponse response = ChatCompletionResponse.builder()
-                .id(id).object("chat.completion.chunk")
-                .created(System.currentTimeMillis() / 1000)
-                .model(model).choices(List.of(choice)).build();
-        emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(response), APPLICATION_JSON_UTF8));
-    }
-    
-    private void sendSseReplace(SseEmitter emitter, String id, String content, String model) throws IOException {
-        String markedContent = "__REPLACE__" + content;
-        ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
-                .delta(ChatCompletionResponse.Delta.builder().content(markedContent).build())
                 .index(0).build();
         ChatCompletionResponse response = ChatCompletionResponse.builder()
                 .id(id).object("chat.completion.chunk")
@@ -591,301 +454,6 @@ public class GeminiProvider implements LLMProvider {
                 .created(System.currentTimeMillis() / 1000)
                 .model(model).choices(List.of(choice)).build();
         emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(response), APPLICATION_JSON_UTF8));
-    }
-    
-    private void sendLoginMethodSelection(SseEmitter emitter, String model, String providerName, String conversationId) {
-        try {
-            StringBuilder message = new StringBuilder();
-            message.append("```nwla-system-message\n");
-            message.append("当前未登录，请选择登录方式：\n\n");
-            message.append("1. 手机号+验证码登录\n");
-            message.append("2. 账号+密码登录\n");
-            message.append("3. 微信扫码登录\n\n");
-            message.append("请输入对应的数字（1、2、3）来选择登录方式。");
-            message.append("\n```");
-            
-            if (conversationId != null && !conversationId.isEmpty()) {
-                message.append("\n\n```nwla-conversation-id\n");
-                message.append(conversationId);
-                message.append("\n```");
-            }
-            
-            String id = UUID.randomUUID().toString();
-            ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
-                    .delta(ChatCompletionResponse.Delta.builder().content(message.toString()).build())
-                    .index(0).build();
-            ChatCompletionResponse response = ChatCompletionResponse.builder()
-                    .id(id).object("chat.completion.chunk")
-                    .created(System.currentTimeMillis() / 1000)
-                    .model(model).choices(List.of(choice)).build();
-            
-            emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(response), APPLICATION_JSON_UTF8));
-            emitter.send(SseEmitter.event().data("[DONE]", MediaType.TEXT_PLAIN));
-            emitter.complete();
-            
-            if (providerName != null) {
-                new Thread(() -> {
-                    try {
-                        Thread.sleep(100);
-                        providerRegistry.releaseLock(providerName);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                    }
-                }).start();
-            }
-        } catch (Exception e) {
-            log.error("发送登录方式选择提示时出错", e);
-            try {
-                emitter.completeWithError(e);
-            } catch (Exception ex) {
-                // 忽略
-            }
-            if (providerName != null) {
-                providerRegistry.releaseLock(providerName);
-            }
-        }
-    }
-    
-    // ==================== SSE 解析 ====================
-    
-    private String extractTextFromSse(String sseData) {
-        if (sseData == null || sseData.isEmpty()) return null;
-        
-        StringBuilder text = new StringBuilder();
-        for (String line : sseData.split("\n")) {
-            line = line.trim();
-            if (line.startsWith("data: ")) {
-                String dataStr = line.substring(6).trim();
-                if (dataStr.isEmpty() || dataStr.equals("{}")) continue;
-                try {
-                    // Gemini 使用数组格式：["wrb.fr",null,"[...]"]
-                    var arrayNode = objectMapper.readTree(dataStr);
-                    if (arrayNode.isArray() && arrayNode.size() > 2) {
-                        var thirdElement = arrayNode.get(2);
-                        if (thirdElement != null && thirdElement.isString()) {
-                            // 第三个元素是 JSON 字符串，需要再次解析
-                            var innerJson = objectMapper.readTree(thirdElement.asString());
-                            String extracted = extractTextFromGeminiJson(innerJson);
-                            if (extracted != null && !extracted.isEmpty()) {
-                                text.append(extracted);
-                            }
-                        }
-                    } else {
-                        // 尝试标准 JSON 格式
-                        var json = objectMapper.readTree(dataStr);
-                        String extracted = extractTextFromGeminiJson(json);
-                        if (extracted != null && !extracted.isEmpty()) {
-                            text.append(extracted);
-                        }
-                    }
-                } catch (Exception e) { }
-            }
-        }
-        return !text.isEmpty() ? text.toString() : null;
-    }
-    
-    /**
-     * 从 Gemini JSON 数据中提取文本内容
-     * 支持思考内容和回复内容的提取
-     */
-    private String extractTextFromGeminiJson(tools.jackson.databind.JsonNode json) {
-        if (json == null) return null;
-        
-        StringBuilder text = new StringBuilder();
-        
-        // 查找回复内容：路径通常是 [4][0][1][0] 或类似结构
-        // 根据抓包数据，回复内容在数组的深层结构中
-        try {
-            // 尝试多种可能的路径
-            if (json.isArray() && json.size() > 4) {
-                var item4 = json.get(4);
-                if (item4 != null && item4.isArray() && item4.size() > 0) {
-                    var item0 = item4.get(0);
-                    if (item0 != null && item0.isArray() && item0.size() > 1) {
-                        var item1 = item0.get(1);
-                        if (item1 != null && item1.isArray() && item1.size() > 0) {
-                            var contentArray = item1.get(0);
-                            if (contentArray != null && contentArray.isArray()) {
-                                // 遍历内容数组，提取文本
-                                for (var contentItem : contentArray) {
-                                    if (contentItem != null && contentItem.isArray() && contentItem.size() > 0) {
-                                        var textNode = contentItem.get(0);
-                                        if (textNode != null && textNode.isArray() && textNode.size() > 1) {
-                                            var actualText = textNode.get(1);
-                                            if (actualText != null && actualText.isString()) {
-                                                String content = actualText.asString();
-                                                if (content != null && !content.isEmpty()) {
-                                                    text.append(content);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (Exception e) {
-            // 如果路径解析失败，尝试其他方式
-        }
-        
-        return text.length() > 0 ? text.toString() : null;
-    }
-    
-    private ModelConfig.ParseResultWithIndex parseSseIncremental(String sseData, Map<Integer, String> fragmentTypeMap, 
-                                                     Integer lastActiveFragmentIndex) {
-        if (sseData == null || sseData.isEmpty()) {
-            return new ModelConfig.ParseResultWithIndex(new ModelConfig.SseParseResult(null, null, false), lastActiveFragmentIndex);
-        }
-        
-        StringBuilder thinkingText = new StringBuilder();
-        StringBuilder responseText = new StringBuilder();
-        boolean finished = false;
-        
-        for (String line : sseData.split("\n")) {
-            line = line.trim();
-            
-            if (line.startsWith("event: ")) {
-                String event = line.substring(7).trim();
-                if ("finish".equals(event) || "close".equals(event) || "done".equals(event)) {
-                    finished = true;
-                }
-                continue;
-            }
-            
-            if (!line.startsWith("data: ")) continue;
-            String dataStr = line.substring(6).trim();
-            if (dataStr.isEmpty() || dataStr.equals("{}")) continue;
-            
-            try {
-                // Gemini 使用数组格式：["wrb.fr",null,"[...]"]
-                var arrayNode = objectMapper.readTree(dataStr);
-                if (arrayNode.isArray() && arrayNode.size() > 2) {
-                    var thirdElement = arrayNode.get(2);
-                    if (thirdElement != null && thirdElement.isString()) {
-                        // 第三个元素是 JSON 字符串，需要再次解析
-                        var innerJson = objectMapper.readTree(thirdElement.asString());
-                        parseGeminiJsonData(innerJson, thinkingText, responseText);
-                    }
-                } else {
-                    // 尝试标准 JSON 格式
-                    parseGeminiJsonData(arrayNode, thinkingText, responseText);
-                }
-            } catch (Exception e) {
-                log.debug("解析 SSE 数据行时出错: {}", e.getMessage());
-            }
-        }
-        
-        ModelConfig.SseParseResult result = new ModelConfig.SseParseResult(
-                thinkingText.length() > 0 ? thinkingText.toString() : null,
-                responseText.length() > 0 ? responseText.toString() : null,
-                finished
-        );
-        return new ModelConfig.ParseResultWithIndex(result, lastActiveFragmentIndex);
-    }
-    
-    /**
-     * 解析 Gemini JSON 数据，提取思考内容和回复内容
-     * 根据抓包数据，数据结构为：[null,[conversationId,responseId],null,null,[[responseData]],...]
-     * 思考内容在深层嵌套数组中，回复内容也在类似结构中
-     */
-    private void parseGeminiJsonData(tools.jackson.databind.JsonNode json, 
-                                     StringBuilder thinkingText, 
-                                     StringBuilder responseText) {
-        if (json == null || !json.isArray()) return;
-        
-        try {
-            // 查找响应数据：在索引 4 的位置，格式为 [[responseData]]
-            if (json.size() > 4) {
-                var responseDataArray = json.get(4);
-                if (responseDataArray != null && responseDataArray.isArray() && responseDataArray.size() > 0) {
-                    var responseData = responseDataArray.get(0);
-                    if (responseData != null && responseData.isArray() && responseData.size() > 0) {
-                        // responseData[0] 是响应 ID，responseData[1] 是内容数组
-                        if (responseData.size() > 1) {
-                            var contentArray = responseData.get(1);
-                            if (contentArray != null && contentArray.isArray() && contentArray.size() > 0) {
-                                // 内容数组的第一个元素包含思考和回复
-                                var firstContent = contentArray.get(0);
-                                if (firstContent != null && firstContent.isArray()) {
-                                    extractThinkingAndResponse(firstContent, thinkingText, responseText);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (Exception e) {
-            log.debug("解析 Gemini JSON 数据时出错: {}", e.getMessage());
-        }
-    }
-    
-    /**
-     * 从内容数组中提取思考内容和回复内容
-     * 根据抓包数据，结构为：[[[thinkingTitle, thinkingContent]], [[responseTitle, responseContent]]]
-     * 或者更复杂的嵌套结构
-     */
-    private void extractThinkingAndResponse(tools.jackson.databind.JsonNode contentArray,
-                                           StringBuilder thinkingText,
-                                           StringBuilder responseText) {
-        if (contentArray == null || !contentArray.isArray()) return;
-        
-        try {
-            // 遍历内容数组的每个元素
-            for (var item : contentArray) {
-                if (item == null || !item.isArray()) continue;
-                
-                // 检查是否是包含文本的数组结构
-                // 格式可能是：[[null,[null,0,"文本内容"]]] 或 [null,[null,0,"文本内容"]]
-                extractTextFromNestedArray(item, thinkingText, responseText);
-            }
-        } catch (Exception e) {
-            log.debug("提取思考内容和回复内容时出错: {}", e.getMessage());
-        }
-    }
-    
-    /**
-     * 从嵌套数组中递归提取文本内容
-     */
-    private void extractTextFromNestedArray(tools.jackson.databind.JsonNode node,
-                                           StringBuilder thinkingText,
-                                           StringBuilder responseText) {
-        if (node == null) return;
-        
-        try {
-            if (node.isArray()) {
-                // 如果是数组，递归处理每个元素
-                for (var element : node) {
-                    extractTextFromNestedArray(element, thinkingText, responseText);
-                }
-            } else if (node.isString()) {
-                String text = node.asString();
-                if (text != null && !text.isEmpty()) {
-                    // 判断是思考内容还是回复内容
-                    // 思考内容通常包含英文关键词，回复内容通常是实际对话内容
-                    if (text.contains("Welcoming") || text.contains("Formulating") || 
-                        text.contains("Seeking") || text.contains("I'm starting") ||
-                        text.contains("I'm working") || text.contains("I'm now")) {
-                        // 这是思考内容
-                        if (thinkingText.length() > 0 && !thinkingText.toString().contains(text)) {
-                            thinkingText.append("\n\n");
-                        }
-                        if (!thinkingText.toString().contains(text)) {
-                            thinkingText.append(text);
-                        }
-                    } else if (text.length() > 10) {
-                        // 较长的文本通常是回复内容（思考内容通常较短且包含特定关键词）
-                        // 避免重复添加
-                        if (!responseText.toString().contains(text)) {
-                            responseText.append(text);
-                        }
-                    }
-                }
-            }
-        } catch (Exception e) {
-            log.debug("从嵌套数组提取文本时出错: {}", e.getMessage());
-        }
     }
     
     // ==================== 对话 ID 提取 ====================
@@ -940,6 +508,65 @@ public class GeminiProvider implements LLMProvider {
         }
         // 使用 /app/ 路径格式
         return "https://gemini.google.com/app/" + conversationId;
+    }
+    
+    /**
+     * 发送手动登录提示
+     * 引导用户在浏览器中手动完成登录
+     */
+    private void sendManualLoginPrompt(SseEmitter emitter, String model, String providerName, String conversationId) {
+        try {
+            StringBuilder message = new StringBuilder();
+            message.append("```nwla-system-message\n");
+            message.append("当前未登录，请在浏览器中手动完成登录。\n\n");
+            message.append("浏览器窗口已打开，请按照以下步骤操作：\n");
+            message.append("1. 在浏览器中找到登录按钮并点击\n");
+            message.append("2. 完成登录流程（可以使用 Google 账号登录）\n");
+            message.append("3. 登录完成后，请重新发送消息\n\n");
+            message.append("注意：登录需要在浏览器界面中手动完成，系统无法自动登录。");
+            message.append("\n```");
+            
+            if (conversationId != null && !conversationId.isEmpty()) {
+                message.append("\n\n```nwla-conversation-id\n");
+                message.append(conversationId);
+                message.append("\n```");
+            }
+            
+            String id = UUID.randomUUID().toString();
+            ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
+                    .delta(ChatCompletionResponse.Delta.builder().content(message.toString()).build())
+                    .index(0).build();
+            ChatCompletionResponse response = ChatCompletionResponse.builder()
+                    .id(id).object("chat.completion.chunk")
+                    .created(System.currentTimeMillis() / 1000)
+                    .model(model).choices(List.of(choice)).build();
+            
+            emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(response), APPLICATION_JSON_UTF8));
+            emitter.send(SseEmitter.event().data("[DONE]", MediaType.TEXT_PLAIN));
+            emitter.complete();
+            
+            // 释放锁
+            if (providerName != null) {
+                new Thread(() -> {
+                    try {
+                        Thread.sleep(100);
+                        providerRegistry.releaseLock(providerName);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }).start();
+            }
+        } catch (Exception e) {
+            log.error("发送手动登录提示时出错", e);
+            try {
+                emitter.completeWithError(e);
+            } catch (Exception ex) {
+                // 忽略
+            }
+            if (providerName != null) {
+                providerRegistry.releaseLock(providerName);
+            }
+        }
     }
     
     

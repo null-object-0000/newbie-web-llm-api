@@ -84,11 +84,6 @@ public class DeepSeekProvider implements LLMProvider {
         }
 
         @Override
-        public void sendReplace(SseEmitter emitter, String id, String content, String model) throws IOException {
-            DeepSeekProvider.this.sendSseReplace(emitter, id, content, model);
-        }
-
-        @Override
         public void sendUrlAndComplete(Page page, SseEmitter emitter, ChatCompletionRequest request) throws IOException {
             DeepSeekProvider.this.sendUrlAndComplete(page, emitter, request);
         }
@@ -1398,18 +1393,6 @@ public class DeepSeekProvider implements LLMProvider {
     private void sendThinkingContent(SseEmitter emitter, String id, String content, String model) throws IOException {
         ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
                 .delta(ChatCompletionResponse.Delta.builder().reasoningContent(content).build())
-                .index(0).build();
-        ChatCompletionResponse response = ChatCompletionResponse.builder()
-                .id(id).object("chat.completion.chunk")
-                .created(System.currentTimeMillis() / 1000)
-                .model(model).choices(List.of(choice)).build();
-        emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(response), APPLICATION_JSON_UTF8));
-    }
-    
-    private void sendSseReplace(SseEmitter emitter, String id, String content, String model) throws IOException {
-        String markedContent = "__REPLACE__" + content;
-        ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
-                .delta(ChatCompletionResponse.Delta.builder().content(markedContent).build())
                 .index(0).build();
         ChatCompletionResponse response = ChatCompletionResponse.builder()
                 .id(id).object("chat.completion.chunk")

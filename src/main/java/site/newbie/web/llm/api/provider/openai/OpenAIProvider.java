@@ -16,7 +16,6 @@ import site.newbie.web.llm.api.model.LoginInfo;
 import site.newbie.web.llm.api.provider.ModelConfig;
 import site.newbie.web.llm.api.provider.ProviderRegistry;
 import org.springframework.context.annotation.Lazy;
-import site.newbie.web.llm.api.manager.LoginSessionManager;
 import site.newbie.web.llm.api.provider.openai.model.OpenAIModelConfig;
 import site.newbie.web.llm.api.provider.openai.model.OpenAIModelConfig.OpenAIContext;
 import site.newbie.web.llm.api.util.ConversationIdUtils;
@@ -45,7 +44,6 @@ public class OpenAIProvider implements LLMProvider {
     private final ObjectMapper objectMapper;
     private final Map<String, OpenAIModelConfig> modelConfigs;
     private final ProviderRegistry providerRegistry;
-    private final LoginSessionManager loginSessionManager;
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
     
     private final ConcurrentHashMap<String, Page> modelPages = new ConcurrentHashMap<>();
@@ -67,11 +65,6 @@ public class OpenAIProvider implements LLMProvider {
         @Override
         public void sendThinking(SseEmitter emitter, String id, String content, String model) throws IOException {
             OpenAIProvider.this.sendThinkingContent(emitter, id, content, model);
-        }
-
-        @Override
-        public void sendReplace(SseEmitter emitter, String id, String content, String model) throws IOException {
-            OpenAIProvider.this.sendSseReplace(emitter, id, content, model);
         }
 
         @Override
@@ -97,12 +90,10 @@ public class OpenAIProvider implements LLMProvider {
     };
 
     public OpenAIProvider(BrowserManager browserManager, ObjectMapper objectMapper, 
-                         List<OpenAIModelConfig> configs, @Lazy ProviderRegistry providerRegistry,
-                         LoginSessionManager loginSessionManager) {
+                         List<OpenAIModelConfig> configs, @Lazy ProviderRegistry providerRegistry) {
         this.browserManager = browserManager;
         this.objectMapper = objectMapper;
         this.providerRegistry = providerRegistry;
-        this.loginSessionManager = loginSessionManager;
         this.modelConfigs = configs.stream()
                 .collect(Collectors.toMap(OpenAIModelConfig::getModelName, Function.identity()));
         log.info("OpenAIProvider 初始化完成，支持的模型: {}", modelConfigs.keySet());
@@ -137,23 +128,23 @@ public class OpenAIProvider implements LLMProvider {
                 return false;
             }
             
-            // 检查是否存在输入框（已登录会有输入框）
-            Locator inputBox = page.locator("div.ProseMirror[id='prompt-textarea']")
-                    .or(page.locator("div[contenteditable='true'][id='prompt-textarea']"));
-            if (inputBox.count() > 0) {
-                log.info("检测到输入框，判断为已登录");
-                return true;
-            }
-            
-            // 检查是否存在登录按钮（未登录会有登录按钮）
+            // 优先检查登录按钮（未登录会有登录按钮）
             Locator loginButton = page.locator("button:has-text('登录')")
                     .or(page.locator("button:has-text('Log in')"))
                     .or(page.locator("a:has-text('登录')"))
                     .or(page.locator("a:has-text('Log in')"))
                     .or(page.locator("a[href*='login']"));
-            if (loginButton.count() > 0) {
+            if (loginButton.count() > 0 && loginButton.first().isVisible()) {
                 log.info("检测到登录按钮，判断为未登录");
                 return false;
+            }
+            
+            // 检查是否存在输入框（已登录会有输入框）
+            Locator inputBox = page.locator("div.ProseMirror[id='prompt-textarea']")
+                    .or(page.locator("div[contenteditable='true'][id='prompt-textarea']"));
+            if (inputBox.count() > 0 && inputBox.first().isVisible()) {
+                log.info("检测到输入框，判断为已登录");
+                return true;
             }
             
             // 如果URL是聊天页面且没有登录按钮，认为已登录
@@ -195,27 +186,16 @@ public class OpenAIProvider implements LLMProvider {
 
                 page = getOrCreatePage(request);
                 
-                // 检查登录状态（在创建页面后再次检查，因为页面创建时可能检测到登录状态丢失）
+                // 检查登录状态
                 if (!checkLoginStatus(page)) {
-                    log.warn("检测到未登录状态，发送登录提示");
-                    // 注意：不在这里更新 providerRegistry 的状态，避免循环依赖
-                    // 状态更新由 Controller 层处理
+                    log.warn("检测到未登录状态，发送手动登录提示");
                     
-                    // 获取或生成对话ID
                     String conversationId = getConversationId(request);
                     if (conversationId == null || conversationId.isEmpty()) {
                         conversationId = "login-" + UUID.randomUUID();
                     }
                     
-                    // 创建登录会话
-                    LoginSessionManager.LoginSession session = loginSessionManager.getOrCreateSession(getProviderName(), conversationId);
-                    session.setConversationId(conversationId);
-                    session.setState(LoginSessionManager.LoginSessionState.WAITING_LOGIN_METHOD);
-                    // 保存会话（确保状态被持久化）
-                    loginSessionManager.saveSession(getProviderName(), conversationId, session);
-                    
-                    // 发送登录方式选择提示
-                    sendLoginMethodSelection(emitter, request.getModel(), getProviderName(), conversationId);
+                    sendManualLoginPrompt(emitter, request.getModel(), getProviderName(), conversationId);
                     return;
                 }
                 
@@ -280,26 +260,22 @@ public class OpenAIProvider implements LLMProvider {
     
     private Page findOrCreatePageForUrl(String url, String model) {
         Page page = findPageByUrl(url);
-        if (page != null && !page.isClosed()) {
-            if (!page.url().equals(url)) {
-                page.navigate(url);
-                page.waitForLoadState();
-                // 检测登录状态是否丢失
-                checkLoginStatusLost(page);
+            if (page != null && !page.isClosed()) {
+                if (!page.url().equals(url)) {
+                    page.navigate(url);
+                    page.waitForLoadState();
+                }
+                modelPages.put(model, page);
+                pageUrls.put(model, url);
+                return page;
             }
+            
+            page = browserManager.newPage(getProviderName());
             modelPages.put(model, page);
+            page.navigate(url);
+            page.waitForLoadState();
             pageUrls.put(model, url);
             return page;
-        }
-        
-        page = browserManager.newPage(getProviderName());
-        modelPages.put(model, page);
-        page.navigate(url);
-        page.waitForLoadState();
-        pageUrls.put(model, url);
-        // 检测登录状态是否丢失
-        checkLoginStatusLost(page);
-        return page;
     }
     
     private Page createNewConversationPage(String model) {
@@ -312,41 +288,10 @@ public class OpenAIProvider implements LLMProvider {
         modelPages.put(model, page);
         page.navigate("https://chatgpt.com/");
         page.waitForLoadState();
+        // 等待页面加载完成（不等待输入框，因为可能未登录）
+        page.waitForTimeout(2000);
         pageUrls.put(model, page.url());
-        // 检测登录状态是否丢失
-        checkLoginStatusLost(page);
         return page;
-    }
-    
-    /**
-     * 检测登录状态是否丢失（通过检查是否有登录按钮）
-     * 如果检测到登录按钮，说明登录状态丢失
-     * 注意：不在这里更新 providerRegistry 的状态，避免循环依赖
-     */
-    private void checkLoginStatusLost(Page page) {
-        try {
-            if (page == null || page.isClosed()) {
-                return;
-            }
-            
-            // 等待页面加载完成
-            page.waitForLoadState();
-            page.waitForTimeout(1000);
-            
-            // 检查是否有登录按钮（登录状态丢失时会出现登录按钮）
-            Locator loginButton = page.locator("button:has-text('登录')")
-                    .or(page.locator("button:has-text('Login')"))
-                    .or(page.locator("button:has-text('Log in')"))
-                    .or(page.locator("button:has-text('Sign in')"));
-            
-            if (loginButton.count() > 0 && loginButton.first().isVisible()) {
-                log.warn("检测到登录按钮，说明登录状态已丢失");
-                // 注意：不在这里更新 providerRegistry 的状态，避免循环依赖
-                // 状态更新由 Controller 层处理
-            }
-        } catch (Exception e) {
-            log.warn("检测登录状态丢失时出错: {}", e.getMessage());
-        }
     }
     
     private Page findPageByUrl(String targetUrl) {
@@ -559,17 +504,6 @@ public class OpenAIProvider implements LLMProvider {
         emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(response), APPLICATION_JSON_UTF8));
     }
     
-    private void sendSseReplace(SseEmitter emitter, String id, String content, String model) throws IOException {
-        ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
-                .delta(ChatCompletionResponse.Delta.builder().content("__REPLACE__" + content).build())
-                .index(0).build();
-        ChatCompletionResponse response = ChatCompletionResponse.builder()
-                .id(id).object("chat.completion.chunk")
-                .created(System.currentTimeMillis() / 1000)
-                .model(model).choices(List.of(choice)).build();
-        emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(response), APPLICATION_JSON_UTF8));
-    }
-    
     private void sendUrlAndComplete(Page page, SseEmitter emitter, ChatCompletionRequest request) throws IOException {
         try {
             if (!page.isClosed()) {
@@ -598,64 +532,6 @@ public class OpenAIProvider implements LLMProvider {
         }
         emitter.send(SseEmitter.event().data("[DONE]", MediaType.TEXT_PLAIN));
         emitter.complete();
-    }
-    
-    /**
-     * 发送登录方式选择提示
-     */
-    private void sendLoginMethodSelection(SseEmitter emitter, String model, String providerName, String conversationId) {
-        try {
-            StringBuilder message = new StringBuilder();
-            message.append("```nwla-system-message\n");
-            message.append("当前未登录，请选择登录方式：\n\n");
-            message.append("1. 手机号+验证码登录\n");
-            message.append("2. 账号+密码登录\n");
-            message.append("3. 微信扫码登录\n\n");
-            message.append("请输入对应的数字（1、2、3）来选择登录方式。");
-            message.append("\n```");
-            
-            // 如果提供了对话ID，在消息中包含对话ID信息
-            if (conversationId != null && !conversationId.isEmpty()) {
-                message.append("\n\n```nwla-conversation-id\n");
-                message.append(conversationId);
-                message.append("\n```");
-            }
-            
-            String id = UUID.randomUUID().toString();
-            ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
-                    .delta(ChatCompletionResponse.Delta.builder().content(message.toString()).build())
-                    .index(0).build();
-            ChatCompletionResponse response = ChatCompletionResponse.builder()
-                    .id(id).object("chat.completion.chunk")
-                    .created(System.currentTimeMillis() / 1000)
-                    .model(model).choices(List.of(choice)).build();
-            
-            emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(response), APPLICATION_JSON_UTF8));
-            emitter.send(SseEmitter.event().data("[DONE]", MediaType.TEXT_PLAIN));
-            emitter.complete();
-            
-            // 释放锁
-            if (providerName != null) {
-                new Thread(() -> {
-                    try {
-                        Thread.sleep(100);
-                        providerRegistry.releaseLock(providerName);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                    }
-                }).start();
-            }
-        } catch (Exception e) {
-            log.error("发送登录方式选择提示时出错", e);
-            try {
-                emitter.completeWithError(e);
-            } catch (Exception ex) {
-                // 忽略
-            }
-            if (providerName != null) {
-                providerRegistry.releaseLock(providerName);
-            }
-        }
     }
     
     private String extractTextFromSse(String sseData) {
@@ -913,6 +789,65 @@ public class OpenAIProvider implements LLMProvider {
         }
         // 默认使用 chatgpt.com，如果需要可以扩展为支持 chat.openai.com
         return "https://chatgpt.com/c/" + conversationId;
+    }
+    
+    /**
+     * 发送手动登录提示
+     * 引导用户在浏览器中手动完成登录
+     */
+    private void sendManualLoginPrompt(SseEmitter emitter, String model, String providerName, String conversationId) {
+        try {
+            StringBuilder message = new StringBuilder();
+            message.append("```nwla-system-message\n");
+            message.append("当前未登录，请在浏览器中手动完成登录。\n\n");
+            message.append("浏览器窗口已打开，请按照以下步骤操作：\n");
+            message.append("1. 在浏览器中找到登录按钮并点击\n");
+            message.append("2. 完成登录流程（可以使用 OpenAI 账号登录）\n");
+            message.append("3. 登录完成后，请重新发送消息\n\n");
+            message.append("注意：登录需要在浏览器界面中手动完成，系统无法自动登录。");
+            message.append("\n```");
+            
+            if (conversationId != null && !conversationId.isEmpty()) {
+                message.append("\n\n```nwla-conversation-id\n");
+                message.append(conversationId);
+                message.append("\n```");
+            }
+            
+            String id = UUID.randomUUID().toString();
+            ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
+                    .delta(ChatCompletionResponse.Delta.builder().content(message.toString()).build())
+                    .index(0).build();
+            ChatCompletionResponse response = ChatCompletionResponse.builder()
+                    .id(id).object("chat.completion.chunk")
+                    .created(System.currentTimeMillis() / 1000)
+                    .model(model).choices(List.of(choice)).build();
+            
+            emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(response), APPLICATION_JSON_UTF8));
+            emitter.send(SseEmitter.event().data("[DONE]", MediaType.TEXT_PLAIN));
+            emitter.complete();
+            
+            // 释放锁
+            if (providerName != null) {
+                new Thread(() -> {
+                    try {
+                        Thread.sleep(100);
+                        providerRegistry.releaseLock(providerName);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }).start();
+            }
+        } catch (Exception e) {
+            log.error("发送手动登录提示时出错", e);
+            try {
+                emitter.completeWithError(e);
+            } catch (Exception ex) {
+                // 忽略
+            }
+            if (providerName != null) {
+                providerRegistry.releaseLock(providerName);
+            }
+        }
     }
     
     
