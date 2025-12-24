@@ -20,7 +20,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class BrowserManager {
 
     private Playwright playwright;
-    
+
     // 每个提供器有独立的 BrowserContext，避免并发冲突
     private final ConcurrentHashMap<String, BrowserContext> providerContexts = new ConcurrentHashMap<>();
 
@@ -43,15 +43,51 @@ public class BrowserManager {
             System.setProperty("playwright.browsers.path", browsersPath);
             log.info("设置 Playwright 浏览器路径: {}", browsersPath);
         }
-        
+
         // 设置系统属性跳过浏览器下载
         System.setProperty("playwright.cli.skip.install", "true");
-        
+
         playwright = Playwright.create();
 
         log.info("Playwright 启动成功！各提供器的 BrowserContext 将按需创建。");
     }
-    
+
+    /**
+     * 检查并确保 Playwright 实例有效，如果无效则重新创建
+     */
+    private synchronized void ensurePlaywrightValid() {
+        if (playwright == null) {
+            log.warn("Playwright 实例为 null，重新创建...");
+            playwright = Playwright.create();
+            log.info("Playwright 实例已重新创建");
+            return;
+        }
+
+        // 尝试通过访问浏览器类型来检查 Playwright 是否有效
+        // 如果连接已关闭，会抛出异常
+        try {
+            playwright.chromium();
+        } catch (Exception e) {
+            String errorMsg = e.getMessage();
+            if (errorMsg != null && (errorMsg.contains("Playwright connection closed") ||
+                    errorMsg.contains("Connection closed") ||
+                    errorMsg.contains("Target closed"))) {
+                log.warn("Playwright 实例无效（连接已关闭），重新创建: {}", errorMsg);
+                try {
+                    playwright.close();
+                } catch (Exception closeEx) {
+                    // 忽略关闭错误
+                    log.debug("关闭旧的 Playwright 实例时出错: {}", closeEx.getMessage());
+                }
+                playwright = Playwright.create();
+                log.info("Playwright 实例已重新创建");
+            } else {
+                // 其他类型的错误，记录但不重新创建
+                log.debug("检查 Playwright 实例时出现异常（非连接关闭）: {}", errorMsg);
+            }
+        }
+    }
+
     /**
      * 获取或创建指定提供器的 BrowserContext
      * 每个提供器有独立的浏览器上下文，避免并发冲突
@@ -59,7 +95,7 @@ public class BrowserManager {
      */
     public synchronized BrowserContext getOrCreateContext(String providerName) {
         BrowserContext existingContext = providerContexts.get(providerName);
-        
+
         // 检查现有 context 是否有效
         if (existingContext != null) {
             try {
@@ -71,24 +107,27 @@ public class BrowserManager {
                 providerContexts.remove(providerName);
             }
         }
-        
+
+        // 确保 Playwright 实例有效
+        ensurePlaywrightValid();
+
         // 创建新的 context
         log.info("为提供器 {} 创建独立的 BrowserContext...", providerName);
-        
+
         // 每个提供器有独立的用户数据目录
         String providerDataDir = userDataDir + "/" + providerName;
-        
+
         // Gemini 和 OpenAI 强制使用 headed 模式（有界面），其他提供器使用配置的模式
         boolean useHeadless = headless;
         if ("gemini".equals(providerName) || "openai".equals(providerName)) {
             useHeadless = false;
             log.info("提供器 {} 强制使用 Headed 模式（有界面）", providerName);
         }
-        
+
         // 配置启动选项
         BrowserType.LaunchPersistentContextOptions options = new BrowserType.LaunchPersistentContextOptions()
                 .setHeadless(useHeadless)
-                .setViewportSize(1920, 1080)  // 使用常见的桌面浏览器窗口大小
+                .setViewportSize(1366, 768)
                 .setArgs(List.of(
                         "--disable-blink-features=AutomationControlled",
                         "--no-sandbox",
@@ -96,47 +135,95 @@ public class BrowserManager {
                 ))
                 .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
 
-        BrowserContext context = playwright.chromium().launchPersistentContext(
-                Paths.get(providerDataDir), options);
-        
-        // 注入抗检测脚本
-        context.addInitScript("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})");
-        
-        providerContexts.put(providerName, context);
-        log.info("提供器 {} 的 BrowserContext 创建成功，数据目录: {}", providerName, providerDataDir);
-        return context;
+        // 重试机制：如果 Playwright 连接关闭，尝试重新创建 Playwright 实例
+        int maxRetries = 2;
+        for (int attempt = 0; attempt < maxRetries; attempt++) {
+            try {
+                BrowserContext context = playwright.chromium().launchPersistentContext(
+                        Paths.get(providerDataDir), options);
+
+                // 注入抗检测脚本
+                context.addInitScript("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})");
+
+                providerContexts.put(providerName, context);
+                log.info("提供器 {} 的 BrowserContext 创建成功，数据目录: {}", providerName, providerDataDir);
+                return context;
+            } catch (Exception e) {
+                if (e.getMessage() != null && e.getMessage().contains("Playwright connection closed")) {
+                    log.warn("Playwright 连接关闭，尝试重新创建 Playwright 实例 (尝试 {}/{})", attempt + 1, maxRetries);
+                    // 重新创建 Playwright 实例
+                    try {
+                        if (playwright != null) {
+                            playwright.close();
+                        }
+                    } catch (Exception closeEx) {
+                        // 忽略关闭错误
+                    }
+                    playwright = Playwright.create();
+                    log.info("Playwright 实例已重新创建，重试创建 BrowserContext...");
+
+                    if (attempt == maxRetries - 1) {
+                        // 最后一次尝试失败，抛出异常
+                        log.error("创建 BrowserContext 失败，已重试 {} 次", maxRetries);
+                        throw new RuntimeException("无法创建 BrowserContext，Playwright 连接问题", e);
+                    }
+                } else {
+                    // 其他错误直接抛出
+                    throw new RuntimeException("创建 BrowserContext 失败", e);
+                }
+            }
+        }
+
+        // 理论上不会到达这里，但为了编译需要
+        throw new RuntimeException("创建 BrowserContext 失败");
     }
 
     /**
      * 获取一个新的页面用于聊天（兼容旧接口，使用默认上下文）
+     *
      * @deprecated 请使用 newPage(String providerName) 方法
      */
     @Deprecated
     public Page newPage() {
         return newPage("default");
     }
-    
+
     /**
      * 为指定提供器获取一个新的页面
      * 如果 context 已关闭会自动重新创建并重试
      */
     public synchronized Page newPage(String providerName) {
-        BrowserContext context = getOrCreateContext(providerName);
-        try {
-            return context.newPage();
-        } catch (Exception e) {
-            // context 可能已关闭，移除并重新创建
-            log.warn("提供器 {} 创建页面失败，将重新创建 BrowserContext: {}", providerName, e.getMessage());
-            providerContexts.remove(providerName);
-            
-            // 重新获取 context 并创建页面
-            context = getOrCreateContext(providerName);
-            return context.newPage();
+        int maxRetries = 3;
+        for (int attempt = 0; attempt < maxRetries; attempt++) {
+            try {
+                BrowserContext context = getOrCreateContext(providerName);
+                return context.newPage();
+            } catch (Exception e) {
+                // context 可能已关闭，移除并重新创建
+                log.warn("提供器 {} 创建页面失败 (尝试 {}/{}): {}", providerName, attempt + 1, maxRetries, e.getMessage());
+                providerContexts.remove(providerName);
+
+                if (attempt < maxRetries - 1) {
+                    // 等待一小段时间后重试
+                    try {
+                        Thread.sleep(500);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new RuntimeException("创建页面时被中断", ie);
+                    }
+                } else {
+                    // 最后一次尝试失败，抛出异常
+                    throw new RuntimeException("创建页面失败，已重试 " + maxRetries + " 次", e);
+                }
+            }
         }
+        // 理论上不会到达这里
+        throw new RuntimeException("创建页面失败");
     }
 
     /**
      * 获取所有打开的页面（兼容旧接口）
+     *
      * @deprecated 请使用 getAllPages(String providerName) 方法
      */
     @Deprecated
@@ -147,7 +234,7 @@ public class BrowserManager {
         }
         return allPages;
     }
-    
+
     /**
      * 获取指定提供器的所有页面
      */
@@ -168,7 +255,7 @@ public class BrowserManager {
     @PreDestroy
     public void destroy() {
         log.info("正在关闭 Playwright...");
-        
+
         // 关闭所有提供器的 BrowserContext
         for (var entry : providerContexts.entrySet()) {
             try {
@@ -179,7 +266,7 @@ public class BrowserManager {
             }
         }
         providerContexts.clear();
-        
+
         if (playwright != null) {
             playwright.close();
         }
