@@ -15,6 +15,8 @@ import site.newbie.web.llm.api.model.LoginInfo;
 import site.newbie.web.llm.api.provider.ModelConfig;
 import site.newbie.web.llm.api.provider.ProviderRegistry;
 import org.springframework.context.annotation.Lazy;
+import site.newbie.web.llm.api.provider.gemini.command.Command;
+import site.newbie.web.llm.api.provider.gemini.command.CommandParser;
 import site.newbie.web.llm.api.provider.gemini.model.GeminiModelConfig;
 import site.newbie.web.llm.api.provider.gemini.model.GeminiModelConfig.GeminiContext;
 import site.newbie.web.llm.api.util.ConversationIdUtils;
@@ -44,13 +46,15 @@ public class GeminiProvider implements LLMProvider {
     private final Map<String, GeminiModelConfig> modelConfigs;
     private final ProviderRegistry providerRegistry;
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
-    
+
     private final ConcurrentHashMap<String, Page> modelPages = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, String> pageUrls = new ConcurrentHashMap<>();
-    
+    // 存储 conversationId -> Page 的映射，用于指令执行后保留的 tab
+    private final ConcurrentHashMap<String, Page> conversationPages = new ConcurrentHashMap<>();
+
     // Gemini 只支持 DOM 模式
     private static final String MONITOR_MODE = "dom";
-    
+
     private final ModelConfig.ResponseHandler responseHandler = new ModelConfig.ResponseHandler() {
         @Override
         public void sendChunk(SseEmitter emitter, String id, String content, String model) throws IOException {
@@ -86,8 +90,8 @@ public class GeminiProvider implements LLMProvider {
         }
     };
 
-    public GeminiProvider(BrowserManager browserManager, ObjectMapper objectMapper, 
-                         List<GeminiModelConfig> configs, @Lazy ProviderRegistry providerRegistry) {
+    public GeminiProvider(BrowserManager browserManager, ObjectMapper objectMapper,
+                          List<GeminiModelConfig> configs, @Lazy ProviderRegistry providerRegistry) {
         this.browserManager = browserManager;
         this.objectMapper = objectMapper;
         this.providerRegistry = providerRegistry;
@@ -113,18 +117,18 @@ public class GeminiProvider implements LLMProvider {
                 log.warn("页面为空或已关闭，无法检查登录状态");
                 return false;
             }
-            
+
             // 等待页面加载完成
             page.waitForLoadState();
             page.waitForTimeout(1000);
-            
+
             // 检查URL：如果URL包含登录相关路径，说明未登录
             String url = page.url();
             if (url.contains("/signin") || url.contains("/login") || url.contains("/auth")) {
                 log.info("检测到登录页面URL: {}", url);
                 return false;
             }
-            
+
             // 优先检查登录按钮（未登录会有登录按钮）
             // 如果明确发现登录按钮，直接判断为未登录，优先级高于输入框检查
             // 根据实际 DOM 结构，登录按钮是 <a> 标签，带有 aria-label="登录" 和 href 包含 ServiceLogin
@@ -136,30 +140,30 @@ public class GeminiProvider implements LLMProvider {
                     .or(page.locator("a:has-text('登录')"))
                     .or(page.locator("a:has-text('Sign in')"))
                     .or(page.locator("a[href*='signin']"));
-            
+
             if (loginButton.count() > 0 && loginButton.first().isVisible()) {
                 log.info("检测到登录按钮，判断为未登录");
                 return false;
             }
-            
+
             // 检查是否存在输入框（已登录会有输入框）
             // 使用 div[role='textbox'] 作为主要选择器
             Locator inputBox = page.locator("div[role='textbox']")
                     .or(page.locator("textarea[placeholder*='输入']"))
                     .or(page.locator("textarea[placeholder*='Enter a prompt']"))
                     .or(page.locator("textarea[aria-label*='prompt']"));
-            
+
             if (inputBox.count() > 0 && inputBox.first().isVisible()) {
                 log.info("检测到输入框，判断为已登录");
                 return true;
             }
-            
+
             // 如果URL是聊天页面且没有登录按钮，认为已登录
             if (url.contains("gemini.google.com") || url.contains("ai.google.dev")) {
                 log.info("在聊天页面且未检测到登录按钮，判断为已登录");
                 return true;
             }
-            
+
             // 默认返回false（保守策略）
             log.warn("无法确定登录状态，默认返回未登录");
             return false;
@@ -168,14 +172,14 @@ public class GeminiProvider implements LLMProvider {
             return false;
         }
     }
-    
+
     @Override
     public LoginInfo getLoginInfo(Page page) {
         boolean loggedIn = checkLoginStatus(page);
         if (!loggedIn) {
             return LoginInfo.notLoggedIn();
         }
-        
+
         return LoginInfo.loggedIn();
     }
 
@@ -186,37 +190,67 @@ public class GeminiProvider implements LLMProvider {
             try {
                 String model = request.getModel();
                 GeminiModelConfig config = modelConfigs.get(model);
-                
+
                 if (config == null) {
                     throw new IllegalArgumentException("不支持的模型: " + model);
                 }
 
+                // 获取用户消息
+                String userMessage = request.getMessages().stream()
+                        .filter(m -> "user".equals(m.getRole()))
+                        .reduce((first, second) -> second)
+                        .map(ChatCompletionRequest.Message::getContent)
+                        .orElse(null);
+
+                // 检查是否是指令对话
+                if (userMessage != null && CommandParser.isCommandOnly(userMessage)) {
+                    // 指令对话：执行指令并返回结果
+                    handleCommandOnly(request, emitter);
+                    return;
+                }
+
                 page = getOrCreatePage(request);
-                
+
+                // 检查是否找到了页面（对于非新对话，必须找到对应的 tab）
+                if (page == null) {
+                    String conversationId = getConversationId(request);
+                    if (conversationId != null && !conversationId.isEmpty() && !isNewConversation(request)) {
+                        // 找不到对应的 tab，返回系统错误
+                        log.error("找不到对应的 tab: conversationId={}", conversationId);
+                        sendSystemError(emitter, request.getModel(),
+                                "系统错误：找不到对应的对话 Tab。该 Tab 可能已被关闭或丢失。请重新开始对话。");
+                        return;
+                    }
+                    // 如果是新对话但 page 为 null，说明创建失败
+                    throw new RuntimeException("无法创建或获取页面");
+                }
+
                 // 检查登录状态
                 if (!checkLoginStatus(page)) {
                     log.warn("检测到未登录状态，发送手动登录提示");
-                    
+
                     String conversationId = getConversationId(request);
                     if (conversationId == null || conversationId.isEmpty()) {
                         conversationId = "login-" + UUID.randomUUID();
                     }
-                    
+
                     sendManualLoginPrompt(emitter, request.getModel(), getProviderName(), conversationId);
                     return;
                 }
-                
-                // Gemini 只支持 DOM 模式，不需要 SSE 拦截器
-                
+
                 if (isNewConversation(request)) {
                     clickNewChatButton(page);
                 }
-                
+
                 config.configure(page);
+
+                // 处理内置指令（如添加附件）- 这些指令会作为附件添加，但消息仍会发送
+                processCommands(page, request);
+
                 sendMessage(page, request);
-                
+
                 int messageCountBefore = countMessages(page);
-                
+
                 GeminiContext context = new GeminiContext(
                         page, emitter, request, messageCountBefore, MONITOR_MODE, responseHandler
                 );
@@ -229,65 +263,123 @@ public class GeminiProvider implements LLMProvider {
             }
         });
     }
-    
+
     // ==================== 页面管理 ====================
-    
+
     private Page getOrCreatePage(ChatCompletionRequest request) {
         String model = request.getModel();
         String conversationId = getConversationId(request);
         boolean isNew = isNewConversation(request);
-        
+
         if (!isNew && conversationId != null) {
+            // 优先从 conversationPages 中查找（指令执行后保留的 tab）
+            Page page = conversationPages.get(conversationId);
+            if (page != null && !page.isClosed()) {
+                // 如果是临时 ID（command- 开头），检查页面是否已经有了真正的 conversationId
+                if (conversationId.startsWith("command-")) {
+                    String currentUrl = page.url();
+                    String realConversationId = extractConversationIdFromUrl(currentUrl);
+                    if (realConversationId != null && !realConversationId.isEmpty()) {
+                        // 页面已经有了真正的 conversationId，更新映射关系
+                        conversationPages.remove(conversationId); // 移除临时 ID
+                        conversationPages.put(realConversationId, page); // 使用真正的 ID
+                        pageUrls.put(model, currentUrl);
+                        modelPages.put(model, page);
+                        log.info("临时 ID 已更新为真正的 conversationId: tempId={}, realId={}, url={}", 
+                            conversationId, realConversationId, currentUrl);
+                        return page;
+                    } else {
+                        // 还是临时 ID，直接使用
+                        log.info("找到已保留的 tab（临时 ID）: tempConversationId={}, url={}", conversationId, currentUrl);
+                        modelPages.put(model, page);
+                        pageUrls.put(model, currentUrl);
+                        return page;
+                    }
+                } else {
+                    // 真正的 conversationId，验证页面 URL 是否匹配
+                    String expectedUrl = buildUrlFromConversationId(conversationId);
+                    String currentUrl = page.url();
+                    if (expectedUrl.equals(currentUrl) || currentUrl.contains(conversationId)) {
+                        log.info("找到已保留的 tab: conversationId={}, url={}", conversationId, currentUrl);
+                        modelPages.put(model, page);
+                        pageUrls.put(model, currentUrl);
+                        return page;
+                    } else {
+                        // URL 不匹配，尝试导航到正确的 URL
+                        try {
+                            page.navigate(expectedUrl);
+                            page.waitForLoadState();
+                            modelPages.put(model, page);
+                            pageUrls.put(model, expectedUrl);
+                            log.info("已导航到正确的 URL: conversationId={}, url={}", conversationId, expectedUrl);
+                            return page;
+                        } catch (Exception e) {
+                            log.warn("导航到 URL 失败，移除无效的 tab 关联: conversationId={}, error={}", conversationId, e.getMessage());
+                            conversationPages.remove(conversationId);
+                        }
+                    }
+                }
+            } else if (page != null && page.isClosed()) {
+                // 页面已关闭，移除无效关联
+                log.warn("已保留的 tab 已关闭，移除关联: conversationId={}", conversationId);
+                conversationPages.remove(conversationId);
+            }
+
+            // 如果是临时 ID，找不到就直接返回 null（不尝试通过 URL 查找）
+            if (conversationId.startsWith("command-")) {
+                log.warn("找不到对应的 tab（临时 ID）: conversationId={}", conversationId);
+                return null;
+            }
+
+            // 如果找不到已保留的 tab，尝试通过 URL 查找（但不创建新页面）
             String conversationUrl = buildUrlFromConversationId(conversationId);
-            return findOrCreatePageForUrl(conversationUrl, model);
+            Page foundPage = findPageByUrl(conversationUrl);
+
+            if (foundPage != null && !foundPage.isClosed()) {
+                // 找到了页面，更新映射
+                modelPages.put(model, foundPage);
+                pageUrls.put(model, conversationUrl);
+                conversationPages.put(conversationId, foundPage);
+                log.info("通过 URL 找到已存在的 tab: conversationId={}, url={}", conversationId, conversationUrl);
+                return foundPage;
+            }
+
+            // 找不到 tab，返回 null（会在 streamChat 中处理为系统错误）
+            log.warn("找不到对应的 tab: conversationId={}, url={}", conversationId, conversationUrl);
+            return null;
         } else {
             return createNewConversationPage(model);
         }
     }
-    
+
     private String getConversationId(ChatCompletionRequest request) {
         String conversationId = request.getConversationId();
         if (conversationId != null && !conversationId.isEmpty()) {
             return conversationId;
         }
-        
+
         if (request.getMessages() != null) {
             conversationId = ConversationIdUtils.extractConversationIdFromRequest(request, true);
         }
         return conversationId;
     }
-    
+
     private boolean isNewConversation(ChatCompletionRequest request) {
         String conversationId = getConversationId(request);
+        // command- 开头的临时 ID 不是新对话（应该复用 tab）
+        // login- 开头的需要登录，视为新对话
         return conversationId == null || conversationId.isEmpty() || conversationId.startsWith("login-");
     }
-    
-    private Page findOrCreatePageForUrl(String url, String model) {
-        Page page = findPageByUrl(url);
-            if (page != null && !page.isClosed()) {
-                if (!page.url().equals(url)) {
-                    page.navigate(url);
-                    page.waitForLoadState();
-                }
-                modelPages.put(model, page);
-                pageUrls.put(model, url);
-                return page;
-            }
-            
-            page = browserManager.newPage(getProviderName());
-            modelPages.put(model, page);
-            page.navigate(url);
-            page.waitForLoadState();
-            pageUrls.put(model, url);
-            return page;
-    }
-    
+
     private Page createNewConversationPage(String model) {
         Page oldPage = modelPages.remove(model);
         if (oldPage != null && !oldPage.isClosed()) {
-            try { oldPage.close(); } catch (Exception e) { }
+            try {
+                oldPage.close();
+            } catch (Exception e) {
+            }
         }
-        
+
         Page page = browserManager.newPage(getProviderName());
         modelPages.put(model, page);
         // 使用 /app 路径
@@ -298,7 +390,7 @@ public class GeminiProvider implements LLMProvider {
         pageUrls.put(model, page.url());
         return page;
     }
-    
+
     private Page findPageByUrl(String targetUrl) {
         if (targetUrl == null) return null;
         for (String model : modelPages.keySet()) {
@@ -313,10 +405,11 @@ public class GeminiProvider implements LLMProvider {
                     return page;
                 }
             }
-        } catch (Exception e) { }
+        } catch (Exception e) {
+        }
         return null;
     }
-    
+
     private void clickNewChatButton(Page page) {
         try {
             page.waitForTimeout(1000);
@@ -328,7 +421,7 @@ public class GeminiProvider implements LLMProvider {
                     .or(page.locator("a:has-text('New chat')"))
                     .or(page.locator("[aria-label*='New chat']"))
                     .or(page.locator("[aria-label*='新对话']"));
-            
+
             if (newChatButton.count() > 0) {
                 newChatButton.first().click();
                 // 等待输入框出现，确保新聊天页面加载完成
@@ -346,7 +439,445 @@ public class GeminiProvider implements LLMProvider {
             log.warn("点击新对话按钮时出错", e);
         }
     }
-    
+
+    /**
+     * 处理纯指令对话（只包含指令，没有其他内容）
+     *
+     * @param request 聊天请求
+     * @param emitter SSE 发射器
+     */
+    private void handleCommandOnly(ChatCompletionRequest request, SseEmitter emitter) {
+        Page page = null;
+        try {
+            String model = request.getModel();
+
+            // 获取用户消息
+            String userMessage = request.getMessages().stream()
+                    .filter(m -> "user".equals(m.getRole()))
+                    .reduce((first, second) -> second)
+                    .map(ChatCompletionRequest.Message::getContent)
+                    .orElse(null);
+
+            if (userMessage == null || userMessage.trim().isEmpty()) {
+                sendCommandResult(emitter, model, "❌ 未找到指令", false);
+                return;
+            }
+
+            // 解析指令
+            CommandParser.ParseResult parseResult = CommandParser.parse(userMessage);
+
+            if (!parseResult.hasCommands()) {
+                sendCommandResult(emitter, model, "❌ 未找到有效指令", false);
+                return;
+            }
+
+            log.info("检测到指令对话，包含 {} 个指令", parseResult.getCommands().size());
+
+            // 检查是否只有 help 指令（help 指令不需要页面和登录）
+            boolean onlyHelpCommand = parseResult.getCommands().size() == 1 && 
+                                     "help".equals(parseResult.getCommands().get(0).getName());
+            
+            // 检查是否只有 login 指令（login 指令需要页面但不需要登录检查）
+            boolean onlyLoginCommand = parseResult.getCommands().size() == 1 && 
+                                      "login".equals(parseResult.getCommands().get(0).getName());
+            
+            if (!onlyHelpCommand) {
+                // 需要页面来执行指令
+                page = getOrCreatePage(request);
+
+                // login 指令不需要检查登录状态（它本身就是用来登录的）
+                if (!onlyLoginCommand) {
+                    // 检查登录状态
+                    if (!checkLoginStatus(page)) {
+                        sendCommandResult(emitter, model, "❌ 未登录，请先登录", false);
+                        return;
+                    }
+                }
+            }
+
+            // 创建进度回调（累积所有进度消息）
+            CommandProgressCallback progressCallback = new CommandProgressCallback(emitter, model, objectMapper);
+            
+            // 发送开始标记
+            progressCallback.sendStartMarker();
+
+            // 执行所有指令（带重试机制）
+            boolean allSuccess = true;
+            int maxRetries = 2; // 最多重试2次（总共执行3次）
+
+            for (int i = 0; i < parseResult.getCommands().size(); i++) {
+                site.newbie.web.llm.api.provider.gemini.command.Command command = parseResult.getCommands().get(i);
+
+                boolean commandSuccess = false;
+                int retryCount = 0;
+
+                while (retryCount <= maxRetries && !commandSuccess) {
+                    try {
+                        if (retryCount > 0) {
+                            log.info("重试执行指令 (尝试 {}/{}): {}", retryCount + 1, maxRetries + 1, command.getName());
+                            progressCallback.addProgress(String.format("重试中... (尝试 %d/%d)", retryCount + 1, maxRetries + 1));
+                            if (page != null) {
+                                page.waitForTimeout(1000); // 重试前等待
+                            }
+                        } else {
+                            log.info("执行指令: {}", command.getName());
+                        }
+
+                        boolean success = command.execute(page, progressCallback);
+
+                        if (success) {
+                            commandSuccess = true;
+                            progressCallback.addProgress("✅ 执行成功");
+                            // 等待附件上传完成（如果有页面）
+                            if (page != null) {
+                                page.waitForTimeout(1000);
+                            }
+                        } else {
+                            if (retryCount < maxRetries) {
+                                log.warn("指令执行失败，将重试 (尝试 {}/{}): {}", retryCount + 1, maxRetries + 1, command.getName());
+                                retryCount++;
+                            } else {
+                                log.error("指令执行失败，已重试 {} 次: {}", maxRetries, command.getName());
+                                progressCallback.addProgress("❌ 执行失败（已重试 " + maxRetries + " 次）");
+                                allSuccess = false;
+                                break;
+                            }
+                        }
+                    } catch (Exception e) {
+                        if (retryCount < maxRetries) {
+                            log.warn("执行指令时出错，将重试 (尝试 {}/{}): {}, error: {}",
+                                retryCount + 1, maxRetries + 1, command.getName(), e.getMessage());
+                            retryCount++;
+                            if (page != null) {
+                                page.waitForTimeout(1000); // 重试前等待
+                            }
+                        } else {
+                            log.error("执行指令时出错，已重试 {} 次: {}, error: {}", maxRetries, command.getName(), e.getMessage(), e);
+                            progressCallback.addProgress("❌ 执行出错（已重试 " + maxRetries + " 次）: " + e.getMessage());
+                            allSuccess = false;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // 发送结束标记
+            progressCallback.sendEndMarker();
+
+            // 发送最终结果（只显示成功或失败）
+            String finalMessage = allSuccess ? "✅ 指令执行成功" : "❌ 指令执行失败";
+
+            // 指令执行成功，保存页面和 conversationId 的关联（help 和 login 指令不需要保存）
+            if (allSuccess && !onlyHelpCommand && !onlyLoginCommand && page != null && !page.isClosed()) {
+                try {
+                    String url = page.url();
+                    if (url.contains("gemini.google.com") || url.contains("ai.google.dev")) {
+                        // 等待一下，看看 URL 是否会变化（可能页面还在加载中）
+                        page.waitForTimeout(1000);
+                        url = page.url(); // 重新获取 URL
+                        
+                        String conversationId = extractConversationIdFromUrl(url);
+                        if (conversationId != null && !conversationId.isEmpty()) {
+                            // 保存 conversationId -> Page 的映射
+                            conversationPages.put(conversationId, page);
+                            pageUrls.put(model, url);
+                            modelPages.put(model, page);
+                            log.info("已保存指令执行后的 tab 关联: conversationId={}, url={}", conversationId, url);
+
+                            // 发送 conversationId，让客户端知道这个标识
+                            sendCommandResultWithConversationId(emitter, model, finalMessage, conversationId);
+                        } else {
+                            // 如果没有 conversationId，生成一个临时 ID（类似 login- 格式）
+                            String tempConversationId = "command-" + UUID.randomUUID().toString();
+                            conversationPages.put(tempConversationId, page);
+                            pageUrls.put(model, url);
+                            modelPages.put(model, page);
+                            log.info("已保存指令执行后的 tab 关联（使用临时 ID）: tempConversationId={}, url={}", tempConversationId, url);
+                            
+                            // 发送临时 conversationId，让客户端知道这个标识
+                            sendCommandResultWithConversationId(emitter, model, finalMessage, tempConversationId);
+                        }
+                    } else {
+                        sendCommandResult(emitter, model, finalMessage, true);
+                    }
+                } catch (Exception e) {
+                    log.warn("保存 tab 关联时出错: {}", e.getMessage());
+                    sendCommandResult(emitter, model, finalMessage, true);
+                }
+            } else {
+                sendCommandResult(emitter, model, finalMessage, allSuccess);
+            }
+
+            // 指令执行成功，保留页面，不需要关闭页面，让用户可以继续使用这个 Tab
+
+        } catch (Exception e) {
+            log.error("处理指令对话时出错", e);
+            try {
+                sendCommandResult(emitter, request.getModel(),
+                        "```nwla-system-message\n❌ 执行指令时出错: " + e.getMessage() + "\n```", false);
+            } catch (Exception ex) {
+                log.error("发送错误消息时出错", ex);
+            }
+            // 出错时才清理页面
+            cleanupPageOnError(page, request.getModel());
+        }
+    }
+
+    /**
+     * 指令进度回调实现
+     * 累积进度消息，在开始和结束时发送标记
+     */
+    private static class CommandProgressCallback implements
+            site.newbie.web.llm.api.provider.gemini.command.Command.ProgressCallback {
+        private final SseEmitter emitter;
+        private final String model;
+        private final ObjectMapper objectMapper;
+        private final StringBuilder accumulatedContent = new StringBuilder();
+        private boolean startMarkerSent = false;
+        private int lastSentLength = 0;
+        private int startMarkerLength = 0;
+
+        public CommandProgressCallback(SseEmitter emitter, String model, ObjectMapper objectMapper) {
+            this.emitter = emitter;
+            this.model = model;
+            this.objectMapper = objectMapper;
+        }
+
+        /**
+         * 发送开始标记
+         */
+        public void sendStartMarker() {
+            try {
+                String startMarker = "```nwla-system-message\n";
+                sendReasoningContent(startMarker);
+                accumulatedContent.append(startMarker);
+                startMarkerLength = startMarker.length();
+                lastSentLength = accumulatedContent.length();
+                startMarkerSent = true;
+            } catch (Exception e) {
+                log.warn("发送开始标记时出错: {}", e.getMessage());
+            }
+        }
+
+        /**
+         * 发送结束标记
+         */
+        public void sendEndMarker() {
+            try {
+                // 先发送换行（如果最后一条消息后面没有换行）
+                String newline = "\n";
+                sendReasoningContent(newline);
+                // 然后发送结束标记
+                String endMarker = "```\n";
+                sendReasoningContent(endMarker);
+            } catch (Exception e) {
+                log.warn("发送结束标记时出错: {}", e.getMessage());
+            }
+        }
+
+        /**
+         * 添加进度消息（累积并实时发送增量）
+         */
+        public void addProgress(String message) {
+            if (startMarkerSent) {
+                // 添加换行（如果已有内容，即除了开始标记外还有其他内容）
+                if (accumulatedContent.length() > startMarkerLength) {
+                    accumulatedContent.append("\n");
+                }
+                accumulatedContent.append(message);
+                // 实时发送增量内容
+                String newContent = accumulatedContent.substring(lastSentLength);
+                sendReasoningContent(newContent);
+                lastSentLength = accumulatedContent.length();
+            }
+        }
+
+        @Override
+        public void onProgress(String message) {
+            if (startMarkerSent) {
+                // 添加换行（如果已有内容，即除了开始标记外还有其他内容）
+                if (accumulatedContent.length() > startMarkerLength) {
+                    accumulatedContent.append("\n");
+                }
+                accumulatedContent.append(message);
+                // 实时发送增量内容
+                String newContent = accumulatedContent.substring(lastSentLength);
+                sendReasoningContent(newContent);
+                lastSentLength = accumulatedContent.length();
+            }
+        }
+
+        /**
+         * 发送思考内容（增量）
+         */
+        private void sendReasoningContent(String content) {
+            try {
+                String thinkingId = UUID.randomUUID().toString();
+                ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
+                        .delta(ChatCompletionResponse.Delta.builder()
+                                .reasoningContent(content)
+                                .build())
+                        .index(0).build();
+                ChatCompletionResponse response = ChatCompletionResponse.builder()
+                        .id(thinkingId).object("chat.completion.chunk")
+                        .created(System.currentTimeMillis() / 1000)
+                        .model(model).choices(List.of(choice)).build();
+                MediaType jsonUtf8 = new MediaType("application", "json", StandardCharsets.UTF_8);
+                emitter.send(SseEmitter.event().data(
+                        objectMapper.writeValueAsString(response),
+                        jsonUtf8));
+            } catch (Exception e) {
+                log.warn("发送思考内容时出错: {}", e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * 发送指令执行结果
+     */
+    private void sendCommandResult(SseEmitter emitter, String model, String message, boolean success) {
+        try {
+            String id = UUID.randomUUID().toString();
+            ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
+                    .delta(ChatCompletionResponse.Delta.builder().content(message).build())
+                    .index(0).build();
+            ChatCompletionResponse response = ChatCompletionResponse.builder()
+                    .id(id).object("chat.completion.chunk")
+                    .created(System.currentTimeMillis() / 1000)
+                    .model(model).choices(List.of(choice)).build();
+            emitter.send(SseEmitter.event().data(
+                    objectMapper.writeValueAsString(response),
+                    APPLICATION_JSON_UTF8));
+
+            // 发送完成标记
+            emitter.send(SseEmitter.event().data("[DONE]", MediaType.TEXT_PLAIN));
+            emitter.complete();
+        } catch (Exception e) {
+            log.error("发送指令结果时出错", e);
+            emitter.completeWithError(e);
+        }
+    }
+
+    /**
+     * 发送指令执行结果（包含 conversationId）
+     */
+    private void sendCommandResultWithConversationId(SseEmitter emitter, String model, String message, String conversationId) {
+        try {
+            String id = UUID.randomUUID().toString();
+            // 先发送结果消息
+            ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
+                    .delta(ChatCompletionResponse.Delta.builder().content(message).build())
+                    .index(0).build();
+            ChatCompletionResponse response = ChatCompletionResponse.builder()
+                    .id(id).object("chat.completion.chunk")
+                    .created(System.currentTimeMillis() / 1000)
+                    .model(model).choices(List.of(choice)).build();
+            emitter.send(SseEmitter.event().data(
+                    objectMapper.writeValueAsString(response),
+                    APPLICATION_JSON_UTF8));
+
+            // 发送 conversationId
+            sendConversationId(emitter, UUID.randomUUID().toString(), conversationId, model);
+
+            // 发送完成标记
+            emitter.send(SseEmitter.event().data("[DONE]", MediaType.TEXT_PLAIN));
+            emitter.complete();
+        } catch (Exception e) {
+            log.error("发送指令结果时出错", e);
+            emitter.completeWithError(e);
+        }
+    }
+
+    /**
+     * 发送系统错误消息
+     */
+    private void sendSystemError(SseEmitter emitter, String model, String errorMessage) {
+        try {
+            String id = UUID.randomUUID().toString();
+            String content = "```nwla-system-message\n" + errorMessage + "\n```";
+            ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
+                    .delta(ChatCompletionResponse.Delta.builder().content(content).build())
+                    .index(0).build();
+            ChatCompletionResponse response = ChatCompletionResponse.builder()
+                    .id(id).object("chat.completion.chunk")
+                    .created(System.currentTimeMillis() / 1000)
+                    .model(model).choices(List.of(choice)).build();
+            emitter.send(SseEmitter.event().data(
+                    objectMapper.writeValueAsString(response),
+                    APPLICATION_JSON_UTF8));
+
+            // 发送完成标记
+            emitter.send(SseEmitter.event().data("[DONE]", MediaType.TEXT_PLAIN));
+            emitter.complete();
+        } catch (Exception e) {
+            log.error("发送系统错误时出错", e);
+            emitter.completeWithError(e);
+        }
+    }
+
+    /**
+     * 处理内置指令（如添加附件）- 用于普通对话中的指令
+     *
+     * @param page    页面对象
+     * @param request 聊天请求
+     */
+    private void processCommands(Page page, ChatCompletionRequest request) {
+        try {
+            // 获取用户消息
+            String userMessage = request.getMessages().stream()
+                    .filter(m -> "user".equals(m.getRole()))
+                    .reduce((first, second) -> second)
+                    .map(ChatCompletionRequest.Message::getContent)
+                    .orElse(null);
+
+            if (userMessage == null || userMessage.trim().isEmpty()) {
+                return;
+            }
+
+            // 解析指令
+            CommandParser.ParseResult parseResult = CommandParser.parse(userMessage);
+
+            if (!parseResult.hasCommands()) {
+                return;
+            }
+
+            log.info("检测到 {} 个内置指令（作为附件添加）", parseResult.getCommands().size());
+
+            // 执行所有指令（不发送进度）
+            for (Command command : parseResult.getCommands()) {
+                try {
+                    log.info("执行指令: {}", command.getName());
+                    boolean success = command.execute(page, null);
+                    if (success) {
+                        log.info("指令执行成功: {}", command.getName());
+                        // 等待附件上传完成
+                        page.waitForTimeout(1000);
+                    } else {
+                        log.warn("指令执行失败: {}", command.getName());
+                    }
+                } catch (Exception e) {
+                    log.error("执行指令时出错: {}", command.getName(), e);
+                }
+            }
+
+            // 更新请求消息为清理后的消息（移除指令部分）
+            if (!parseResult.getCleanedMessage().equals(userMessage)) {
+                // 更新最后一个用户消息的内容
+                request.getMessages().stream()
+                        .filter(m -> "user".equals(m.getRole()))
+                        .reduce((first, second) -> second)
+                        .ifPresent(m -> m.setContent(parseResult.getCleanedMessage()));
+
+                log.info("已更新消息内容（移除指令）: 原始长度={}, 新长度={}",
+                        userMessage.length(), parseResult.getCleanedMessage().length());
+            }
+
+        } catch (Exception e) {
+            log.error("处理指令时出错: {}", e.getMessage(), e);
+            // 不抛出异常，继续执行消息发送
+        }
+    }
+
     private void sendMessage(Page page, ChatCompletionRequest request) {
         try {
             page.waitForTimeout(1000);
@@ -355,15 +886,20 @@ public class GeminiProvider implements LLMProvider {
                     .or(page.locator("textarea[placeholder*='输入']"))
                     .or(page.locator("textarea[placeholder*='Enter a prompt']"))
                     .or(page.locator("textarea[aria-label*='prompt']"));
-            
+
             inputBox.waitFor();
-            
+
             String message = request.getMessages().stream()
                     .filter(m -> "user".equals(m.getRole()))
                     .reduce((first, second) -> second)
                     .map(ChatCompletionRequest.Message::getContent)
                     .orElse("Hello");
-            
+
+            // 如果消息为空，使用默认消息
+            if (message == null || message.trim().isEmpty()) {
+                message = "Hello";
+            }
+
             log.info("发送消息: {}", message);
             // 直接 fill 然后按 Enter
             if (inputBox.count() > 0) {
@@ -380,7 +916,7 @@ public class GeminiProvider implements LLMProvider {
             throw new RuntimeException("发送消息失败", e);
         }
     }
-    
+
     private int countMessages(Page page) {
         // 使用 model-response message-content 作为响应选择器
         Locator locators = page.locator("model-response message-content")
@@ -388,18 +924,23 @@ public class GeminiProvider implements LLMProvider {
                 .or(page.locator("[data-author='model']"));
         return locators.count();
     }
-    
+
     private void cleanupPageOnError(Page page, String model) {
         if (page != null) {
             modelPages.remove(model, page);
-            try { if (!page.isClosed()) page.close(); } catch (Exception e) { }
+            // 从 conversationPages 中移除（如果存在）
+            conversationPages.entrySet().removeIf(entry -> entry.getValue() == page);
+            try {
+                if (!page.isClosed()) page.close();
+            } catch (Exception e) {
+            }
         }
     }
-    
+
     // ==================== SSE 发送 ====================
-    
+
     private static final MediaType APPLICATION_JSON_UTF8 = new MediaType("application", "json", StandardCharsets.UTF_8);
-    
+
     private void sendSseChunk(SseEmitter emitter, String id, String content, String model) throws IOException {
         ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
                 .delta(ChatCompletionResponse.Delta.builder().content(content).build())
@@ -410,7 +951,7 @@ public class GeminiProvider implements LLMProvider {
                 .model(model).choices(List.of(choice)).build();
         emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(response), APPLICATION_JSON_UTF8));
     }
-    
+
     private void sendThinkingContent(SseEmitter emitter, String id, String content, String model) throws IOException {
         ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
                 .delta(ChatCompletionResponse.Delta.builder().reasoningContent(content).build())
@@ -421,7 +962,7 @@ public class GeminiProvider implements LLMProvider {
                 .model(model).choices(List.of(choice)).build();
         emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(response), APPLICATION_JSON_UTF8));
     }
-    
+
     private void sendUrlAndComplete(Page page, SseEmitter emitter, ChatCompletionRequest request) throws IOException {
         try {
             if (!page.isClosed()) {
@@ -443,7 +984,7 @@ public class GeminiProvider implements LLMProvider {
         emitter.send(SseEmitter.event().data("[DONE]", MediaType.TEXT_PLAIN));
         emitter.complete();
     }
-    
+
     private void sendConversationId(SseEmitter emitter, String id, String conversationId, String model) throws IOException {
         String content = "\n\n```nwla-conversation-id\n" + conversationId + "\n```\n\n";
         ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
@@ -455,14 +996,14 @@ public class GeminiProvider implements LLMProvider {
                 .model(model).choices(List.of(choice)).build();
         emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(response), APPLICATION_JSON_UTF8));
     }
-    
+
     // ==================== 对话 ID 提取 ====================
-    
+
     private String extractConversationIdFromUrl(String url) {
         if (url == null || (!url.contains("gemini.google.com") && !url.contains("ai.google.dev"))) {
             return null;
         }
-        
+
         try {
             // Gemini URL 格式: https://gemini.google.com/app/{conversationId}
             int appIdx = url.indexOf("/app/");
@@ -473,13 +1014,13 @@ public class GeminiProvider implements LLMProvider {
                 int endIdx = afterApp.length();
                 if (queryIdx >= 0) endIdx = Math.min(endIdx, queryIdx);
                 if (fragmentIdx >= 0) endIdx = Math.min(endIdx, fragmentIdx);
-                
+
                 String id = afterApp.substring(0, endIdx).trim();
                 if (!id.isEmpty()) {
                     return id;
                 }
             }
-            
+
             // 兼容旧格式: https://gemini.google.com/chat/{id}
             int chatIdx = url.indexOf("/chat/");
             if (chatIdx >= 0) {
@@ -489,7 +1030,7 @@ public class GeminiProvider implements LLMProvider {
                 int endIdx = afterChat.length();
                 if (queryIdx >= 0) endIdx = Math.min(endIdx, queryIdx);
                 if (fragmentIdx >= 0) endIdx = Math.min(endIdx, fragmentIdx);
-                
+
                 String id = afterChat.substring(0, endIdx).trim();
                 if (!id.isEmpty()) {
                     return id;
@@ -498,10 +1039,10 @@ public class GeminiProvider implements LLMProvider {
         } catch (Exception e) {
             log.warn("从 URL 提取对话 ID 失败: url={}, error={}", url, e.getMessage());
         }
-        
+
         return null;
     }
-    
+
     private String buildUrlFromConversationId(String conversationId) {
         if (conversationId == null || conversationId.isEmpty()) {
             return null;
@@ -509,7 +1050,7 @@ public class GeminiProvider implements LLMProvider {
         // 使用 /app/ 路径格式
         return "https://gemini.google.com/app/" + conversationId;
     }
-    
+
     /**
      * 发送手动登录提示
      * 引导用户在浏览器中手动完成登录
@@ -525,13 +1066,13 @@ public class GeminiProvider implements LLMProvider {
             message.append("3. 登录完成后，请重新发送消息\n\n");
             message.append("注意：登录需要在浏览器界面中手动完成，系统无法自动登录。");
             message.append("\n```");
-            
+
             if (conversationId != null && !conversationId.isEmpty()) {
                 message.append("\n\n```nwla-conversation-id\n");
                 message.append(conversationId);
                 message.append("\n```");
             }
-            
+
             String id = UUID.randomUUID().toString();
             ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
                     .delta(ChatCompletionResponse.Delta.builder().content(message.toString()).build())
@@ -540,11 +1081,11 @@ public class GeminiProvider implements LLMProvider {
                     .id(id).object("chat.completion.chunk")
                     .created(System.currentTimeMillis() / 1000)
                     .model(model).choices(List.of(choice)).build();
-            
+
             emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(response), APPLICATION_JSON_UTF8));
             emitter.send(SseEmitter.event().data("[DONE]", MediaType.TEXT_PLAIN));
             emitter.complete();
-            
+
             // 释放锁
             if (providerName != null) {
                 new Thread(() -> {
@@ -568,15 +1109,26 @@ public class GeminiProvider implements LLMProvider {
             }
         }
     }
-    
-    
+
+
     @PreDestroy
     public void cleanup() {
-        log.info("清理页面，共 {} 个", modelPages.size());
+        log.info("清理页面，modelPages: {}, conversationPages: {}", 
+            modelPages.size(), conversationPages.size());
         modelPages.values().forEach(page -> {
-            try { if (page != null && !page.isClosed()) page.close(); } catch (Exception e) { }
+            try {
+                if (page != null && !page.isClosed()) page.close();
+            } catch (Exception e) {
+            }
+        });
+        conversationPages.values().forEach(page -> {
+            try {
+                if (page != null && !page.isClosed()) page.close();
+            } catch (Exception e) {
+            }
         });
         modelPages.clear();
+        conversationPages.clear();
     }
 }
 
