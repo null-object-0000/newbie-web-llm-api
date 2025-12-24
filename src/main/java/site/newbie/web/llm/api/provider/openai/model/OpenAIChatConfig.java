@@ -274,14 +274,12 @@ public class OpenAIChatConfig implements OpenAIModelConfig {
         for (int i = currentCount - 1; i >= messageCountBefore; i--) {
             try {
                 Locator locator = allResponseLocators.nth(i);
-                Boolean isInThinking = (Boolean) locator.evaluate("""
-                    el => {
-                        const reasoningContent = el.closest('[class*="reasoning"], [class*="thinking"]');
-                        return reasoningContent !== null;
-                    }
-                """);
+                // 使用 Playwright locator 检查父元素是否包含 reasoning 或 thinking 类
+                // 如果找不到包含这些类的父元素，说明不是思考内容
+                Locator thinkingParent = locator.locator("xpath=ancestor::*[contains(@class, 'reasoning') or contains(@class, 'thinking')]");
+                boolean isInThinking = thinkingParent.count() > 0;
                 
-                if (isInThinking == null || !isInThinking) {
+                if (!isInThinking) {
                     return locator.innerText();
                 }
             } catch (Exception e) {

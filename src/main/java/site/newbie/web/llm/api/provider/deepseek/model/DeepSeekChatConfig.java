@@ -58,26 +58,32 @@ public class DeepSeekChatConfig implements DeepSeekModelConfig {
                         log.info("深度思考模式已关闭");
                     }
                 } catch (Exception e) {
-                    page.evaluate("""
-                        () => {
-                            const buttons = document.querySelectorAll('button, div[role="button"]');
-                            for (const btn of buttons) {
-                                const text = btn.textContent || '';
-                                if (text.includes('深度思考') || text.includes('Thinking')) {
-                                    const isActive = btn.classList.contains('active') ||
-                                                   btn.classList.contains('selected') ||
-                                                   btn.classList.contains('ds-toggle-button--active') ||
-                                                   btn.classList.contains('ds-toggle-button-active') ||
-                                                   btn.getAttribute('aria-pressed') === 'true';
-                                    if (isActive) {
-                                        btn.click();
-                                        return true;
-                                    }
-                                }
+                    // Fallback: 尝试使用更宽泛的选择器查找按钮
+                    try {
+                        Locator fallbackButtons = page.locator("button:has-text('深度思考')")
+                                .or(page.locator("button:has-text('Thinking')"))
+                                .or(page.locator("div[role='button']:has-text('深度思考')"))
+                                .or(page.locator("div[role='button']:has-text('Thinking')"));
+                        
+                        if (fallbackButtons.count() > 0) {
+                            Locator button = fallbackButtons.first();
+                            String className = button.getAttribute("class");
+                            String ariaPressed = button.getAttribute("aria-pressed");
+                            boolean isActive = (className != null && 
+                                    (className.contains("active") || className.contains("selected") || 
+                                     className.contains("ds-toggle-button--active") ||
+                                     className.contains("ds-toggle-button-active"))) ||
+                                    "true".equals(ariaPressed);
+                            
+                            if (isActive) {
+                                button.click();
+                                page.waitForTimeout(300);
+                                log.info("已通过 fallback 方法关闭深度思考模式");
                             }
-                            return false;
                         }
-                    """);
+                    } catch (Exception e2) {
+                        log.debug("Fallback 方法也失败: {}", e2.getMessage());
+                    }
                 }
             }
         } catch (Exception e) {

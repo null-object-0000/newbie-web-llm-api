@@ -397,15 +397,8 @@ public class AttachDriveCommand implements Command {
                 progressCallback.onProgress("检测到已打开的弹窗，正在关闭...");
             }
             
-            // 方法1: 查找关闭按钮（X 按钮）
-            Locator closeButton = page.locator(".google-picker button[aria-label='关闭']")
-                    .or(page.locator(".google-picker button[aria-label='Close']"))
-                    .or(page.locator(".google-picker button[title='关闭']"))
-                    .or(page.locator(".google-picker button[title='Close']"))
-                    .or(page.locator(".google-picker button:has-text('×')"))
-                    .or(page.locator(".google-picker button:has-text('✕')"))
-                    .or(page.locator(".google-picker [role='button'][aria-label*='关闭']"))
-                    .or(page.locator(".google-picker [role='button'][aria-label*='Close']"));
+            // 查找关闭按钮（X 按钮）
+            Locator closeButton = page.locator(".google-picker button[aria-label=\"关闭“选择文件”选择器\"]");
             
             if (closeButton.count() > 0 && closeButton.first().isVisible()) {
                 try {
@@ -415,41 +408,6 @@ public class AttachDriveCommand implements Command {
                     return true;
                 } catch (Exception e) {
                     log.warn("点击关闭按钮失败: {}", e.getMessage());
-                }
-            }
-            
-            // 方法2: 按 ESC 键关闭
-            try {
-                page.keyboard().press("Escape");
-                page.waitForTimeout(500);
-                log.info("已按 ESC 键尝试关闭弹窗");
-                
-                // 检查是否已关闭
-                if (iframeElement.count() == 0 || !iframeElement.first().isVisible()) {
-                    return true;
-                }
-            } catch (Exception e) {
-                log.warn("按 ESC 键失败: {}", e.getMessage());
-            }
-            
-            // 方法3: 点击遮罩层外部区域（如果存在）
-            Locator overlay = page.locator(".google-picker")
-                    .or(page.locator("[class*='picker-overlay']"))
-                    .or(page.locator("[class*='dialog-overlay']"));
-            
-            if (overlay.count() > 0) {
-                try {
-                    // 点击遮罩层（点击外部区域可能会关闭弹窗）
-                    overlay.first().click();
-                    page.waitForTimeout(500);
-                    log.info("已点击遮罩层尝试关闭弹窗");
-                    
-                    // 检查是否已关闭
-                    if (iframeElement.count() == 0 || !iframeElement.first().isVisible()) {
-                        return true;
-                    }
-                } catch (Exception e) {
-                    log.warn("点击遮罩层失败: {}", e.getMessage());
                 }
             }
             

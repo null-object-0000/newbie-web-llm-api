@@ -96,15 +96,8 @@ public class GeminiChatConfig implements GeminiModelConfig {
                         // 检查动画元素：如果存在未完成的动画，说明还在生成中
                         boolean animationActive = false;
                         try {
-                            Object animationResult = page.evaluate("""
-                                () => {
-                                    const elements = document.querySelectorAll('div.avatar div.avatar_primary_animation:not([data-test-lottie-animation-status="completed"])');
-                                    return elements.length > 0;
-                                }
-                            """);
-                            if (animationResult instanceof Boolean) {
-                                animationActive = (Boolean) animationResult;
-                            }
+                            Locator animationLocator = page.locator("div.avatar div.avatar_primary_animation:not([data-test-lottie-animation-status='completed'])");
+                            animationActive = animationLocator.count() > 0;
                         } catch (Exception e) {
                             log.debug("检查动画状态时出错: {}", e.getMessage());
                         }
@@ -280,23 +273,16 @@ public class GeminiChatConfig implements GeminiModelConfig {
                     log.error("DOM 查询时出错: {}", e.getMessage());
                 }
 
-                // 检测响应是否完成
-                if (!responseFinished) {
-                    // 检查动画元素：如果存在未完成的动画，说明还在生成中
-                    boolean animationActive = false;
-                    try {
-                        Object animationResult = page.evaluate("""
-                            () => {
-                                const elements = document.querySelectorAll('div.avatar div.avatar_primary_animation:not([data-test-lottie-animation-status="completed"])');
-                                return elements.length > 0;
-                            }
-                        """);
-                        if (animationResult instanceof Boolean) {
-                            animationActive = (Boolean) animationResult;
+                    // 检测响应是否完成
+                    if (!responseFinished) {
+                        // 检查动画元素：如果存在未完成的动画，说明还在生成中
+                        boolean animationActive = false;
+                        try {
+                            Locator animationLocator = page.locator("div.avatar div.avatar_primary_animation:not([data-test-lottie-animation-status='completed'])");
+                            animationActive = animationLocator.count() > 0;
+                        } catch (Exception e) {
+                            log.debug("检查动画状态时出错: {}", e.getMessage());
                         }
-                    } catch (Exception e) {
-                        log.debug("检查动画状态时出错: {}", e.getMessage());
-                    }
                     
                     // 如果动画还在进行，说明还在生成，继续等待
                     if (animationActive) {
@@ -337,16 +323,8 @@ public class GeminiChatConfig implements GeminiModelConfig {
                         Thread.sleep(500);
                         // 再次确认动画状态和发送按钮
                         try {
-                            Object animationResult2 = page.evaluate("""
-                                () => {
-                                    const elements = document.querySelectorAll('div.avatar div.avatar_primary_animation:not([data-test-lottie-animation-status="completed"])');
-                                    return elements.length > 0;
-                                }
-                            """);
-                            boolean animationActive2 = false;
-                            if (animationResult2 instanceof Boolean) {
-                                animationActive2 = (Boolean) animationResult2;
-                            }
+                            Locator animationLocator2 = page.locator("div.avatar div.avatar_primary_animation:not([data-test-lottie-animation-status='completed'])");
+                            boolean animationActive2 = animationLocator2.count() > 0;
                             
                             thinkingVisible = page.locator(thinkingSelector).all().stream().anyMatch(Locator::isVisible);
                             sendButtonVisible = page.locator("input-container button.send-button:not(.stop)").count() > 0 
@@ -545,20 +523,14 @@ public class GeminiChatConfig implements GeminiModelConfig {
      */
     private boolean isThoughtsExpanded(Page page) {
         try {
-            // 使用 JavaScript 检查最新的 model-thoughts structured-content-container 是否存在
-            Object result = page.evaluate("""
-                () => {
-                    const elements = document.querySelectorAll('model-thoughts structured-content-container');
-                    if (elements.length === 0) {
-                        return false;
-                    }
-                    // 检查最后一个元素（最新的思考内容）是否可见
-                    const latestElement = elements[elements.length - 1];
-                    const style = window.getComputedStyle(latestElement);
-                    return style.display !== 'none' && style.visibility !== 'hidden';
-                }
-            """);
-            return result != null && Boolean.TRUE.equals(result);
+            // 使用 Playwright locator 检查最新的 model-thoughts structured-content-container 是否可见
+            Locator thoughtsElements = page.locator("model-thoughts structured-content-container");
+            int count = thoughtsElements.count();
+            if (count == 0) {
+                return false;
+            }
+            // 检查最后一个元素（最新的思考内容）是否可见
+            return thoughtsElements.nth(count - 1).isVisible();
         } catch (Exception e) {
             log.debug("检查思考内容是否展开时出错: {}", e.getMessage());
             return false;
@@ -659,69 +631,17 @@ public class GeminiChatConfig implements GeminiModelConfig {
                 return null;
             }
             
-            // 使用 JavaScript 直接查询 model-thoughts structured-content-container
-            String thinkingText = (String) page.evaluate("""
-                () => {
-                    // 查找所有 model-thoughts structured-content-container 元素
-                    const elements = document.querySelectorAll('model-thoughts structured-content-container');
-                    if (elements.length === 0) {
-                        return null;
-                    }
-                    
-                    // 获取最后一个元素（通常是最新的回复）
-                    const latestElement = elements[elements.length - 1];
-                    
-                    // 提取所有文本内容，包括子元素
-                    function extractText(node) {
-                        if (node.nodeType === Node.TEXT_NODE) {
-                            return node.textContent || '';
-                        }
-                        
-                        if (node.nodeType !== Node.ELEMENT_NODE) {
-                            return '';
-                        }
-                        
-                        // 跳过按钮、脚本等交互元素
-                        const tagName = node.tagName?.toLowerCase();
-                        if (tagName === 'button' || tagName === 'script' || tagName === 'style' || 
-                            tagName === 'svg' || tagName === 'path') {
-                            return '';
-                        }
-                        
-                        // 跳过隐藏元素
-                        const style = window.getComputedStyle(node);
-                        if (style.display === 'none' || style.visibility === 'hidden') {
-                            return '';
-                        }
-                        
-                        // 递归提取子节点文本
-                        const children = Array.from(node.childNodes);
-                        return children.map(extractText).join('');
-                    }
-                    
-                    const text = extractText(latestElement).trim();
+            // 使用 Playwright Locator 直接提取文本内容
+            Locator thoughtsElements = page.locator("model-thoughts structured-content-container");
+            int count = thoughtsElements.count();
+            if (count > 0) {
+                Locator latestThoughts = thoughtsElements.nth(count - 1);
+                // 使用 innerText() 自动过滤隐藏元素和脚本标签
+                String innerText = latestThoughts.innerText();
+                if (innerText != null && !innerText.trim().isEmpty()) {
                     // 移除多余的空白字符
-                    return text.replace(/\\s+/g, ' ').trim();
+                    return innerText.trim().replaceAll("\\s+", " ");
                 }
-            """);
-            
-            if (thinkingText != null && !thinkingText.isEmpty()) {
-                return thinkingText;
-            }
-            
-            // 如果 JavaScript 提取失败，尝试使用 Playwright Locator
-            try {
-                Locator thoughtsElements = page.locator("model-thoughts structured-content-container");
-                int count = thoughtsElements.count();
-                if (count > 0) {
-                    Locator latestThoughts = thoughtsElements.nth(count - 1);
-                    String innerText = latestThoughts.innerText();
-                    if (innerText != null && !innerText.trim().isEmpty()) {
-                        return innerText.trim();
-                    }
-                }
-            } catch (Exception e) {
-                log.debug("使用 Locator 提取思考内容失败: {}", e.getMessage());
             }
         } catch (Exception e) {
             log.debug("查找思考内容时出错: {}", e.getMessage());

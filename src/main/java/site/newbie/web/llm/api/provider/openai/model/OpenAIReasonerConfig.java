@@ -96,52 +96,44 @@ public class OpenAIReasonerConfig implements OpenAIModelConfig {
                         log.error("Locator 方法失败: {}", e.getMessage());
                     }
                     
-                    // JavaScript 备选方案
+                    // Playwright 备选方案
                     if (!thinkingEnabled) {
                         try {
-                            String result = (String) page.evaluate("""
-                                () => {
-                                    // 检查是否已激活
-                                    const footerActions = document.querySelector('[data-testid="composer-footer-actions"]');
-                                    if (footerActions && footerActions.querySelector('button[aria-label*="思考"]')) {
-                                        return 'already-active';
-                                    }
-                                    
-                                    // 点击加号按钮
-                                    const plusBtn = document.querySelector('button[data-testid="composer-plus-btn"]');
-                                    if (!plusBtn) return 'plus-not-found';
-                                    plusBtn.click();
-                                    return 'clicked-plus';
-                                }
-                            """);
-                            
-                            if ("already-active".equals(result)) {
-                                thinkingEnabled = true;
-                            } else if ("clicked-plus".equals(result)) {
-                                page.waitForTimeout(500);
-                                
-                                String menuResult = (String) page.evaluate("""
-                                    () => {
-                                        const menuItems = document.querySelectorAll('div[role="menuitemradio"]');
-                                        for (const item of menuItems) {
-                                            if (item.textContent.includes('思考') && 
-                                                !item.textContent.includes('深度研究')) {
-                                                item.click();
-                                                return 'clicked';
-                                            }
-                                        }
-                                        return 'not-found';
-                                    }
-                                """);
-                                
-                                if ("clicked".equals(menuResult)) {
-                                    page.waitForTimeout(800);
+                            // 检查是否已激活
+                            Locator footerActions = page.locator("[data-testid='composer-footer-actions']");
+                            if (footerActions.count() > 0) {
+                                Locator thinkingButton = footerActions.locator("button[aria-label*='思考']");
+                                if (thinkingButton.count() > 0 && thinkingButton.isVisible()) {
                                     thinkingEnabled = true;
-                                    log.info("通过 JavaScript 启用深度思考模式");
+                                    log.info("深度思考模式已激活");
+                                }
+                            }
+                            
+                            // 如果未激活，尝试点击加号按钮
+                            if (!thinkingEnabled) {
+                                Locator plusButton = page.locator("button[data-testid='composer-plus-btn']");
+                                if (plusButton.count() > 0 && plusButton.isVisible()) {
+                                    plusButton.click();
+                                    page.waitForTimeout(500);
+                                    
+                                    // 选择"思考"选项（排除"深度研究"）
+                                    Locator allMenuItems = page.locator("div[role='menuitemradio']");
+                                    int menuItemCount = allMenuItems.count();
+                                    for (int i = 0; i < menuItemCount; i++) {
+                                        Locator item = allMenuItems.nth(i);
+                                        String text = item.textContent();
+                                        if (text != null && text.contains("思考") && !text.contains("深度研究")) {
+                                            item.click();
+                                            page.waitForTimeout(800);
+                                            thinkingEnabled = true;
+                                            log.info("通过 Playwright 备选方案启用深度思考模式");
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         } catch (Exception e) {
-                            log.error("JavaScript 方法失败: {}", e.getMessage());
+                            log.error("Playwright 备选方案失败: {}", e.getMessage());
                         }
                     }
                 }
