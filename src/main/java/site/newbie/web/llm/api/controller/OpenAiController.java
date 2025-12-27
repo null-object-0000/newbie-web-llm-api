@@ -2,6 +2,7 @@ package site.newbie.web.llm.api.controller;
 
 import com.microsoft.playwright.Page;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -16,8 +17,11 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import site.newbie.web.llm.api.manager.BrowserManager;
 import site.newbie.web.llm.api.model.ChatCompletionRequest;
 import site.newbie.web.llm.api.model.ChatCompletionResponse;
+import site.newbie.web.llm.api.model.ImageGenerationRequest;
+import site.newbie.web.llm.api.model.ImageGenerationResponse;
 import site.newbie.web.llm.api.model.ModelResponse;
 import site.newbie.web.llm.api.provider.LLMProvider;
+import site.newbie.web.llm.api.provider.gemini.GeminiProvider;
 import site.newbie.web.llm.api.model.LoginInfo;
 import site.newbie.web.llm.api.manager.LoginSessionManager;
 import site.newbie.web.llm.api.provider.ProviderRegistry;
@@ -43,6 +47,12 @@ public class OpenAiController {
     private final BrowserManager browserManager;
     private final ObjectMapper objectMapper;
     private final LoginSessionManager loginSessionManager;
+    
+    @Value("${app.server.base-url:http://localhost:24753}")
+    private String serverBaseUrl;
+    
+    @Value("${app.browser.user-data-dir:./user-data}")
+    private String userDataDir;
 
     public OpenAiController(ProviderRegistry providerRegistry, BrowserManager browserManager, 
                            ObjectMapper objectMapper, LoginSessionManager loginSessionManager) {
@@ -919,6 +929,155 @@ public class OpenAiController {
     @GetMapping("/models")
     public ResponseEntity<ModelResponse> getModels() {
         return ResponseEntity.ok(providerRegistry.getOpenAIModels());
+    }
+    
+    /**
+     * 图片生成 API（OpenAI 兼容）
+     * POST /v1/images/generations
+     */
+    @PostMapping(value = "/images/generations", produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<ImageGenerationResponse> generateImage(@RequestBody ImageGenerationRequest request) {
+        try {
+            log.info("收到图片生成请求: prompt={}, model={}, response_format={}, n={}", 
+                    request != null ? (request.getPrompt() != null ? request.getPrompt().substring(0, Math.min(50, request.getPrompt().length())) : "null") : "null",
+                    request != null ? request.getModel() : "null",
+                    request != null ? request.getResponseFormat() : "null",
+                    request != null ? request.getN() : "null");
+            
+            // 参数校验
+            if (request == null || request.getPrompt() == null || request.getPrompt().trim().isEmpty()) {
+                log.warn("图片生成请求参数错误: prompt 为空");
+                throw new IllegalArgumentException("Prompt is required");
+            }
+            
+            // 获取 Gemini Provider
+            LLMProvider geminiProvider = providerRegistry.getProviderByModel("gemini-web-imagegen");
+            if (geminiProvider == null || !(geminiProvider instanceof GeminiProvider)) {
+                throw new IllegalArgumentException("Image generation model not available");
+            }
+            
+            GeminiProvider provider = (GeminiProvider) geminiProvider;
+            
+            // 确定响应格式（默认 b64_json，支持 url）
+            String responseFormat = request.getResponseFormat();
+            if (responseFormat == null || responseFormat.isEmpty()) {
+                responseFormat = "b64_json";
+            }
+            boolean returnBase64 = "b64_json".equals(responseFormat);
+            
+            // 生成图片（同步方法，返回文件名列表）
+            log.info("开始调用 generateImageSync，prompt: {}", request.getPrompt().substring(0, Math.min(50, request.getPrompt().length())));
+            List<String> imageFilenames = provider.generateImageSync(request.getPrompt(), request.getN());
+            log.info("generateImageSync 返回，文件名数量: {}", imageFilenames != null ? imageFilenames.size() : 0);
+            
+            if (imageFilenames == null || imageFilenames.isEmpty()) {
+                log.error("图片生成失败：返回的文件名列表为空");
+                throw new RuntimeException("Failed to generate image");
+            }
+            
+            log.info("成功生成图片，文件名: {}", imageFilenames);
+            
+            // 构建响应数据
+            List<ImageGenerationResponse.ImageData> imageDataList = new java.util.ArrayList<>();
+            
+            for (String filename : imageFilenames) {
+                ImageGenerationResponse.ImageData.ImageDataBuilder builder = ImageGenerationResponse.ImageData.builder();
+                
+                if (returnBase64) {
+                    // 读取图片文件并转换为 base64
+                    String base64Image = readImageAsBase64(filename);
+                    if (base64Image != null) {
+                        builder.b64Json(base64Image);
+                    } else {
+                        // 如果读取失败，降级到 URL
+                        String imageUrl = buildImageUrl(filename);
+                        builder.url(imageUrl);
+                    }
+                } else {
+                    // 返回 URL
+                    String imageUrl = buildImageUrl(filename);
+                    builder.url(imageUrl);
+                }
+                
+                // 添加修订后的提示词（与原始提示词相同，因为 Gemini 不提供修订）
+                builder.revisedPrompt(request.getPrompt());
+                
+                imageDataList.add(builder.build());
+            }
+            
+            ImageGenerationResponse response = ImageGenerationResponse.builder()
+                    .created(System.currentTimeMillis() / 1000)
+                    .data(imageDataList)
+                    .build();
+            
+            // 记录响应日志（用于调试）
+            try {
+                String responseJson = objectMapper.writeValueAsString(response);
+                log.debug("图片生成响应: {}", responseJson);
+            } catch (Exception e) {
+                log.warn("序列化响应失败: {}", e.getMessage());
+            }
+            
+            return ResponseEntity.ok(response);
+            
+        } catch (IllegalArgumentException e) {
+            log.error("图片生成请求参数错误: {}", e.getMessage());
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                    .body(ImageGenerationResponse.builder()
+                            .created(System.currentTimeMillis() / 1000)
+                            .data(List.of())
+                            .build());
+        } catch (Exception e) {
+            log.error("图片生成失败: {}", e.getMessage(), e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(ImageGenerationResponse.builder()
+                            .created(System.currentTimeMillis() / 1000)
+                            .data(List.of())
+                            .build());
+        }
+    }
+    
+    /**
+     * 构建图片 URL
+     */
+    private String buildImageUrl(String filename) {
+        String baseUrl = serverBaseUrl;
+        if (baseUrl != null && baseUrl.endsWith("/")) {
+            baseUrl = baseUrl.substring(0, baseUrl.length() - 1);
+        }
+        if (baseUrl == null || baseUrl.isEmpty()) {
+            baseUrl = "http://localhost:24753";
+        }
+        return baseUrl + "/api/images/" + filename;
+    }
+    
+    /**
+     * 读取图片文件并转换为 base64
+     */
+    private String readImageAsBase64(String filename) {
+        try {
+            String imagesSubdir = "gemini-images";
+            java.nio.file.Path imagePath = java.nio.file.Paths.get(userDataDir, imagesSubdir, filename);
+            java.io.File imageFile = imagePath.toFile();
+            
+            if (!imageFile.exists() || !imageFile.isFile()) {
+                log.warn("图片文件不存在: {}", imagePath.toAbsolutePath());
+                return null;
+            }
+            
+            // 读取文件
+            byte[] imageBytes = java.nio.file.Files.readAllBytes(imagePath);
+            
+            // 转换为 base64
+            String base64Image = java.util.Base64.getEncoder().encodeToString(imageBytes);
+            log.debug("成功读取图片并转换为 base64: {} ({} bytes)", filename, imageBytes.length);
+            
+            return base64Image;
+            
+        } catch (Exception e) {
+            log.error("读取图片文件失败: {}", e.getMessage(), e);
+            return null;
+        }
     }
 
     // 处理普通请求

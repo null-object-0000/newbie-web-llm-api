@@ -912,5 +912,193 @@ public class GeminiProvider implements LLMProvider {
         modelPages.clear();
         conversationPages.clear();
     }
+    
+    /**
+     * 同步生成图片（用于 OpenAI 兼容的图片生成 API）
+     * @param prompt 图片描述提示词
+     * @param n 生成图片数量
+     * @return 图片文件名列表（不是 URL）
+     */
+    public List<String> generateImageSync(String prompt, int n) {
+        List<String> imageUrls = new java.util.ArrayList<>();
+        // 创建一个自定义的 ResponseHandler 来收集图片文件名
+        final List<String> collectedFilenames = new java.util.ArrayList<>();
+        
+        // 创建请求
+        ChatCompletionRequest request = ChatCompletionRequest.builder()
+                .model("gemini-web-imagegen")
+                .messages(List.of(
+                        ChatCompletionRequest.Message.builder()
+                                .role("user")
+                                .content(prompt)
+                                .build()
+                ))
+                .stream(false)
+                .newConversation(true)
+                .build();
+        
+        // 使用 CountDownLatch 等待结果
+        java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicReference<List<String>> resultRef = new java.util.concurrent.atomic.AtomicReference<>();
+        
+        // 创建临时 SSE Emitter 来收集结果
+        SseEmitter emitter = new SseEmitter(300000L); // 5分钟超时
+        
+        emitter.onCompletion(() -> {
+            log.info("SSE emitter 完成回调被触发");
+            if (latch.getCount() > 0) {
+                latch.countDown();
+            }
+        });
+        
+        emitter.onError((ex) -> {
+            log.error("SSE emitter 错误回调被触发: {}", ex.getMessage());
+            if (latch.getCount() > 0) {
+                latch.countDown();
+            }
+        });
+        
+        // 创建一个自定义的 ResponseHandler 来收集图片文件名
+        ModelConfig.ResponseHandler imageHandler = new ModelConfig.ResponseHandler() {
+            @Override
+            public void sendChunk(SseEmitter emitter, String id, String content, String model) throws IOException {
+                // 从 Markdown 格式中提取图片 URL，然后提取文件名
+                // 格式: ![生成的图片](http://localhost:24753/api/images/xxx.jpg)
+                if (content != null && content.contains("![生成的图片](")) {
+                    int start = content.indexOf("![生成的图片](") + "![生成的图片](".length();
+                    int end = content.indexOf(")", start);
+                    if (end > start) {
+                        String imageUrl = content.substring(start, end);
+                        // 从 URL 中提取文件名
+                        // URL 格式: http://localhost:24753/api/images/gemini_xxx.jpg
+                        int lastSlash = imageUrl.lastIndexOf('/');
+                        if (lastSlash >= 0 && lastSlash < imageUrl.length() - 1) {
+                            String filename = imageUrl.substring(lastSlash + 1);
+                            collectedFilenames.add(filename);
+                            log.info("收集到图片文件名: {}", filename);
+                        } else {
+                            // 如果无法解析，尝试直接使用 URL（向后兼容）
+                            imageUrls.add(imageUrl);
+                            log.warn("无法从 URL 提取文件名，使用完整 URL: {}", imageUrl);
+                        }
+                    }
+                }
+            }
+            
+            @Override
+            public void sendThinking(SseEmitter emitter, String id, String content, String model) throws IOException {
+                // 忽略思考内容
+            }
+            
+            @Override
+            public void sendUrlAndComplete(Page page, SseEmitter emitter, ChatCompletionRequest request) throws IOException {
+                // 完成时关闭 emitter
+                emitter.complete();
+            }
+            
+            @Override
+            public String getSseData(Page page, String varName) {
+                return null;
+            }
+            
+            @Override
+            public ModelConfig.ParseResultWithIndex parseSseIncremental(String sseData, Map<Integer, String> fragmentTypeMap, Integer lastActiveFragmentIndex) {
+                return new ModelConfig.ParseResultWithIndex(new ModelConfig.SseParseResult(null, null, false), lastActiveFragmentIndex);
+            }
+            
+            @Override
+            public String extractTextFromSse(String sseData) {
+                return null;
+            }
+        };
+        
+        // 执行图片生成
+        executor.submit(() -> {
+            Page page = null;
+            try {
+                GeminiModelConfig config = modelConfigs.get("gemini-web-imagegen");
+                if (config == null) {
+                    throw new IllegalArgumentException("图片生成模型不可用");
+                }
+                
+                page = createNewConversationPage("gemini-web-imagegen");
+                if (page == null) {
+                    throw new RuntimeException("无法创建页面");
+                }
+                
+                // 检查登录状态
+                if (!checkLoginStatus(page)) {
+                    throw new RuntimeException("未登录，请先登录 Gemini");
+                }
+                
+                // 配置模型
+                config.configure(page);
+                
+                // 发送消息
+                sendMessage(page, request);
+                
+                int messageCountBefore = countMessages(page);
+                
+                // 使用自定义 handler 监控响应
+                GeminiContext context = new GeminiContext(
+                        page, emitter, request, messageCountBefore, MONITOR_MODE, imageHandler
+                );
+                
+                // monitorResponse 会调用 sendUrlAndComplete，这会完成 emitter
+                // 所以这里不需要再次调用 emitter.complete()
+                config.monitorResponse(context);
+                
+                log.debug("monitorResponse 已完成，已收集到 {} 个文件名", collectedFilenames.size());
+                
+            } catch (Exception e) {
+                log.error("图片生成失败", e);
+                try {
+                    emitter.completeWithError(e);
+                } catch (Exception ex) {
+                    // emitter 可能已经被完成，忽略
+                    log.debug("完成 emitter 时出错: {}", ex.getMessage());
+                }
+            } finally {
+                // 确保 latch 被触发（即使出错或 emitter 已完成）
+                // 因为 onCompletion 回调可能没有被触发，或者已经触发过了
+                if (latch.getCount() > 0) {
+                    log.info("在 finally 块中手动触发 latch（当前计数: {}，已收集文件名: {}）", latch.getCount(), collectedFilenames.size());
+                    latch.countDown();
+                } else {
+                    log.debug("latch 已经被触发");
+                }
+            }
+        });
+        
+        // 等待完成
+        log.info("等待图片生成完成（最多 300 秒），当前已收集文件名: {}", collectedFilenames.size());
+        try {
+            boolean completed = latch.await(300, java.util.concurrent.TimeUnit.SECONDS);
+            if (!completed) {
+                log.warn("图片生成等待超时，但可能已经收集到文件名: {}", collectedFilenames.size());
+            } else {
+                log.info("图片生成等待完成，已收集文件名: {}", collectedFilenames.size());
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.error("等待图片生成时被中断", e);
+        }
+        
+        // 优先使用收集到的文件名
+        List<String> result = collectedFilenames.isEmpty() ? imageUrls : collectedFilenames;
+        log.info("图片生成完成，返回 {} 个文件名: {}", result.size(), result);
+        
+        // 如果请求生成多张图片，但目前 Gemini 只支持一次生成一张
+        // 所以如果 n > 1，我们需要重复第一张图片
+        if (n > 1 && !result.isEmpty()) {
+            String first = result.get(0);
+            result.clear();
+            for (int i = 0; i < n; i++) {
+                result.add(first);
+            }
+        }
+        
+        return result;
+    }
 }
 

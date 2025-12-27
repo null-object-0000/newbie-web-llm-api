@@ -168,22 +168,6 @@ docker rm newbie-web-llm-api
 
 [Open WebUI](https://github.com/open-webui/open-webui) 是一个功能强大的开源 Web UI，完全兼容 OpenAI API。
 
-#### 安装 Open WebUI
-
-使用 Docker 快速启动：
-
-```bash
-docker run -d \
-  --name open-webui \
-  -p 3000:8080 \
-  -v open-webui:/app/backend/data \
-  --add-host=host.docker.internal:host-gateway \
-  -e OPENAI_API_BASE_URL=http://host.docker.internal:24753/v1 \
-  -e DEFAULT_MODEL=deepseek-web \
-  --restart always \
-  ghcr.io/open-webui/open-webui:main
-```
-
 #### 配置 Open WebUI
 
 1. 访问 `http://localhost:3000`
@@ -426,26 +410,6 @@ public class MyProvider extends BaseProvider implements LLMProvider {
 4. **对话 URL**：切换对话时会自动导航到保存的 URL，确保对话上下文正确
 5. **图片存储**：生成的图片会存储在 `user-data/gemini-images/` 目录，请确保有足够的磁盘空间
 6. **图片 URL**：图片 URL 基于 `app.server.base-url` 配置生成，部署到其他服务器时请修改此配置
-
-## 🐛 故障排除
-
-### 问题：前端无法连接后端
-
-- 检查后端是否正常运行
-- 确认端口号是否正确（默认 24753）
-- 检查浏览器控制台的错误信息
-
-### 问题：无法获取 AI 回复
-
-- 检查是否已登录 DeepSeek
-- 查看后端日志，确认 Playwright 是否正常工作
-- 检查网络连接
-
-### 问题：对话 URL 未保存
-
-- 检查浏览器控制台是否有错误
-- 确认 LocalStorage 是否可用
-- 查看后端日志，确认 URL 是否成功发送
 
 ## 📄 许可证
 
