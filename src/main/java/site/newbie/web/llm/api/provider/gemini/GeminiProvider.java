@@ -15,8 +15,11 @@ import site.newbie.web.llm.api.model.LoginInfo;
 import site.newbie.web.llm.api.provider.ModelConfig;
 import site.newbie.web.llm.api.provider.ProviderRegistry;
 import org.springframework.context.annotation.Lazy;
-import site.newbie.web.llm.api.provider.gemini.command.Command;
-import site.newbie.web.llm.api.provider.gemini.command.CommandParser;
+import site.newbie.web.llm.api.provider.command.Command;
+import site.newbie.web.llm.api.provider.command.CommandParser;
+import site.newbie.web.llm.api.provider.command.CommandHandler;
+import site.newbie.web.llm.api.provider.gemini.command.AttachDriveCommand;
+import site.newbie.web.llm.api.provider.gemini.command.AttachLocalFileCommand;
 import site.newbie.web.llm.api.provider.gemini.model.GeminiModelConfig;
 import site.newbie.web.llm.api.provider.gemini.model.GeminiModelConfig.GeminiContext;
 import site.newbie.web.llm.api.util.ConversationIdUtils;
@@ -46,6 +49,9 @@ public class GeminiProvider implements LLMProvider {
     private final Map<String, GeminiModelConfig> modelConfigs;
     private final ProviderRegistry providerRegistry;
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+    
+    // 全局指令解析器，支持全局指令和 Gemini 特定指令
+    private final CommandParser commandParser;
 
     private final ConcurrentHashMap<String, Page> modelPages = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, String> pageUrls = new ConcurrentHashMap<>();
@@ -97,7 +103,52 @@ public class GeminiProvider implements LLMProvider {
         this.providerRegistry = providerRegistry;
         this.modelConfigs = configs.stream()
                 .collect(Collectors.toMap(GeminiModelConfig::getModelName, Function.identity()));
+        
+        // 创建指令解析器，支持全局指令和 Gemini 特定指令
+        this.commandParser = new CommandParser(this::createProviderCommand);
+        
         log.info("GeminiProvider 初始化完成，支持的模型: {}", modelConfigs.keySet());
+    }
+    
+    @Override
+    public CommandParser getCommandParser() {
+        return commandParser;
+    }
+    
+    /**
+     * 创建 Gemini provider 特定指令
+     */
+    private Command createProviderCommand(String commandName, String param, String extra) {
+        commandName = commandName.toLowerCase();
+        
+        // 如果 param 为空，尝试从 extra 中提取
+        if (param == null && extra != null) {
+            String[] parts = extra.split("\\s+", 2);
+            if (parts.length > 0) {
+                param = parts[0];
+            }
+        }
+        
+        switch (commandName) {
+            case "attach-drive":
+            case "attach-google-drive":
+                if (param != null && !param.trim().isEmpty()) {
+                    return new AttachDriveCommand(param.trim());
+                }
+                log.warn("attach-drive 指令缺少文件名参数");
+                return null;
+                
+            case "attach-local":
+            case "attach-file":
+                if (param != null && !param.trim().isEmpty()) {
+                    return new AttachLocalFileCommand(param.trim());
+                }
+                log.warn("attach-local 指令缺少文件路径参数");
+                return null;
+                
+            default:
+                return null;
+        }
     }
 
     @Override
@@ -195,20 +246,7 @@ public class GeminiProvider implements LLMProvider {
                     throw new IllegalArgumentException("不支持的模型: " + model);
                 }
 
-                // 获取用户消息
-                String userMessage = request.getMessages().stream()
-                        .filter(m -> "user".equals(m.getRole()))
-                        .reduce((first, second) -> second)
-                        .map(ChatCompletionRequest.Message::getContent)
-                        .orElse(null);
-
-                // 检查是否是指令对话
-                if (userMessage != null && CommandParser.isCommandOnly(userMessage)) {
-                    // 指令对话：执行指令并返回结果
-                    handleCommandOnly(request, emitter);
-                    return;
-                }
-
+                // 注意：指令检查已在 Controller 层统一处理，这里只处理普通聊天请求
                 page = getOrCreatePage(request);
 
                 // 检查是否找到了页面（对于非新对话，必须找到对应的 tab）
@@ -266,7 +304,8 @@ public class GeminiProvider implements LLMProvider {
 
     // ==================== 页面管理 ====================
 
-    private Page getOrCreatePage(ChatCompletionRequest request) {
+    @Override
+    public Page getOrCreatePage(ChatCompletionRequest request) {
         String model = request.getModel();
         String conversationId = getConversationId(request);
         boolean isNew = isNewConversation(request);
@@ -352,7 +391,8 @@ public class GeminiProvider implements LLMProvider {
         }
     }
 
-    private String getConversationId(ChatCompletionRequest request) {
+    @Override
+    public String getConversationId(ChatCompletionRequest request) {
         String conversationId = request.getConversationId();
         if (conversationId != null && !conversationId.isEmpty()) {
             return conversationId;
@@ -364,7 +404,8 @@ public class GeminiProvider implements LLMProvider {
         return conversationId;
     }
 
-    private boolean isNewConversation(ChatCompletionRequest request) {
+    @Override
+    public boolean isNewConversation(ChatCompletionRequest request) {
         String conversationId = getConversationId(request);
         // command- 开头的临时 ID 不是新对话（应该复用 tab）
         // login- 开头的需要登录，视为新对话
@@ -440,323 +481,58 @@ public class GeminiProvider implements LLMProvider {
         }
     }
 
+    @Override
+    public CommandHandler.CommandSuccessCallback getCommandSuccessCallback() {
+        return this::handleCommandSuccess;
+    }
+    
     /**
-     * 处理纯指令对话（只包含指令，没有其他内容）
-     *
-     * @param request 聊天请求
-     * @param emitter SSE 发射器
+     * 处理指令执行成功后的逻辑（保存 conversationId 等）
+     * 这个方法会被 CommandHandler 调用
      */
-    private void handleCommandOnly(ChatCompletionRequest request, SseEmitter emitter) {
-        Page page = null;
+    private boolean handleCommandSuccess(Page page, String model, SseEmitter emitter, String finalMessage, boolean allSuccess) {
+        if (page == null || page.isClosed()) {
+            return false; // 没有页面，使用默认处理
+        }
+        
         try {
-            String model = request.getModel();
+            String url = page.url();
+            if (url.contains("gemini.google.com") || url.contains("ai.google.dev")) {
+                // 等待一下，看看 URL 是否会变化（可能页面还在加载中）
+                page.waitForTimeout(1000);
+                url = page.url(); // 重新获取 URL
+                
+                String conversationId = extractConversationIdFromUrl(url);
+                if (conversationId != null && !conversationId.isEmpty()) {
+                    // 保存 conversationId -> Page 的映射
+                    conversationPages.put(conversationId, page);
+                    pageUrls.put(model, url);
+                    modelPages.put(model, page);
+                    log.info("已保存指令执行后的 tab 关联: conversationId={}, url={}", conversationId, url);
 
-            // 获取用户消息
-            String userMessage = request.getMessages().stream()
-                    .filter(m -> "user".equals(m.getRole()))
-                    .reduce((first, second) -> second)
-                    .map(ChatCompletionRequest.Message::getContent)
-                    .orElse(null);
-
-            if (userMessage == null || userMessage.trim().isEmpty()) {
-                sendCommandResult(emitter, model, "❌ 未找到指令", false);
-                return;
-            }
-
-            // 解析指令
-            CommandParser.ParseResult parseResult = CommandParser.parse(userMessage);
-
-            if (!parseResult.hasCommands()) {
-                sendCommandResult(emitter, model, "❌ 未找到有效指令", false);
-                return;
-            }
-
-            log.info("检测到指令对话，包含 {} 个指令", parseResult.getCommands().size());
-
-            // 检查是否只有 help 指令（help 指令不需要页面和登录）
-            boolean onlyHelpCommand = parseResult.getCommands().size() == 1 && 
-                                     "help".equals(parseResult.getCommands().get(0).getName());
-            
-            // 检查是否只有 login 指令（login 指令需要页面但不需要登录检查）
-            boolean onlyLoginCommand = parseResult.getCommands().size() == 1 && 
-                                      "login".equals(parseResult.getCommands().get(0).getName());
-            
-            if (!onlyHelpCommand) {
-                // 需要页面来执行指令
-                page = getOrCreatePage(request);
-
-                // login 指令不需要检查登录状态（它本身就是用来登录的）
-                if (!onlyLoginCommand) {
-                    // 检查登录状态
-                    if (!checkLoginStatus(page)) {
-                        sendCommandResult(emitter, model, "❌ 未登录，请先登录", false);
-                        return;
-                    }
+                    // 发送 conversationId，让客户端知道这个标识
+                    sendCommandResultWithConversationId(emitter, model, finalMessage, conversationId);
+                    return true; // 已处理
+                } else {
+                    // 如果没有 conversationId，生成一个临时 ID（类似 login- 格式）
+                    String tempConversationId = "command-" + UUID.randomUUID().toString();
+                    conversationPages.put(tempConversationId, page);
+                    pageUrls.put(model, url);
+                    modelPages.put(model, page);
+                    log.info("已保存指令执行后的 tab 关联（使用临时 ID）: tempConversationId={}, url={}", tempConversationId, url);
+                    
+                    // 发送临时 conversationId，让客户端知道这个标识
+                    sendCommandResultWithConversationId(emitter, model, finalMessage, tempConversationId);
+                    return true; // 已处理
                 }
             }
-
-            // 创建进度回调（累积所有进度消息）
-            CommandProgressCallback progressCallback = new CommandProgressCallback(emitter, model, objectMapper);
-            
-            // 发送开始标记
-            progressCallback.sendStartMarker();
-
-            // 执行所有指令（带重试机制）
-            boolean allSuccess = true;
-            int maxRetries = 2; // 最多重试2次（总共执行3次）
-
-            for (int i = 0; i < parseResult.getCommands().size(); i++) {
-                site.newbie.web.llm.api.provider.gemini.command.Command command = parseResult.getCommands().get(i);
-
-                boolean commandSuccess = false;
-                int retryCount = 0;
-
-                while (retryCount <= maxRetries && !commandSuccess) {
-                    try {
-                        if (retryCount > 0) {
-                            log.info("重试执行指令 (尝试 {}/{}): {}", retryCount + 1, maxRetries + 1, command.getName());
-                            progressCallback.addProgress(String.format("重试中... (尝试 %d/%d)", retryCount + 1, maxRetries + 1));
-                            if (page != null) {
-                                page.waitForTimeout(1000); // 重试前等待
-                            }
-                        } else {
-                            log.info("执行指令: {}", command.getName());
-                        }
-
-                        boolean success = command.execute(page, progressCallback);
-
-                        if (success) {
-                            commandSuccess = true;
-                            progressCallback.addProgress("✅ 执行成功");
-                            // 等待附件上传完成（如果有页面）
-                            if (page != null) {
-                                page.waitForTimeout(1000);
-                            }
-                        } else {
-                            if (retryCount < maxRetries) {
-                                log.warn("指令执行失败，将重试 (尝试 {}/{}): {}", retryCount + 1, maxRetries + 1, command.getName());
-                                retryCount++;
-                            } else {
-                                log.error("指令执行失败，已重试 {} 次: {}", maxRetries, command.getName());
-                                progressCallback.addProgress("❌ 执行失败（已重试 " + maxRetries + " 次）");
-                                allSuccess = false;
-                                break;
-                            }
-                        }
-                    } catch (Exception e) {
-                        if (retryCount < maxRetries) {
-                            log.warn("执行指令时出错，将重试 (尝试 {}/{}): {}, error: {}",
-                                retryCount + 1, maxRetries + 1, command.getName(), e.getMessage());
-                            retryCount++;
-                            if (page != null) {
-                                page.waitForTimeout(1000); // 重试前等待
-                            }
-                        } else {
-                            log.error("执行指令时出错，已重试 {} 次: {}, error: {}", maxRetries, command.getName(), e.getMessage(), e);
-                            progressCallback.addProgress("❌ 执行出错（已重试 " + maxRetries + " 次）: " + e.getMessage());
-                            allSuccess = false;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // 发送结束标记
-            progressCallback.sendEndMarker();
-
-            // 发送最终结果（只显示成功或失败）
-            String finalMessage = allSuccess ? "✅ 指令执行成功" : "❌ 指令执行失败";
-
-            // 指令执行成功，保存页面和 conversationId 的关联（help 和 login 指令不需要保存）
-            if (allSuccess && !onlyHelpCommand && !onlyLoginCommand && page != null && !page.isClosed()) {
-                try {
-                    String url = page.url();
-                    if (url.contains("gemini.google.com") || url.contains("ai.google.dev")) {
-                        // 等待一下，看看 URL 是否会变化（可能页面还在加载中）
-                        page.waitForTimeout(1000);
-                        url = page.url(); // 重新获取 URL
-                        
-                        String conversationId = extractConversationIdFromUrl(url);
-                        if (conversationId != null && !conversationId.isEmpty()) {
-                            // 保存 conversationId -> Page 的映射
-                            conversationPages.put(conversationId, page);
-                            pageUrls.put(model, url);
-                            modelPages.put(model, page);
-                            log.info("已保存指令执行后的 tab 关联: conversationId={}, url={}", conversationId, url);
-
-                            // 发送 conversationId，让客户端知道这个标识
-                            sendCommandResultWithConversationId(emitter, model, finalMessage, conversationId);
-                        } else {
-                            // 如果没有 conversationId，生成一个临时 ID（类似 login- 格式）
-                            String tempConversationId = "command-" + UUID.randomUUID().toString();
-                            conversationPages.put(tempConversationId, page);
-                            pageUrls.put(model, url);
-                            modelPages.put(model, page);
-                            log.info("已保存指令执行后的 tab 关联（使用临时 ID）: tempConversationId={}, url={}", tempConversationId, url);
-                            
-                            // 发送临时 conversationId，让客户端知道这个标识
-                            sendCommandResultWithConversationId(emitter, model, finalMessage, tempConversationId);
-                        }
-                    } else {
-                        sendCommandResult(emitter, model, finalMessage, true);
-                    }
-                } catch (Exception e) {
-                    log.warn("保存 tab 关联时出错: {}", e.getMessage());
-                    sendCommandResult(emitter, model, finalMessage, true);
-                }
-            } else {
-                sendCommandResult(emitter, model, finalMessage, allSuccess);
-            }
-
-            // 指令执行成功，保留页面，不需要关闭页面，让用户可以继续使用这个 Tab
-
         } catch (Exception e) {
-            log.error("处理指令对话时出错", e);
-            try {
-                sendCommandResult(emitter, request.getModel(),
-                        "```nwla-system-message\n❌ 执行指令时出错: " + e.getMessage() + "\n```", false);
-            } catch (Exception ex) {
-                log.error("发送错误消息时出错", ex);
-            }
-            // 出错时才清理页面
-            cleanupPageOnError(page, request.getModel());
+            log.warn("保存 tab 关联时出错: {}", e.getMessage());
         }
+        
+        return false; // 未处理，使用默认处理
     }
 
-    /**
-     * 指令进度回调实现
-     * 累积进度消息，在开始和结束时发送标记
-     */
-    private static class CommandProgressCallback implements
-            site.newbie.web.llm.api.provider.gemini.command.Command.ProgressCallback {
-        private final SseEmitter emitter;
-        private final String model;
-        private final ObjectMapper objectMapper;
-        private final StringBuilder accumulatedContent = new StringBuilder();
-        private boolean startMarkerSent = false;
-        private int lastSentLength = 0;
-        private int startMarkerLength = 0;
-
-        public CommandProgressCallback(SseEmitter emitter, String model, ObjectMapper objectMapper) {
-            this.emitter = emitter;
-            this.model = model;
-            this.objectMapper = objectMapper;
-        }
-
-        /**
-         * 发送开始标记
-         */
-        public void sendStartMarker() {
-            try {
-                String startMarker = "```nwla-system-message\n";
-                sendReasoningContent(startMarker);
-                accumulatedContent.append(startMarker);
-                startMarkerLength = startMarker.length();
-                lastSentLength = accumulatedContent.length();
-                startMarkerSent = true;
-            } catch (Exception e) {
-                log.warn("发送开始标记时出错: {}", e.getMessage());
-            }
-        }
-
-        /**
-         * 发送结束标记
-         */
-        public void sendEndMarker() {
-            try {
-                // 先发送换行（如果最后一条消息后面没有换行）
-                String newline = "\n";
-                sendReasoningContent(newline);
-                // 然后发送结束标记
-                String endMarker = "```\n";
-                sendReasoningContent(endMarker);
-            } catch (Exception e) {
-                log.warn("发送结束标记时出错: {}", e.getMessage());
-            }
-        }
-
-        /**
-         * 添加进度消息（累积并实时发送增量）
-         */
-        public void addProgress(String message) {
-            if (startMarkerSent) {
-                // 添加换行（如果已有内容，即除了开始标记外还有其他内容）
-                if (accumulatedContent.length() > startMarkerLength) {
-                    accumulatedContent.append("\n");
-                }
-                accumulatedContent.append(message);
-                // 实时发送增量内容
-                String newContent = accumulatedContent.substring(lastSentLength);
-                sendReasoningContent(newContent);
-                lastSentLength = accumulatedContent.length();
-            }
-        }
-
-        @Override
-        public void onProgress(String message) {
-            if (startMarkerSent) {
-                // 添加换行（如果已有内容，即除了开始标记外还有其他内容）
-                if (accumulatedContent.length() > startMarkerLength) {
-                    accumulatedContent.append("\n");
-                }
-                accumulatedContent.append(message);
-                // 实时发送增量内容
-                String newContent = accumulatedContent.substring(lastSentLength);
-                sendReasoningContent(newContent);
-                lastSentLength = accumulatedContent.length();
-            }
-        }
-
-        /**
-         * 发送思考内容（增量）
-         */
-        private void sendReasoningContent(String content) {
-            try {
-                String thinkingId = UUID.randomUUID().toString();
-                ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
-                        .delta(ChatCompletionResponse.Delta.builder()
-                                .reasoningContent(content)
-                                .build())
-                        .index(0).build();
-                ChatCompletionResponse response = ChatCompletionResponse.builder()
-                        .id(thinkingId).object("chat.completion.chunk")
-                        .created(System.currentTimeMillis() / 1000)
-                        .model(model).choices(List.of(choice)).build();
-                MediaType jsonUtf8 = new MediaType("application", "json", StandardCharsets.UTF_8);
-                emitter.send(SseEmitter.event().data(
-                        objectMapper.writeValueAsString(response),
-                        jsonUtf8));
-            } catch (Exception e) {
-                log.warn("发送思考内容时出错: {}", e.getMessage());
-            }
-        }
-    }
-
-    /**
-     * 发送指令执行结果
-     */
-    private void sendCommandResult(SseEmitter emitter, String model, String message, boolean success) {
-        try {
-            String id = UUID.randomUUID().toString();
-            ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
-                    .delta(ChatCompletionResponse.Delta.builder().content(message).build())
-                    .index(0).build();
-            ChatCompletionResponse response = ChatCompletionResponse.builder()
-                    .id(id).object("chat.completion.chunk")
-                    .created(System.currentTimeMillis() / 1000)
-                    .model(model).choices(List.of(choice)).build();
-            emitter.send(SseEmitter.event().data(
-                    objectMapper.writeValueAsString(response),
-                    APPLICATION_JSON_UTF8));
-
-            // 发送完成标记
-            emitter.send(SseEmitter.event().data("[DONE]", MediaType.TEXT_PLAIN));
-            emitter.complete();
-        } catch (Exception e) {
-            log.error("发送指令结果时出错", e);
-            emitter.completeWithError(e);
-        }
-    }
 
     /**
      * 发送指令执行结果（包含 conversationId）
@@ -782,6 +558,12 @@ public class GeminiProvider implements LLMProvider {
             // 发送完成标记
             emitter.send(SseEmitter.event().data("[DONE]", MediaType.TEXT_PLAIN));
             emitter.complete();
+            
+            // 立即释放锁（不等待 onCompletion 回调，因为可能有时序问题）
+            // 注意：这里需要从外部传入 providerName，但当前方法签名中没有
+            // 暂时通过 providerRegistry 获取，或者延迟释放
+            // 实际上，锁应该在 Controller 层的 onCompletion 中释放，这里只是确保完成
+            log.debug("指令执行结果已发送，emitter 已完成");
         } catch (Exception e) {
             log.error("发送指令结果时出错", e);
             emitter.completeWithError(e);
@@ -835,7 +617,7 @@ public class GeminiProvider implements LLMProvider {
             }
 
             // 解析指令
-            CommandParser.ParseResult parseResult = CommandParser.parse(userMessage);
+            CommandParser.ParseResult parseResult = commandParser.parse(userMessage);
 
             if (!parseResult.hasCommands()) {
                 return;
@@ -847,7 +629,7 @@ public class GeminiProvider implements LLMProvider {
             for (Command command : parseResult.getCommands()) {
                 try {
                     log.info("执行指令: {}", command.getName());
-                    boolean success = command.execute(page, null);
+                    boolean success = command.execute(page, null, GeminiProvider.this);
                     if (success) {
                         log.info("指令执行成功: {}", command.getName());
                         // 等待附件上传完成

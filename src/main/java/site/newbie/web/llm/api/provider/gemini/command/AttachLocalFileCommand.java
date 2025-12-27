@@ -1,7 +1,10 @@
 package site.newbie.web.llm.api.provider.gemini.command;
 
 import com.microsoft.playwright.Locator;
+import com.microsoft.playwright.Page;
 import lombok.extern.slf4j.Slf4j;
+import site.newbie.web.llm.api.provider.LLMProvider;
+import site.newbie.web.llm.api.provider.command.Command;
 
 import java.nio.file.Paths;
 
@@ -28,7 +31,12 @@ public class AttachLocalFileCommand implements Command {
     }
     
     @Override
-    public boolean execute(com.microsoft.playwright.Page page, ProgressCallback progressCallback) {
+    public String getExample() {
+        return "/attach-local:文件路径 或 /attach-local 文件路径";
+    }
+    
+    @Override
+    public boolean execute(Page page, ProgressCallback progressCallback, LLMProvider provider) {
         try {
             log.info("执行指令: 添加本地文件 -> {}", filePath);
             if (progressCallback != null) {

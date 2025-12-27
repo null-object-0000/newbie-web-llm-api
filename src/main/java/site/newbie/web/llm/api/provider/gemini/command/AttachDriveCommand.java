@@ -1,7 +1,10 @@
 package site.newbie.web.llm.api.provider.gemini.command;
 
 import com.microsoft.playwright.Locator;
+import com.microsoft.playwright.Page;
 import lombok.extern.slf4j.Slf4j;
+import site.newbie.web.llm.api.provider.LLMProvider;
+import site.newbie.web.llm.api.provider.command.Command;
 
 /**
  * 添加 Google Drive 文件指令
@@ -26,7 +29,12 @@ public class AttachDriveCommand implements Command {
     }
     
     @Override
-    public boolean execute(com.microsoft.playwright.Page page, ProgressCallback progressCallback) {
+    public String getExample() {
+        return "/attach-drive:隋坡-糖醋排骨-202409.mp4";
+    }
+    
+    @Override
+    public boolean execute(Page page, ProgressCallback progressCallback, LLMProvider provider) {
         try {
             log.info("执行指令: 添加 Google Drive 文件 -> {}", fileName);
             if (progressCallback != null) {
@@ -221,12 +229,41 @@ public class AttachDriveCommand implements Command {
             // 7. 等待搜索结果并双击选择第一个结果（带验证）
             String resultSelector = "div[data-target='selectionArea'] div[role='listbox'] > div > div:nth-child(2) > div > div[role='option']";
             
+            // 无结果提示的选择器（支持中英文）
+            String noResultSelector = "div[role='status'][aria-live='assertive']";
+            String noResultTextSelector = noResultSelector + " .R9Lal, " + noResultSelector + " div:has-text('没有匹配的结果'), " + 
+                                        noResultSelector + " div:has-text('No matching results')";
+            
             startTime = System.currentTimeMillis();
             timeout = 10 * 1000; // 10秒超时
             boolean fileSelected = false;
+            boolean searchCompleted = false; // 标记搜索是否已完成（无论是否有结果）
             
             while (System.currentTimeMillis() - startTime < timeout) {
                 try {
+                    // 首先检查是否有"无结果"提示
+                    Locator noResultIndicator = frame.locator(noResultTextSelector);
+                    if (noResultIndicator.count() > 0 && noResultIndicator.first().isVisible()) {
+                        try {
+                            String noResultText = noResultIndicator.first().innerText();
+                            if (noResultText != null && (noResultText.contains("没有匹配的结果") || 
+                                noResultText.contains("No matching results") || 
+                                noResultText.contains("没有匹配") || 
+                                noResultText.contains("No results"))) {
+                                log.warn("搜索完成，但没有找到匹配的文件: {}", fileName);
+                                searchCompleted = true;
+                                if (progressCallback != null) {
+                                    progressCallback.onProgress("❌ 搜索完成，但没有找到匹配的文件: " + fileName);
+                                    progressCallback.onProgress("💡 提示：请检查文件名是否正确，或尝试使用部分文件名搜索");
+                                }
+                                break;
+                            }
+                        } catch (Exception e) {
+                            log.debug("读取无结果提示文本时出错: {}", e.getMessage());
+                        }
+                    }
+                    
+                    // 检查是否有搜索结果
                     Locator resultItem = frame.locator(resultSelector);
                     if (resultItem.count() > 0 && resultItem.first().isVisible()) {
                         // 双击选择文件
@@ -244,6 +281,7 @@ public class AttachDriveCommand implements Command {
                         
                         if (attachmentAdded) {
                             fileSelected = true;
+                            searchCompleted = true;
                             log.info("✅ 文件添加成功: {}", fileName);
                             if (progressCallback != null) {
                                 progressCallback.onProgress("✅ 已选择文件: " + fileName);
@@ -262,6 +300,19 @@ public class AttachDriveCommand implements Command {
                             break;
                         }
                     }
+                    
+                    // 检查搜索是否已完成（通过检查是否有结果列表容器，即使为空）
+                    // 如果搜索框不再处于加载状态，且没有结果也没有"无结果"提示，可能还在加载中
+                    Locator searchContainer = frame.locator("div[data-target='selectionArea']");
+                    if (searchContainer.count() > 0) {
+                        // 检查是否不再加载（通过检查 aria-live 状态）
+                        Locator loadingStatus = frame.locator("div[data-active='true'] div[aria-live='assertive']");
+                        if (loadingStatus.count() == 0 || !loadingStatus.first().isVisible()) {
+                            // 搜索已完成，但没有结果也没有"无结果"提示（可能是其他状态）
+                            // 等待一下，看看是否会出现结果或提示
+                            page.waitForTimeout(500);
+                        }
+                    }
                 } catch (Exception e) {
                     log.debug("等待搜索结果时出错: {}", e.getMessage());
                     // 继续等待
@@ -277,9 +328,15 @@ public class AttachDriveCommand implements Command {
             }
             
             if (!fileSelected) {
-                log.warn("未找到搜索结果或超时");
-                if (progressCallback != null) {
-                    progressCallback.onProgress("❌ 未找到文件或超时");
+                if (searchCompleted) {
+                    // 搜索已完成但没有结果，已经在上面处理了
+                    log.warn("搜索完成但没有找到文件: {}", fileName);
+                } else {
+                    // 超时
+                    log.warn("等待搜索结果超时: {}", fileName);
+                    if (progressCallback != null) {
+                        progressCallback.onProgress("❌ 搜索超时，请重试");
+                    }
                 }
             }
             return false;
@@ -398,7 +455,7 @@ public class AttachDriveCommand implements Command {
             }
             
             // 查找关闭按钮（X 按钮）
-            Locator closeButton = page.locator(".google-picker button[aria-label=\"关闭“选择文件”选择器\"]");
+            Locator closeButton = page.locator("button[aria-label=\"关闭“选择文件”选择器\"]");
             
             if (closeButton.count() > 0 && closeButton.first().isVisible()) {
                 try {

@@ -27,6 +27,14 @@ public interface Command {
     }
     
     /**
+     * 获取指令使用示例
+     * @return 指令使用示例，如 "/command:参数 或 /command 参数"
+     */
+    default String getExample() {
+        return "/" + getName();
+    }
+    
+    /**
      * 进度回调接口
      */
     @FunctionalInterface

@@ -5,8 +5,11 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import site.newbie.web.llm.api.manager.LoginSessionManager;
 import site.newbie.web.llm.api.model.ChatCompletionRequest;
 import site.newbie.web.llm.api.model.LoginInfo;
+import site.newbie.web.llm.api.provider.command.CommandHandler;
+import site.newbie.web.llm.api.provider.command.CommandParser;
 
 import java.util.List;
+import java.util.function.Function;
 
 /**
  * LLM 提供者接口
@@ -67,8 +70,64 @@ public interface LLMProvider {
     }
     
     /**
-     * 处理流式聊天请求
+     * 获取指令解析器
+     * 每个 provider 应该提供自己的 CommandParser 实例（可能包含 provider 特定指令）
+     * @return CommandParser 实例，如果 provider 不支持指令则返回 null
+     */
+    default CommandParser getCommandParser() {
+        // 默认实现：返回一个只支持全局指令的 CommandParser
+        return new CommandParser();
+    }
+    
+    /**
+     * 获取或创建页面
+     * 用于指令处理时获取页面
      * @param request 聊天请求
+     * @return 页面对象，如果无法创建则返回 null
+     */
+    default Page getOrCreatePage(ChatCompletionRequest request) {
+        // 默认实现：不支持页面管理
+        return null;
+    }
+    
+    /**
+     * 获取对话ID
+     * 用于指令处理时获取对话ID
+     * @param request 聊天请求
+     * @return 对话ID，如果不存在则返回 null
+     */
+    default String getConversationId(ChatCompletionRequest request) {
+        // 默认实现：从请求中获取
+        return request.getConversationId();
+    }
+    
+    /**
+     * 判断是否是新对话
+     * 用于指令处理时判断是否是新对话
+     * @param request 聊天请求
+     * @return true 如果是新对话，false 如果是已有对话
+     */
+    default boolean isNewConversation(ChatCompletionRequest request) {
+        // 默认实现：根据 conversationId 判断
+        String conversationId = getConversationId(request);
+        return conversationId == null || conversationId.isEmpty() || conversationId.startsWith("login-");
+    }
+    
+    /**
+     * 获取指令执行成功后的回调
+     * 用于处理 provider 特定的逻辑（如保存 conversationId）
+     * @return CommandSuccessCallback 实例，如果不需要则返回 null
+     */
+    default CommandHandler.CommandSuccessCallback getCommandSuccessCallback() {
+        // 默认实现：不需要成功回调
+        return null;
+    }
+    
+    /**
+     * 处理流式聊天请求
+     * 注意：此方法应该只处理非指令的普通聊天请求
+     * 指令检查应该在 Controller 层统一处理
+     * @param request 聊天请求（已确认不包含指令或指令已处理）
      * @param emitter SSE 发射器，用于发送流式数据
      */
     void streamChat(ChatCompletionRequest request, SseEmitter emitter);

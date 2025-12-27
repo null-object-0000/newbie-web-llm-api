@@ -1,11 +1,14 @@
-package site.newbie.web.llm.api.provider.gemini.command;
+package site.newbie.web.llm.api.provider.command;
 
 import com.microsoft.playwright.Locator;
+import com.microsoft.playwright.Page;
 import lombok.extern.slf4j.Slf4j;
+import site.newbie.web.llm.api.provider.LLMProvider;
 
 /**
- * 登录指令
+ * 全局登录指令
  * 用法: /login
+ * 这是一个全局指令，通过 LLMProvider 接口检查登录状态
  */
 @Slf4j
 public class LoginCommand implements Command {
@@ -24,7 +27,27 @@ public class LoginCommand implements Command {
     }
     
     @Override
-    public boolean execute(com.microsoft.playwright.Page page, ProgressCallback progressCallback) {
+    public String getExample() {
+        return "/login";
+    }
+    
+    @Override
+    public boolean requiresPage() {
+        return true; // login 指令需要页面
+    }
+    
+    @Override
+    public boolean requiresLogin() {
+        return false; // login 指令本身是用来登录的，不需要先登录
+    }
+    
+    @Override
+    public boolean requiresProvider() {
+        return true; // login 指令需要 provider 来检查登录状态
+    }
+    
+    @Override
+    public boolean execute(Page page, ProgressCallback progressCallback, LLMProvider provider) {
         try {
             log.info("执行 login 指令");
             
@@ -38,14 +61,19 @@ public class LoginCommand implements Command {
                 return false;
             }
             
+            if (provider == null) {
+                progressCallback.onProgress("❌ Provider 不可用");
+                return false;
+            }
+            
             // 等待页面加载完成
             page.waitForLoadState();
             page.waitForTimeout(1000);
             
-            // 检查当前登录状态
+            // 使用 provider 的 checkLoginStatus 方法检查登录状态
             progressCallback.onProgress("正在检查登录状态...");
             
-            boolean isLoggedIn = checkLoginStatus(page);
+            boolean isLoggedIn = provider.checkLoginStatus(page);
             
             if (isLoggedIn) {
                 progressCallback.onProgress("✅ 已登录");
@@ -55,7 +83,7 @@ public class LoginCommand implements Command {
             // 未登录，尝试打开登录页面
             progressCallback.onProgress("未登录，正在打开登录页面...");
             
-            // 查找登录按钮
+            // 查找登录按钮（通用选择器）
             Locator loginButton = page.locator("a[aria-label='登录']")
                     .or(page.locator("a[aria-label='Sign in']"))
                     .or(page.locator("a[href*='ServiceLogin']"))
@@ -63,7 +91,9 @@ public class LoginCommand implements Command {
                     .or(page.locator("button:has-text('Sign in')"))
                     .or(page.locator("a:has-text('登录')"))
                     .or(page.locator("a:has-text('Sign in')"))
-                    .or(page.locator("a[href*='signin']"));
+                    .or(page.locator("a[href*='signin']"))
+                    .or(page.locator("button[aria-label*='登录']"))
+                    .or(page.locator("button[aria-label*='Sign in']"));
             
             if (loginButton.count() > 0 && loginButton.first().isVisible()) {
                 try {
@@ -81,8 +111,8 @@ public class LoginCommand implements Command {
                     while (System.currentTimeMillis() - startTime < timeout) {
                         page.waitForTimeout(2000); // 每2秒检查一次
                         
-                        // 重新检查登录状态
-                        boolean loggedIn = checkLoginStatus(page);
+                        // 使用 provider 的 checkLoginStatus 方法重新检查登录状态
+                        boolean loggedIn = provider.checkLoginStatus(page);
                         if (loggedIn) {
                             progressCallback.onProgress("✅ 登录成功！");
                             return true;
@@ -93,7 +123,7 @@ public class LoginCommand implements Command {
                         if (!url.contains("/signin") && !url.contains("/login") && !url.contains("/auth")) {
                             // 可能已经跳转，再次检查登录状态
                             page.waitForTimeout(1000);
-                            loggedIn = checkLoginStatus(page);
+                            loggedIn = provider.checkLoginStatus(page);
                             if (loggedIn) {
                                 progressCallback.onProgress("✅ 登录成功！");
                                 return true;
@@ -124,8 +154,8 @@ public class LoginCommand implements Command {
                     while (System.currentTimeMillis() - startTime < timeout) {
                         page.waitForTimeout(2000); // 每2秒检查一次
                         
-                        // 检查登录状态
-                        boolean loggedIn = checkLoginStatus(page);
+                        // 使用 provider 的 checkLoginStatus 方法检查登录状态
+                        boolean loggedIn = provider.checkLoginStatus(page);
                         if (loggedIn) {
                             progressCallback.onProgress("✅ 登录成功！");
                             return true;
@@ -146,61 +176,6 @@ public class LoginCommand implements Command {
             if (progressCallback != null) {
                 progressCallback.onProgress("❌ 执行登录指令时出错: " + e.getMessage());
             }
-            return false;
-        }
-    }
-    
-    /**
-     * 检查登录状态
-     */
-    private boolean checkLoginStatus(com.microsoft.playwright.Page page) {
-        try {
-            if (page == null || page.isClosed()) {
-                return false;
-            }
-            
-            // 等待页面加载完成
-            page.waitForLoadState();
-            page.waitForTimeout(500);
-            
-            // 检查URL：如果URL包含登录相关路径，说明未登录
-            String url = page.url();
-            if (url.contains("/signin") || url.contains("/login") || url.contains("/auth")) {
-                return false;
-            }
-            
-            // 检查登录按钮（未登录会有登录按钮）
-            Locator loginButton = page.locator("a[aria-label='登录']")
-                    .or(page.locator("a[aria-label='Sign in']"))
-                    .or(page.locator("a[href*='ServiceLogin']"))
-                    .or(page.locator("button:has-text('登录')"))
-                    .or(page.locator("button:has-text('Sign in')"))
-                    .or(page.locator("a:has-text('登录')"))
-                    .or(page.locator("a:has-text('Sign in')"))
-                    .or(page.locator("a[href*='signin']"));
-            
-            if (loginButton.count() > 0 && loginButton.first().isVisible()) {
-                return false;
-            }
-            
-            // 检查是否存在输入框（已登录会有输入框）
-            Locator inputBox = page.locator("div[role='textbox']")
-                    .or(page.locator("textarea[placeholder*='输入']"))
-                    .or(page.locator("textarea[placeholder*='Enter a prompt']"))
-                    .or(page.locator("textarea[aria-label*='prompt']"));
-            
-            if (inputBox.count() > 0 && inputBox.first().isVisible()) {
-                return true;
-            }
-            
-            // 如果URL是聊天页面且没有登录按钮，认为已登录
-            if (url.contains("gemini.google.com") || url.contains("ai.google.dev")) {
-                return true;
-            }
-            
-            return false;
-        } catch (Exception e) {
-            log.warn("检查登录状态时出错: {}", e.getMessage());
             return false;
         }
     }

@@ -17,6 +17,8 @@ import site.newbie.web.llm.api.manager.LoginSessionManager;
 import site.newbie.web.llm.api.provider.ModelConfig;
 import site.newbie.web.llm.api.provider.ProviderRegistry;
 import org.springframework.context.annotation.Lazy;
+import site.newbie.web.llm.api.provider.command.CommandHandler;
+import site.newbie.web.llm.api.provider.command.CommandParser;
 import site.newbie.web.llm.api.provider.deepseek.model.DeepSeekModelConfig;
 import site.newbie.web.llm.api.provider.deepseek.model.DeepSeekModelConfig.DeepSeekContext;
 import site.newbie.web.llm.api.util.ConversationIdUtils;
@@ -63,6 +65,9 @@ public class DeepSeekProvider implements LLMProvider {
     // 页面管理
     private final ConcurrentHashMap<String, Page> modelPages = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, String> pageUrls = new ConcurrentHashMap<>();
+    
+    // 全局指令解析器，支持全局指令
+    private final CommandParser commandParser;
     
     // SSE 拦截器配置
     private static final String SSE_DATA_VAR = "__deepseekSseData";
@@ -113,7 +118,14 @@ public class DeepSeekProvider implements LLMProvider {
         this.loginSessionManager = loginSessionManager;
         this.modelConfigs = configs.stream()
                 .collect(Collectors.toMap(DeepSeekModelConfig::getModelName, Function.identity()));
+        // DeepSeek 目前没有 provider 特定的命令，只支持全局命令
+        this.commandParser = new CommandParser();
         log.info("DeepSeekProvider 初始化完成，支持的模型: {}", modelConfigs.keySet());
+    }
+    
+    @Override
+    public CommandParser getCommandParser() {
+        return commandParser;
     }
 
     @Override
@@ -871,6 +883,7 @@ public class DeepSeekProvider implements LLMProvider {
                     throw new IllegalArgumentException("不支持的模型: " + model);
                 }
 
+                // 注意：指令检查已在 Controller 层统一处理，这里只处理普通聊天请求
                 // 1. 获取或创建页面
                 page = getOrCreatePage(request);
                 
@@ -938,7 +951,8 @@ public class DeepSeekProvider implements LLMProvider {
     
     // ==================== 页面管理 ====================
     
-    private Page getOrCreatePage(ChatCompletionRequest request) {
+    @Override
+    public Page getOrCreatePage(ChatCompletionRequest request) {
         String model = request.getModel();
         String conversationId = getConversationId(request);
         boolean isNewConversation = isNewConversation(request);
@@ -954,7 +968,8 @@ public class DeepSeekProvider implements LLMProvider {
         return page;
     }
     
-    private String getConversationId(ChatCompletionRequest request) {
+    @Override
+    public String getConversationId(ChatCompletionRequest request) {
         // 首先尝试从请求中获取
         String conversationId = request.getConversationId();
         if (conversationId != null && !conversationId.isEmpty()) {
@@ -968,7 +983,8 @@ public class DeepSeekProvider implements LLMProvider {
         return conversationId;
     }
     
-    private boolean isNewConversation(ChatCompletionRequest request) {
+    @Override
+    public boolean isNewConversation(ChatCompletionRequest request) {
         String conversationId = getConversationId(request);
         return conversationId == null || conversationId.isEmpty() || conversationId.startsWith("login-");
     }

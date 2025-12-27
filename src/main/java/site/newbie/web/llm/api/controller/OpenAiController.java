@@ -22,6 +22,9 @@ import site.newbie.web.llm.api.model.LoginInfo;
 import site.newbie.web.llm.api.manager.LoginSessionManager;
 import site.newbie.web.llm.api.provider.ProviderRegistry;
 import site.newbie.web.llm.api.util.ConversationIdUtils;
+import site.newbie.web.llm.api.provider.command.Command;
+import site.newbie.web.llm.api.provider.command.CommandHandler;
+import site.newbie.web.llm.api.provider.command.CommandParser;
 import tools.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
@@ -117,6 +120,91 @@ public class OpenAiController {
     // 处理流式请求 (SSE)
     private Object handleStreamRequest(ChatCompletionRequest request, LLMProvider provider) {
         String providerName = provider.getProviderName();
+        
+        // 统一检查是否是指令对话（在 Controller 层统一处理，避免每个 provider 重复实现）
+        String userMessage = null;
+        if (request.getMessages() != null) {
+            userMessage = request.getMessages().stream()
+                    .filter(m -> "user".equals(m.getRole()))
+                    .reduce((first, second) -> second)
+                    .map(ChatCompletionRequest.Message::getContent)
+                    .orElse(null);
+        }
+        
+        // 从 provider 获取 CommandParser（可能包含 provider 特定指令）
+        CommandParser commandParser = provider.getCommandParser();
+        if (commandParser != null && userMessage != null && commandParser.isCommandOnly(userMessage)) {
+            // 是指令对话，统一在 Controller 层处理
+            log.info("检测到指令对话，在 Controller 层统一处理");
+            
+            // 解析指令，检查是否需要页面或登录（以决定是否需要锁）
+            CommandParser.ParseResult parseResult = commandParser.parse(userMessage);
+            final boolean needsLock;
+            if (parseResult.hasCommands()) {
+                // 检查是否有任何指令需要页面或登录
+                boolean tempNeedsLock = false;
+                for (Command cmd : parseResult.getCommands()) {
+                    if (cmd.requiresPage() || cmd.requiresLogin()) {
+                        tempNeedsLock = true;
+                        break;
+                    }
+                }
+                needsLock = tempNeedsLock;
+            } else {
+                needsLock = false;
+            }
+            
+            SseEmitter emitter = new SseEmitter(300000L);
+            
+            // 设置响应头（使用 AtomicBoolean 防止重复释放锁）
+            java.util.concurrent.atomic.AtomicBoolean lockReleased = new java.util.concurrent.atomic.AtomicBoolean(false);
+            Runnable releaseLock = () -> {
+                if (needsLock && lockReleased.compareAndSet(false, true)) {
+                    providerRegistry.releaseLock(providerName);
+                    log.debug("已释放锁: {}", providerName);
+                }
+            };
+            
+            emitter.onError((ex) -> {
+                log.error("SSE Error: {}", ex.getMessage(), ex);
+                releaseLock.run();
+            });
+            emitter.onTimeout(() -> {
+                log.warn("SSE Timeout");
+                emitter.complete();
+                releaseLock.run();
+            });
+            emitter.onCompletion(() -> {
+                log.info("SSE Completed");
+                releaseLock.run(); // 这里也会尝试释放，但只会释放一次
+            });
+            
+            // 只有需要页面或登录的指令才需要获取锁
+            if (needsLock) {
+                if (!providerRegistry.tryAcquireLock(providerName)) {
+                    log.warn("提供器 {} 正忙，拒绝指令请求", providerName);
+                    try {
+                        sendSystemMessage(emitter, request.getModel(), 
+                            providerName + " 提供器正忙，请等待当前对话完成后再试", false, null, null);
+                    } catch (Exception e) {
+                        emitter.completeWithError(e);
+                    }
+                    return emitter;
+                }
+            }
+            
+            // 使用 CommandHandler 统一处理指令
+            CommandHandler.handleCommandOnly(
+                    request, emitter, provider, commandParser,
+                    provider::getOrCreatePage,
+                    provider::getConversationId,
+                    provider::isNewConversation,
+                    objectMapper,
+                    provider.getCommandSuccessCallback(), // 从 provider 获取成功回调
+                    releaseLock); // 传入释放锁的回调，确保指令执行完成后立即释放锁
+            
+            return emitter;
+        }
         
         // 获取对话ID（用于标识登录对话）
         // 只从历史消息中提取登录对话ID

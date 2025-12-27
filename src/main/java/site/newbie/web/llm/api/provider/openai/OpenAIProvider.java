@@ -3,6 +3,7 @@ package site.newbie.web.llm.api.provider.openai;
 import com.microsoft.playwright.Locator;
 import com.microsoft.playwright.Page;
 import jakarta.annotation.PreDestroy;
+import lombok.AllArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
@@ -15,6 +16,9 @@ import site.newbie.web.llm.api.provider.LLMProvider;
 import site.newbie.web.llm.api.model.LoginInfo;
 import site.newbie.web.llm.api.provider.ModelConfig;
 import site.newbie.web.llm.api.provider.ProviderRegistry;
+import site.newbie.web.llm.api.provider.command.Command;
+import site.newbie.web.llm.api.provider.command.CommandHandler;
+import site.newbie.web.llm.api.provider.command.CommandParser;
 import org.springframework.context.annotation.Lazy;
 import site.newbie.web.llm.api.provider.openai.model.OpenAIModelConfig;
 import site.newbie.web.llm.api.provider.openai.model.OpenAIModelConfig.OpenAIContext;
@@ -48,10 +52,13 @@ public class OpenAIProvider implements LLMProvider {
     
     private final ConcurrentHashMap<String, Page> modelPages = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, String> pageUrls = new ConcurrentHashMap<>();
-    
+
+    // 全局指令解析器，支持全局指令
+    private final CommandParser commandParser;
+
     @Value("${openai.monitor.mode:sse}")
     private String monitorMode;
-    
+
     private static final String SSE_DATA_VAR = "__openaiSseData";
     private static final String SSE_INTERCEPTOR_VAR = "__openaiSseInterceptorSet";
     private static final String[] SSE_URL_PATTERNS = {"/api/conversation", "/backend-api"};
@@ -89,14 +96,21 @@ public class OpenAIProvider implements LLMProvider {
         }
     };
 
-    public OpenAIProvider(BrowserManager browserManager, ObjectMapper objectMapper, 
-                         List<OpenAIModelConfig> configs, @Lazy ProviderRegistry providerRegistry) {
+    public OpenAIProvider(BrowserManager browserManager, ObjectMapper objectMapper,
+                          List<OpenAIModelConfig> configs, @Lazy ProviderRegistry providerRegistry) {
         this.browserManager = browserManager;
         this.objectMapper = objectMapper;
         this.providerRegistry = providerRegistry;
         this.modelConfigs = configs.stream()
                 .collect(Collectors.toMap(OpenAIModelConfig::getModelName, Function.identity()));
+        // OpenAI 目前没有 provider 特定的命令，只支持全局命令
+        this.commandParser = new CommandParser();
         log.info("OpenAIProvider 初始化完成，支持的模型: {}", modelConfigs.keySet());
+    }
+    
+    @Override
+    public CommandParser getCommandParser() {
+        return commandParser;
     }
 
     @Override
@@ -184,6 +198,7 @@ public class OpenAIProvider implements LLMProvider {
                     throw new IllegalArgumentException("不支持的模型: " + model);
                 }
 
+                // 注意：指令检查已在 Controller 层统一处理，这里只处理普通聊天请求
                 page = getOrCreatePage(request);
                 
                 // 检查登录状态
@@ -224,9 +239,50 @@ public class OpenAIProvider implements LLMProvider {
         });
     }
     
+    @Override
+    public CommandHandler.CommandSuccessCallback getCommandSuccessCallback() {
+        return this::handleCommandSuccess;
+    }
+    
+    /**
+     * 处理指令执行成功后的逻辑（保存 conversationId 等）
+     * 这个方法会被 CommandHandler 调用
+     */
+    private boolean handleCommandSuccess(Page page, String model, SseEmitter emitter, String finalMessage, boolean allSuccess) {
+        if (page == null || page.isClosed()) {
+            return false; // 没有页面，使用默认处理
+        }
+        
+        try {
+            String url = page.url();
+            if (url.contains("chatgpt.com") || url.contains("chat.openai.com")) {
+                // 等待一下，看看 URL 是否会变化（可能页面还在加载中）
+                page.waitForTimeout(1000);
+                url = page.url(); // 重新获取 URL
+                
+                String conversationId = extractConversationIdFromUrl(url);
+                if (conversationId != null && !conversationId.isEmpty()) {
+                    // 保存 conversationId -> Page 的映射
+                    pageUrls.put(model, url);
+                    modelPages.put(model, page);
+                    log.info("已保存指令执行后的 tab 关联: conversationId={}, url={}", conversationId, url);
+
+                    // 发送 conversationId，让客户端知道这个标识
+                    sendCommandResultWithConversationId(emitter, model, finalMessage, conversationId);
+                    return true; // 已处理
+                }
+            }
+        } catch (Exception e) {
+            log.warn("保存 tab 关联时出错: {}", e.getMessage());
+        }
+        
+        return false; // 未处理，使用默认处理
+    }
+
     // ==================== 页面管理 ====================
     
-    private Page getOrCreatePage(ChatCompletionRequest request) {
+    @Override
+    public Page getOrCreatePage(ChatCompletionRequest request) {
         String model = request.getModel();
         String conversationId = getConversationId(request);
         boolean isNew = isNewConversation(request);
@@ -239,7 +295,8 @@ public class OpenAIProvider implements LLMProvider {
         }
     }
     
-    private String getConversationId(ChatCompletionRequest request) {
+    @Override
+    public String getConversationId(ChatCompletionRequest request) {
         // 首先尝试从请求中获取
         String conversationId = request.getConversationId();
         if (conversationId != null && !conversationId.isEmpty()) {
@@ -253,7 +310,8 @@ public class OpenAIProvider implements LLMProvider {
         return conversationId;
     }
     
-    private boolean isNewConversation(ChatCompletionRequest request) {
+    @Override
+    public boolean isNewConversation(ChatCompletionRequest request) {
         String conversationId = getConversationId(request);
         return conversationId == null || conversationId.isEmpty() || conversationId.startsWith("login-");
     }
@@ -504,6 +562,18 @@ public class OpenAIProvider implements LLMProvider {
         emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(response), APPLICATION_JSON_UTF8));
     }
     
+    private void sendConversationId(SseEmitter emitter, String id, String conversationId, String model) throws IOException {
+        String content = "\n\n```nwla-conversation-id\n" + conversationId + "\n```\n\n";
+        ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
+                .delta(ChatCompletionResponse.Delta.builder().content(content).build())
+                .index(0).build();
+        ChatCompletionResponse response = ChatCompletionResponse.builder()
+                .id(id).object("chat.completion.chunk")
+                .created(System.currentTimeMillis() / 1000)
+                .model(model).choices(List.of(choice)).build();
+        emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(response), APPLICATION_JSON_UTF8));
+    }
+
     private void sendUrlAndComplete(Page page, SseEmitter emitter, ChatCompletionRequest request) throws IOException {
         try {
             if (!page.isClosed()) {
@@ -512,15 +582,7 @@ public class OpenAIProvider implements LLMProvider {
                     pageUrls.put(request.getModel(), url);
                     String conversationId = extractConversationIdFromUrl(url);
                     if (conversationId != null && !conversationId.isEmpty()) {
-                        String content = "\n\n```nwla-conversation-id\n" + conversationId + "\n```\n\n";
-                        ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
-                                .delta(ChatCompletionResponse.Delta.builder().content(content).build())
-                                .index(0).build();
-                        ChatCompletionResponse response = ChatCompletionResponse.builder()
-                                .id(UUID.randomUUID().toString()).object("chat.completion.chunk")
-                                .created(System.currentTimeMillis() / 1000)
-                                .model(request.getModel()).choices(List.of(choice)).build();
-                        emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(response), APPLICATION_JSON_UTF8));
+                        sendConversationId(emitter, UUID.randomUUID().toString(), conversationId, request.getModel());
                         log.info("已发送对话 ID: {} (从 URL: {})", conversationId, url);
                     } else {
                         log.warn("无法从 URL 中提取对话 ID: {}", url);
@@ -795,6 +857,170 @@ public class OpenAIProvider implements LLMProvider {
      * 发送手动登录提示
      * 引导用户在浏览器中手动完成登录
      */
+    /**
+     * 指令进度回调实现
+     * 累积进度消息，在开始和结束时发送标记
+     */
+    private static class CommandProgressCallback implements Command.ProgressCallback {
+        private final SseEmitter emitter;
+        private final String model;
+        private final ObjectMapper objectMapper;
+        private final StringBuilder accumulatedContent = new StringBuilder();
+        private boolean startMarkerSent = false;
+        private int lastSentLength = 0;
+        private int startMarkerLength = 0;
+
+        public CommandProgressCallback(SseEmitter emitter, String model, ObjectMapper objectMapper) {
+            this.emitter = emitter;
+            this.model = model;
+            this.objectMapper = objectMapper;
+        }
+
+        /**
+         * 发送开始标记
+         */
+        public void sendStartMarker() {
+            try {
+                String startMarker = "```nwla-system-message\n";
+                sendReasoningContent(startMarker);
+                accumulatedContent.append(startMarker);
+                startMarkerLength = startMarker.length();
+                lastSentLength = accumulatedContent.length();
+                startMarkerSent = true;
+            } catch (Exception e) {
+                log.warn("发送开始标记时出错: {}", e.getMessage());
+            }
+        }
+
+        /**
+         * 发送结束标记
+         */
+        public void sendEndMarker() {
+            try {
+                // 先发送换行（如果最后一条消息后面没有换行）
+                String newline = "\n";
+                sendReasoningContent(newline);
+                // 然后发送结束标记
+                String endMarker = "```\n";
+                sendReasoningContent(endMarker);
+            } catch (Exception e) {
+                log.warn("发送结束标记时出错: {}", e.getMessage());
+            }
+        }
+
+        /**
+         * 添加进度消息（累积并实时发送增量）
+         */
+        public void addProgress(String message) {
+            if (startMarkerSent) {
+                // 添加换行（如果已有内容，即除了开始标记外还有其他内容）
+                if (accumulatedContent.length() > startMarkerLength) {
+                    accumulatedContent.append("\n");
+                }
+                accumulatedContent.append(message);
+                // 实时发送增量内容
+                String newContent = accumulatedContent.substring(lastSentLength);
+                sendReasoningContent(newContent);
+                lastSentLength = accumulatedContent.length();
+            }
+        }
+
+        @Override
+        public void onProgress(String message) {
+            if (startMarkerSent) {
+                // 添加换行（如果已有内容，即除了开始标记外还有其他内容）
+                if (accumulatedContent.length() > startMarkerLength) {
+                    accumulatedContent.append("\n");
+                }
+                accumulatedContent.append(message);
+                // 实时发送增量内容
+                String newContent = accumulatedContent.substring(lastSentLength);
+                sendReasoningContent(newContent);
+                lastSentLength = accumulatedContent.length();
+            }
+        }
+
+        /**
+         * 发送思考内容（增量）
+         */
+        private void sendReasoningContent(String content) {
+            try {
+                String thinkingId = UUID.randomUUID().toString();
+                ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
+                        .delta(ChatCompletionResponse.Delta.builder()
+                                .reasoningContent(content)
+                                .build())
+                        .index(0).build();
+                ChatCompletionResponse response = ChatCompletionResponse.builder()
+                        .id(thinkingId).object("chat.completion.chunk")
+                        .created(System.currentTimeMillis() / 1000)
+                        .model(model).choices(List.of(choice)).build();
+                MediaType jsonUtf8 = new MediaType("application", "json", StandardCharsets.UTF_8);
+                emitter.send(SseEmitter.event().data(
+                        objectMapper.writeValueAsString(response),
+                        jsonUtf8));
+            } catch (Exception e) {
+                log.warn("发送思考内容时出错: {}", e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * 发送指令执行结果
+     */
+    private void sendCommandResult(SseEmitter emitter, String model, String message, boolean success) {
+        try {
+            String id = UUID.randomUUID().toString();
+            ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
+                    .delta(ChatCompletionResponse.Delta.builder().content(message).build())
+                    .index(0).build();
+            ChatCompletionResponse response = ChatCompletionResponse.builder()
+                    .id(id).object("chat.completion.chunk")
+                    .created(System.currentTimeMillis() / 1000)
+                    .model(model).choices(List.of(choice)).build();
+            emitter.send(SseEmitter.event().data(
+                    objectMapper.writeValueAsString(response),
+                    APPLICATION_JSON_UTF8));
+
+            // 发送完成标记
+            emitter.send(SseEmitter.event().data("[DONE]", MediaType.TEXT_PLAIN));
+            emitter.complete();
+        } catch (Exception e) {
+            log.error("发送指令结果时出错", e);
+            emitter.completeWithError(e);
+        }
+    }
+
+    /**
+     * 发送指令执行结果（包含 conversationId）
+     */
+    private void sendCommandResultWithConversationId(SseEmitter emitter, String model, String message, String conversationId) {
+        try {
+            String id = UUID.randomUUID().toString();
+            // 先发送结果消息
+            ChatCompletionResponse.Choice choice = ChatCompletionResponse.Choice.builder()
+                    .delta(ChatCompletionResponse.Delta.builder().content(message).build())
+                    .index(0).build();
+            ChatCompletionResponse response = ChatCompletionResponse.builder()
+                    .id(id).object("chat.completion.chunk")
+                    .created(System.currentTimeMillis() / 1000)
+                    .model(model).choices(List.of(choice)).build();
+            emitter.send(SseEmitter.event().data(
+                    objectMapper.writeValueAsString(response),
+                    APPLICATION_JSON_UTF8));
+
+            // 发送 conversationId
+            sendConversationId(emitter, UUID.randomUUID().toString(), conversationId, model);
+
+            // 发送完成标记
+            emitter.send(SseEmitter.event().data("[DONE]", MediaType.TEXT_PLAIN));
+            emitter.complete();
+        } catch (Exception e) {
+            log.error("发送指令结果时出错", e);
+            emitter.completeWithError(e);
+        }
+    }
+
     private void sendManualLoginPrompt(SseEmitter emitter, String model, String providerName, String conversationId) {
         try {
             StringBuilder message = new StringBuilder();
