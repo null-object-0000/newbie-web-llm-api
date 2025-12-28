@@ -63,7 +63,7 @@ body {
 /* 标签页样式 - 药丸形状 */
 .tabs-nav {
     position: sticky;
-    top: 4rem; /* 在 Header 下方 */
+    top: 0; /* 固定在顶部 */
     z-index: 49;
     padding-top: 0;
     transition: all 0.2s;
