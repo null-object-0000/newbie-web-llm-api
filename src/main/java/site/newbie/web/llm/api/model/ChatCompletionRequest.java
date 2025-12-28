@@ -36,6 +36,9 @@ public class ChatCompletionRequest {
     // 对话 ID（用于继续特定对话）
     private String conversationId;
     
+    // 账号 ID（用于多账号支持，可选）
+    private String accountId;
+    
     // 便捷方法：确保返回非 null 值
     public boolean isStream() {
         return stream != null && stream;

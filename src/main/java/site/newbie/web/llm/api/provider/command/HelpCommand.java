@@ -153,18 +153,12 @@ public class HelpCommand implements Command {
                 progressCallback.onProgress("  " + cmd.getExample());
                 progressCallback.onProgress("");
                 progressCallback.onProgress("示例:");
-                // 特殊处理 help 和 login 指令的详细示例
+                // 特殊处理 help 指令的详细示例
                 if ("help".equalsIgnoreCase(commandName)) {
                     progressCallback.onProgress("  /help");
-                    progressCallback.onProgress("  /help:login");
-                } else if ("login".equalsIgnoreCase(commandName)) {
-                    progressCallback.onProgress("  " + cmd.getExample());
-                    progressCallback.onProgress("");
-                    progressCallback.onProgress("说明:");
-                    progressCallback.onProgress("- 会自动检查当前登录状态");
-                    progressCallback.onProgress("- 如果已登录，直接返回成功");
-                    progressCallback.onProgress("- 如果未登录，会点击登录按钮并等待用户完成登录");
-                    progressCallback.onProgress("- 最多等待 60 秒，超时后需要手动检查登录状态");
+                    progressCallback.onProgress("  /help:指令名");
+                // login 指令已移除，登录功能改为在管理后台统一操作
+                // 账号管理指令已移除，账号管理功能改为在管理后台统一操作
                 } else {
                     progressCallback.onProgress("  " + cmd.getExample());
                 }
@@ -234,7 +228,7 @@ public class HelpCommand implements Command {
     private List<Command> getDefaultGlobalCommands() {
         List<Command> commands = new ArrayList<>();
         commands.add(new HelpCommand());
-        commands.add(new LoginCommand());
+        // login 指令已移除，登录功能改为在管理后台统一操作
         return commands;
     }
 }

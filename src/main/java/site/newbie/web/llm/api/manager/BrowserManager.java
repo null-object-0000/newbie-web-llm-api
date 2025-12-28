@@ -21,7 +21,8 @@ public class BrowserManager {
 
     private Playwright playwright;
 
-    // 每个提供器有独立的 BrowserContext，避免并发冲突
+    // 每个提供器+账号有独立的 BrowserContext，避免并发冲突
+    // Key 格式: "providerName" 或 "providerName:accountId"
     private final ConcurrentHashMap<String, BrowserContext> providerContexts = new ConcurrentHashMap<>();
 
     // 从配置文件读取配置
@@ -89,12 +90,26 @@ public class BrowserManager {
     }
 
     /**
-     * 获取或创建指定提供器的 BrowserContext
-     * 每个提供器有独立的浏览器上下文，避免并发冲突
-     * 如果 context 已关闭会自动重新创建
+     * 获取或创建指定提供器的 BrowserContext（兼容旧接口，使用默认账号）
+     * @deprecated 请使用 getOrCreateContext(String providerName, String accountId) 方法
      */
+    @Deprecated
     public synchronized BrowserContext getOrCreateContext(String providerName) {
-        BrowserContext existingContext = providerContexts.get(providerName);
+        return getOrCreateContext(providerName, null);
+    }
+    
+    /**
+     * 获取或创建指定提供器和账号的 BrowserContext
+     * 每个提供器+账号有独立的浏览器上下文，避免并发冲突
+     * 如果 context 已关闭会自动重新创建
+     * @param providerName 提供器名称
+     * @param accountId 账号ID，如果为 null 则使用默认账号（兼容旧代码）
+     */
+    public synchronized BrowserContext getOrCreateContext(String providerName, String accountId) {
+        String contextKey = accountId != null && !accountId.isEmpty() 
+                ? providerName + ":" + accountId 
+                : providerName;
+        BrowserContext existingContext = providerContexts.get(contextKey);
 
         // 检查现有 context 是否有效
         if (existingContext != null) {
@@ -103,8 +118,20 @@ public class BrowserManager {
                 existingContext.pages();
                 return existingContext;
             } catch (Exception e) {
-                log.warn("提供器 {} 的 BrowserContext 已关闭，将重新创建...", providerName);
-                providerContexts.remove(providerName);
+                String errorMsg = e.getMessage();
+                boolean isClosed = errorMsg != null && (
+                        errorMsg.contains("Target page, context or browser has been closed") ||
+                        errorMsg.contains("TargetClosedError") ||
+                        errorMsg.contains("Browser closed") ||
+                        errorMsg.contains("Context closed") ||
+                        errorMsg.contains("Connection closed")
+                );
+                if (isClosed) {
+                    log.warn("提供器 {} 账号 {} 的 BrowserContext 已关闭，将重新创建...", providerName, accountId);
+                } else {
+                    log.warn("提供器 {} 账号 {} 的 BrowserContext 访问失败，将重新创建: {}", providerName, accountId, errorMsg);
+                }
+                providerContexts.remove(contextKey);
             }
         }
 
@@ -112,10 +139,16 @@ public class BrowserManager {
         ensurePlaywrightValid();
 
         // 创建新的 context
-        log.info("为提供器 {} 创建独立的 BrowserContext...", providerName);
+        if (accountId != null && !accountId.isEmpty()) {
+            log.info("为提供器 {} 账号 {} 创建独立的 BrowserContext...", providerName, accountId);
+        } else {
+            log.info("为提供器 {} 创建独立的 BrowserContext...", providerName);
+        }
 
-        // 每个提供器有独立的用户数据目录
-        String providerDataDir = userDataDir + "/" + providerName;
+        // 每个提供器+账号有独立的用户数据目录
+        String providerDataDir = accountId != null && !accountId.isEmpty()
+                ? userDataDir + "/" + providerName + "/" + accountId
+                : userDataDir + "/" + providerName;
 
         // Gemini 和 OpenAI 强制使用 headed 模式（有界面），其他提供器使用配置的模式
         boolean useHeadless = headless;
@@ -145,12 +178,28 @@ public class BrowserManager {
                 // 注入抗检测脚本
                 context.addInitScript("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})");
 
-                providerContexts.put(providerName, context);
-                log.info("提供器 {} 的 BrowserContext 创建成功，数据目录: {}", providerName, providerDataDir);
+                providerContexts.put(contextKey, context);
+                if (accountId != null && !accountId.isEmpty()) {
+                    log.info("提供器 {} 账号 {} 的 BrowserContext 创建成功，数据目录: {}", providerName, accountId, providerDataDir);
+                } else {
+                    log.info("提供器 {} 的 BrowserContext 创建成功，数据目录: {}", providerName, providerDataDir);
+                }
                 return context;
             } catch (Exception e) {
-                if (e.getMessage() != null && e.getMessage().contains("Playwright connection closed")) {
-                    log.warn("Playwright 连接关闭，尝试重新创建 Playwright 实例 (尝试 {}/{})", attempt + 1, maxRetries);
+                String errorMsg = e.getMessage();
+                boolean isConnectionClosed = errorMsg != null && (
+                        errorMsg.contains("Playwright connection closed") ||
+                        errorMsg.contains("Connection closed") ||
+                        errorMsg.contains("Target page, context or browser has been closed") ||
+                        errorMsg.contains("TargetClosedError") ||
+                        errorMsg.contains("Browser closed") ||
+                        errorMsg.contains("Context closed")
+                );
+                
+                if (isConnectionClosed) {
+                    log.warn("Playwright 连接或浏览器已关闭，尝试重新创建 Playwright 实例 (尝试 {}/{})", attempt + 1, maxRetries);
+                    // 清理上下文缓存
+                    providerContexts.remove(contextKey);
                     // 重新创建 Playwright 实例
                     try {
                         if (playwright != null) {
@@ -158,6 +207,7 @@ public class BrowserManager {
                         }
                     } catch (Exception closeEx) {
                         // 忽略关闭错误
+                        log.debug("关闭旧的 Playwright 实例时出错: {}", closeEx.getMessage());
                     }
                     playwright = Playwright.create();
                     log.info("Playwright 实例已重新创建，重试创建 BrowserContext...");
@@ -165,11 +215,11 @@ public class BrowserManager {
                     if (attempt == maxRetries - 1) {
                         // 最后一次尝试失败，抛出异常
                         log.error("创建 BrowserContext 失败，已重试 {} 次", maxRetries);
-                        throw new RuntimeException("无法创建 BrowserContext，Playwright 连接问题", e);
+                        throw new RuntimeException("无法创建 BrowserContext，浏览器连接问题: " + errorMsg, e);
                     }
                 } else {
                     // 其他错误直接抛出
-                    throw new RuntimeException("创建 BrowserContext 失败", e);
+                    throw new RuntimeException("创建 BrowserContext 失败: " + (errorMsg != null ? errorMsg : e.getClass().getSimpleName()), e);
                 }
             }
         }
@@ -178,6 +228,27 @@ public class BrowserManager {
         throw new RuntimeException("创建 BrowserContext 失败");
     }
 
+    /**
+     * 强制清理指定提供器和账号的 BrowserContext
+     * 用于在浏览器关闭后清理无效的上下文引用
+     * @param providerName 提供器名称
+     * @param accountId 账号ID，如果为 null 则使用默认账号
+     */
+    public synchronized void clearContext(String providerName, String accountId) {
+        String contextKey = accountId != null && !accountId.isEmpty() 
+                ? providerName + ":" + accountId 
+                : providerName;
+        BrowserContext context = providerContexts.remove(contextKey);
+        if (context != null) {
+            try {
+                context.close();
+                log.info("已清理提供器 {} 账号 {} 的 BrowserContext", providerName, accountId);
+            } catch (Exception e) {
+                log.debug("清理 BrowserContext 时出错（可能已关闭）: {}", e.getMessage());
+            }
+        }
+    }
+    
     /**
      * 获取一个新的页面用于聊天（兼容旧接口，使用默认上下文）
      *
@@ -189,19 +260,31 @@ public class BrowserManager {
     }
 
     /**
-     * 为指定提供器获取一个新的页面
+     * 为指定提供器获取一个新的页面（兼容旧接口，使用默认账号）
+     * @deprecated 请使用 newPage(String providerName, String accountId) 方法
+     */
+    @Deprecated
+    public synchronized Page newPage(String providerName) {
+        return newPage(providerName, null);
+    }
+    
+    /**
+     * 为指定提供器和账号获取一个新的页面
      * 如果 context 已关闭会自动重新创建并重试
      */
-    public synchronized Page newPage(String providerName) {
+    public synchronized Page newPage(String providerName, String accountId) {
+        String contextKey = accountId != null && !accountId.isEmpty() 
+                ? providerName + ":" + accountId 
+                : providerName;
         int maxRetries = 3;
         for (int attempt = 0; attempt < maxRetries; attempt++) {
             try {
-                BrowserContext context = getOrCreateContext(providerName);
+                BrowserContext context = getOrCreateContext(providerName, accountId);
                 return context.newPage();
             } catch (Exception e) {
                 // context 可能已关闭，移除并重新创建
-                log.warn("提供器 {} 创建页面失败 (尝试 {}/{}): {}", providerName, attempt + 1, maxRetries, e.getMessage());
-                providerContexts.remove(providerName);
+                log.warn("提供器 {} 账号 {} 创建页面失败 (尝试 {}/{}): {}", providerName, accountId, attempt + 1, maxRetries, e.getMessage());
+                providerContexts.remove(contextKey);
 
                 if (attempt < maxRetries - 1) {
                     // 等待一小段时间后重试
@@ -236,10 +319,22 @@ public class BrowserManager {
     }
 
     /**
-     * 获取指定提供器的所有页面
+     * 获取指定提供器的所有页面（兼容旧接口，使用默认账号）
+     * @deprecated 请使用 getAllPages(String providerName, String accountId) 方法
      */
+    @Deprecated
     public List<Page> getAllPages(String providerName) {
-        BrowserContext context = providerContexts.get(providerName);
+        return getAllPages(providerName, null);
+    }
+    
+    /**
+     * 获取指定提供器和账号的所有页面
+     */
+    public List<Page> getAllPages(String providerName, String accountId) {
+        String contextKey = accountId != null && !accountId.isEmpty() 
+                ? providerName + ":" + accountId 
+                : providerName;
+        BrowserContext context = providerContexts.get(contextKey);
         if (context == null) {
             return List.of();
         }
@@ -247,7 +342,7 @@ public class BrowserManager {
             return context.pages();
         } catch (Exception e) {
             // context 已关闭
-            log.warn("获取提供器 {} 页面时出错，context 可能已关闭: {}", providerName, e.getMessage());
+            log.warn("获取提供器 {} 账号 {} 页面时出错，context 可能已关闭: {}", providerName, accountId, e.getMessage());
             return List.of();
         }
     }

@@ -57,6 +57,17 @@ public interface LLMProvider {
     }
     
     /**
+     * 获取当前登录的账号信息
+     * 此方法用于从页面中提取当前登录用户的账号信息（账号名称、邮箱等）
+     * @param page 浏览器页面
+     * @return AccountInfo 包含账号名称和账号标识（如邮箱），如果未登录或无法获取则返回失败的 AccountInfo
+     */
+    default AccountInfo getCurrentAccountInfo(Page page) {
+        // 默认实现：不支持获取账号信息
+        return AccountInfo.failed("此提供器不支持获取账号信息");
+    }
+    
+    /**
      * 处理登录流程
      * @param request 聊天请求（包含用户输入）
      * @param emitter SSE 发射器，用于发送流式数据

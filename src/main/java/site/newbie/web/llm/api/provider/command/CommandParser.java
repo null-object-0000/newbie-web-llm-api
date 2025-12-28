@@ -41,6 +41,13 @@ public class CommandParser {
     private final ProviderCommandFactory providerCommandFactory;
     
     /**
+     * 获取 ProviderCommandFactory（用于创建支持 provider 特定指令的 CommandParser）
+     */
+    public ProviderCommandFactory getProviderCommandFactory() {
+        return providerCommandFactory;
+    }
+    
+    /**
      * 创建全局指令解析器（只支持全局指令）
      */
     public CommandParser() {
@@ -177,9 +184,8 @@ public class CommandParser {
                 }
                 return new HelpCommand(null, this);
                 
-            case "login":
-                // login 指令不需要参数
-                return new LoginCommand();
+            // login 指令已移除，登录功能改为在管理后台统一操作
+            // 账号管理指令已移除，账号管理功能改为在管理后台统一操作
                 
             default:
                 return null; // 不是全局指令
@@ -193,7 +199,7 @@ public class CommandParser {
     public List<Command> getGlobalCommands() {
         List<Command> commands = new ArrayList<>();
         // 获取所有已知的全局指令
-        String[] globalCommandNames = {"help", "login"};
+        String[] globalCommandNames = {"help"};
         
         for (String cmdName : globalCommandNames) {
             try {

@@ -10,6 +10,7 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import site.newbie.web.llm.api.manager.BrowserManager;
 import site.newbie.web.llm.api.model.ChatCompletionRequest;
 import site.newbie.web.llm.api.model.ChatCompletionResponse;
+import site.newbie.web.llm.api.provider.AccountInfo;
 import site.newbie.web.llm.api.provider.LLMProvider;
 import site.newbie.web.llm.api.model.LoginInfo;
 import site.newbie.web.llm.api.provider.ModelConfig;
@@ -233,6 +234,113 @@ public class GeminiProvider implements LLMProvider {
 
         return LoginInfo.loggedIn();
     }
+    
+    @Override
+    public AccountInfo getCurrentAccountInfo(Page page) {
+        try {
+            if (page == null || page.isClosed()) {
+                return AccountInfo.failed("页面为空或已关闭");
+            }
+            
+            // 等待页面加载完成
+            page.waitForLoadState();
+            page.waitForTimeout(1000);
+            
+            // 根据用户提供的 HTML 结构，账号信息在最后的 div 中
+            // <div ng-non-bindable=""><div class="gb_T"><div class="gb_Rc">
+            //   <div>Google 账号</div>
+            //   <div class="gb_g">Changen Ni</div>  // 账号名称
+            //   <div>thien01657008216@gmail.com</div>  // 账号邮箱
+            // </div></div></div>
+            
+            // 根据 HTML 结构：
+            // <div class="gb_Rc">
+            //   <div>Google 账号</div>
+            //   <div class="gb_g">Changen Ni</div>  // 昵称
+            //   <div>thien01657008216@gmail.com</div>  // 账号（邮箱）
+            //   <div class="gb_Sc"></div>
+            // </div>
+            
+            // 方法1: 获取昵称（gb_g）
+            Locator accountNameDiv = page.locator("div.gb_g");
+            String accountName = null;
+            if (accountNameDiv.count() > 0) {
+                accountName = accountNameDiv.first().textContent();
+                if (accountName != null) {
+                    accountName = accountName.trim();
+                }
+            }
+            
+            // 方法2: 直接获取 gb_Rc 容器中，gb_g 后面的那个包含邮箱的 div
+            Locator accountContainer = page.locator("div.gb_Rc");
+            String accountEmail = null;
+            if (accountContainer.count() > 0) {
+                try {
+                    // 查找 gb_Rc 内所有 div
+                    var allDivs = accountContainer.first().locator("div");
+                    int divCount = allDivs.count();
+                    
+                    // 找到 gb_g 的位置，然后取它后面的第一个包含 @ 的 div
+                    boolean foundGbG = false;
+                    for (int i = 0; i < divCount; i++) {
+                        var div = allDivs.nth(i);
+                        String className = div.getAttribute("class");
+                        
+                        // 找到 gb_g
+                        if (className != null && className.contains("gb_g")) {
+                            foundGbG = true;
+                            continue;
+                        }
+                        
+                        // 如果已经找到 gb_g，且当前 div 不是 gb_Sc，且包含 @，那就是邮箱
+                        if (foundGbG && (className == null || !className.contains("gb_Sc"))) {
+                            String divText = div.textContent();
+                            if (divText != null && divText.contains("@")) {
+                                // 提取邮箱
+                                java.util.regex.Pattern emailPattern = java.util.regex.Pattern.compile(
+                                    "[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}");
+                                java.util.regex.Matcher matcher = emailPattern.matcher(divText.trim());
+                                if (matcher.find()) {
+                                    accountEmail = matcher.group();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    log.debug("从 gb_Rc 获取邮箱失败: {}", e.getMessage());
+                }
+            }
+            
+            // 如果找到了邮箱，返回成功
+            if (accountEmail != null && !accountEmail.isEmpty()) {
+                return AccountInfo.success(
+                    accountName != null && !accountName.isEmpty() ? accountName : accountEmail,
+                    accountEmail
+                );
+            }
+            
+            // 方法3: 如果上述方法失败，尝试在整个页面中查找邮箱（备用方案）
+            String pageText = page.textContent("body");
+            if (pageText != null) {
+                java.util.regex.Pattern emailPattern = java.util.regex.Pattern.compile(
+                    "[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}");
+                java.util.regex.Matcher matcher = emailPattern.matcher(pageText);
+                if (matcher.find()) {
+                    accountEmail = matcher.group();
+                    return AccountInfo.success(
+                        accountName != null && !accountName.isEmpty() ? accountName : accountEmail,
+                        accountEmail
+                    );
+                }
+            }
+            
+            return AccountInfo.failed("无法从页面中提取账号信息");
+        } catch (Exception e) {
+            log.error("获取当前账号信息失败: {}", e.getMessage(), e);
+            return AccountInfo.failed("获取账号信息时出错: " + e.getMessage());
+        }
+    }
 
     @Override
     public void streamChat(ChatCompletionRequest request, SseEmitter emitter) {
@@ -387,7 +495,8 @@ public class GeminiProvider implements LLMProvider {
             log.warn("找不到对应的 tab: conversationId={}, url={}", conversationId, conversationUrl);
             return null;
         } else {
-            return createNewConversationPage(model);
+            String accountId = request.getAccountId();
+            return createNewConversationPage(model, accountId);
         }
     }
 
@@ -412,7 +521,7 @@ public class GeminiProvider implements LLMProvider {
         return conversationId == null || conversationId.isEmpty() || conversationId.startsWith("login-");
     }
 
-    private Page createNewConversationPage(String model) {
+    private Page createNewConversationPage(String model, String accountId) {
         Page oldPage = modelPages.remove(model);
         if (oldPage != null && !oldPage.isClosed()) {
             try {
@@ -421,7 +530,7 @@ public class GeminiProvider implements LLMProvider {
             }
         }
 
-        Page page = browserManager.newPage(getProviderName());
+        Page page = browserManager.newPage(getProviderName(), accountId);
         modelPages.put(model, page);
         // 使用 /app 路径
         page.navigate("https://gemini.google.com/app");
@@ -441,7 +550,8 @@ public class GeminiProvider implements LLMProvider {
             }
         }
         try {
-            for (Page page : browserManager.getAllPages(getProviderName())) {
+            String accountId = null; // TODO: 从 request 中获取 accountId
+            for (Page page : browserManager.getAllPages(getProviderName(), accountId)) {
                 if (page != null && !page.isClosed() && targetUrl.equals(page.url())) {
                     return page;
                 }
@@ -1021,7 +1131,9 @@ public class GeminiProvider implements LLMProvider {
                     throw new IllegalArgumentException("图片生成模型不可用");
                 }
                 
-                page = createNewConversationPage("gemini-web-imagegen");
+                // 从 request 中获取 accountId（如果存在）
+                String accountId = request.getAccountId();
+                page = createNewConversationPage("gemini-web-imagegen", accountId);
                 if (page == null) {
                     throw new RuntimeException("无法创建页面");
                 }

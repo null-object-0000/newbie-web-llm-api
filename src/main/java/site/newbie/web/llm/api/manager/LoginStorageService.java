@@ -104,22 +104,39 @@ public class LoginStorageService {
     }
     
     /**
-     * 生成会话键（providerName:conversationId）
+     * 生成会话键（providerName:accountId:conversationId 或 providerName:conversationId）
      */
-    private String generateSessionKey(String providerName, String conversationId) {
+    private String generateSessionKey(String providerName, String accountId, String conversationId) {
         if (conversationId == null || conversationId.isEmpty()) {
             throw new IllegalArgumentException("conversationId 不能为空");
+        }
+        if (accountId != null && !accountId.isEmpty()) {
+            return providerName + ":" + accountId + ":" + conversationId;
         }
         return providerName + ":" + conversationId;
     }
     
     /**
-     * 保存登录会话
+     * 生成会话键（兼容旧接口）
+     */
+    private String generateSessionKey(String providerName, String conversationId) {
+        return generateSessionKey(providerName, null, conversationId);
+    }
+    
+    /**
+     * 保存登录会话（兼容旧接口，使用默认账号）
      */
     public void saveLoginSession(String providerName, String conversationId, LoginSessionManager.LoginSession session) {
+        saveLoginSession(providerName, null, conversationId, session);
+    }
+    
+    /**
+     * 保存登录会话
+     */
+    public void saveLoginSession(String providerName, String accountId, String conversationId, LoginSessionManager.LoginSession session) {
         Map<String, LoginSessionManager.LoginSession> loginSessionsMap = loadLoginSessionsMap();
         if (session != null && conversationId != null && !conversationId.isEmpty()) {
-            String key = generateSessionKey(providerName, conversationId);
+            String key = generateSessionKey(providerName, accountId, conversationId);
             // 检查是否是新建的登录会话（之前不存在）
             boolean isNewSession = !loginSessionsMap.containsKey(key);
             loginSessionsMap.put(key, session);
@@ -144,14 +161,21 @@ public class LoginStorageService {
     }
     
     /**
-     * 获取登录会话
+     * 获取登录会话（兼容旧接口，使用默认账号）
      */
     public LoginSessionManager.LoginSession getLoginSession(String providerName, String conversationId) {
+        return getLoginSession(providerName, null, conversationId);
+    }
+    
+    /**
+     * 获取登录会话
+     */
+    public LoginSessionManager.LoginSession getLoginSession(String providerName, String accountId, String conversationId) {
         if (conversationId == null || conversationId.isEmpty()) {
             return null;
         }
         Map<String, LoginSessionManager.LoginSession> loginSessionsMap = loadLoginSessionsMap();
-        String key = generateSessionKey(providerName, conversationId);
+        String key = generateSessionKey(providerName, accountId, conversationId);
         LoginSessionManager.LoginSession session = loginSessionsMap.get(key);
         log.debug("获取登录会话: key={}, session存在={}, state={}", 
             key, session != null, session != null ? session.getState() : null);
@@ -166,14 +190,21 @@ public class LoginStorageService {
     }
     
     /**
-     * 删除登录会话
+     * 删除登录会话（兼容旧接口，使用默认账号）
      */
     public void removeLoginSession(String providerName, String conversationId) {
+        removeLoginSession(providerName, null, conversationId);
+    }
+    
+    /**
+     * 删除登录会话
+     */
+    public void removeLoginSession(String providerName, String accountId, String conversationId) {
         if (conversationId == null || conversationId.isEmpty()) {
             return;
         }
         Map<String, LoginSessionManager.LoginSession> loginSessionsMap = loadLoginSessionsMap();
-        String key = generateSessionKey(providerName, conversationId);
+        String key = generateSessionKey(providerName, accountId, conversationId);
         loginSessionsMap.remove(key);
         persistLoginSessions(loginSessionsMap);
     }
