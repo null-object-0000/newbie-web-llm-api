@@ -60,35 +60,7 @@ body {
     overflow: hidden;
 }
 
-/* 头部样式 - 对齐 Antigravity-Manager */
-.header-nav {
-    position: sticky;
-    top: 0;
-    z-index: 50;
-    padding-top: 0;
-    transition: all 0.2s;
-    background: #FAFBFC;
-    border-bottom: none;
-}
-
-.dark .header-nav {
-    background: #334155; /* base-300 */
-}
-
-.header-nav .max-w-7xl {
-    max-width: 80rem;
-}
-
-.header-nav .px-8 {
-    padding-left: 2rem;
-    padding-right: 2rem;
-}
-
-.header-nav .h-16 {
-    height: 4rem;
-}
-
-/* 标签页样式 - 药丸形状，对齐 Antigravity-Manager */
+/* 标签页样式 - 药丸形状 */
 .tabs-nav {
     position: sticky;
     top: 4rem; /* 在 Header 下方 */

@@ -7,7 +7,6 @@ window.addEventListener('DOMContentLoaded', () => {
         
         const App = {
             components: {
-                Header: window.Header,
                 Tabs: window.Tabs,
                 Modal: window.Modal,
                 Dashboard: window.Dashboard,
@@ -30,7 +29,9 @@ window.addEventListener('DOMContentLoaded', () => {
                     return (account) => {
                         if (!account) return false;
                         const playwrightProviders = ['gemini', 'openai', 'deepseek'];
-                        return playwrightProviders.includes(account.providerName?.toLowerCase()) && !account.isLoginVerified;
+                        // 兼容两种字段名：isLoginVerified 和 loginVerified
+                        const isVerified = account.isLoginVerified !== undefined ? account.isLoginVerified : account.loginVerified;
+                        return playwrightProviders.includes(account.providerName?.toLowerCase()) && !isVerified;
                     };
                 }
             },
@@ -69,7 +70,9 @@ window.addEventListener('DOMContentLoaded', () => {
                     }
                     // 如果不是登录验证成功的情况，立即关闭模态框
                     // 登录验证成功的情况，AccountForm 会自己延迟关闭（显示成功消息）
-                    const isLoginSuccess = data && data.account && data.account.isLoginVerified === true;
+                    // 兼容两种字段名：isLoginVerified 和 loginVerified
+                    const account = data && data.account;
+                    const isLoginSuccess = account && (account.isLoginVerified === true || account.loginVerified === true);
                     if (!isLoginSuccess) {
                         this.closeAccountModal();
                     }
@@ -86,7 +89,6 @@ window.addEventListener('DOMContentLoaded', () => {
             },
             template: `
                 <div class="app-container">
-                    <Header />
                     <Tabs :active-tab="activeTab" @switch-tab="switchTab" />
                     
                     <div class="tab-content">

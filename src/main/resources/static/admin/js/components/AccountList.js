@@ -93,7 +93,27 @@ const AccountList = {
         },
         needsLogin(provider, account) {
             // 只有 Playwright 类提供器且未完成登录验证的账号需要登录
-            return apiService.isPlaywrightProvider(provider) && !account.isLoginVerified;
+            // 兼容两种字段名：isLoginVerified 和 loginVerified
+            const isVerified = account.isLoginVerified !== undefined ? account.isLoginVerified : account.loginVerified;
+            return apiService.isPlaywrightProvider(provider) && !isVerified;
+        },
+        getAccountStatus(provider, account) {
+            // 获取账号状态文本
+            if (!apiService.isPlaywrightProvider(provider)) {
+                return '无需登录';
+            }
+            // 兼容两种字段名：isLoginVerified 和 loginVerified
+            const isVerified = account.isLoginVerified !== undefined ? account.isLoginVerified : account.loginVerified;
+            return isVerified ? '已完成登录' : '未完成登录';
+        },
+        getAccountStatusClass(provider, account) {
+            // 获取账号状态的样式类
+            if (!apiService.isPlaywrightProvider(provider)) {
+                return 'text-gray-500 dark:text-gray-400';
+            }
+            // 兼容两种字段名：isLoginVerified 和 loginVerified
+            const isVerified = account.isLoginVerified !== undefined ? account.isLoginVerified : account.loginVerified;
+            return isVerified ? 'text-green-600 dark:text-green-400' : 'text-yellow-600 dark:text-yellow-400';
         }
     },
     computed: {
@@ -168,6 +188,7 @@ const AccountList = {
                                     <thead>
                                         <tr class="table-header-row">
                                             <th class="table-header">账号名称</th>
+                                            <th class="table-header">状态</th>
                                             <th class="table-header">创建时间</th>
                                             <th class="table-header">最后使用</th>
                                             <th class="table-header">操作</th>
@@ -176,25 +197,18 @@ const AccountList = {
                                     <tbody class="table-body">
                                         <tr v-for="account in accountList" :key="account.accountId" class="table-row">
                                             <td class="table-cell">
-                                                <div class="account-name-cell">
-                                                    <div class="flex flex-col gap-1">
-                                                        <span class="font-medium text-sm">{{ account.accountName }}</span>
-                                                        <span v-if="account.nickname" class="text-xs text-gray-500 dark:text-gray-400">
-                                                            <i data-lucide="user" class="w-3 h-3 inline"></i>
-                                                            {{ account.nickname }}
-                                                        </span>
-                                                    </div>
-                                                    <div class="flex items-center gap-1 flex-wrap">
-                                                        <span v-if="needsLogin(provider, account)" class="badge badge-warning">
-                                                            <i data-lucide="alert-circle"></i>
-                                                            未完成登录
-                                                        </span>
-                                                        <span v-else-if="apiService.isPlaywrightProvider(provider) && account.isLoginVerified" class="badge badge-success">
-                                                            <i data-lucide="check-circle"></i>
-                                                            已登录
-                                                        </span>
-                                                    </div>
+                                                <div class="flex flex-col gap-1">
+                                                    <span class="font-medium text-sm">{{ account.accountName }}</span>
+                                                    <span v-if="account.nickname" class="text-xs text-gray-500 dark:text-gray-400">
+                                                        <i data-lucide="user" class="w-3 h-3 inline"></i>
+                                                        {{ account.nickname }}
+                                                    </span>
                                                 </div>
+                                            </td>
+                                            <td class="table-cell">
+                                                <span :class="getAccountStatusClass(provider, account)" class="text-sm font-medium">
+                                                    {{ getAccountStatus(provider, account) }}
+                                                </span>
                                             </td>
                                             <td class="table-cell">{{ formatTime(account.createdAt) }}</td>
                                             <td class="table-cell">{{ formatTime(account.lastUsedAt) }}</td>
