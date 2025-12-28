@@ -59,13 +59,19 @@ window.addEventListener('DOMContentLoaded', () => {
                     this.showApiKeyModal = false;
                     this.editingApiKey = null;
                 },
-                handleAccountSaved() {
-                    this.closeAccountModal();
+                handleAccountSaved(data) {
+                    // 立即刷新账号列表和统计信息
                     if (this.$refs.accountList) {
                         this.$refs.accountList.loadAccounts();
                     }
                     if (this.$refs.dashboard) {
                         this.$refs.dashboard.loadStats();
+                    }
+                    // 如果不是登录验证成功的情况，立即关闭模态框
+                    // 登录验证成功的情况，AccountForm 会自己延迟关闭（显示成功消息）
+                    const isLoginSuccess = data && data.account && data.account.isLoginVerified === true;
+                    if (!isLoginSuccess) {
+                        this.closeAccountModal();
                     }
                 },
                 handleApiKeySaved() {

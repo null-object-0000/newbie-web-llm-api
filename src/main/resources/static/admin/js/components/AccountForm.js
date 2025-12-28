@@ -142,9 +142,15 @@ const AccountForm = {
                         this.createdAccount.accountName = data.actualAccount;
                     }
                     
-                    // 延迟后关闭表单
+                    // 标记为已登录验证
+                    this.createdAccount.isLoginVerified = true;
+                    
+                    // 立即触发 saved 事件，让父组件刷新账号列表
+                    this.$emit('saved', { account: this.createdAccount });
+                    
+                    // 延迟后关闭表单（给用户看到成功消息的时间）
                     setTimeout(() => {
-                        this.$emit('saved', { account: this.createdAccount });
+                        this.$emit('cancel');
                     }, 2000);
                 } else {
                     this.loginStatus = 'failed';

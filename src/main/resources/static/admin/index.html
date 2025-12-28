@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN" class="dark">
+<html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -9,28 +9,17 @@
     <script src="./libs/tailwindcss.js"></script>
     <script src="./libs/lucide.js"></script>
     <link rel="stylesheet" href="./styles/main.css">
-    <script>
-        // 主题初始化
-        (function() {
-            try {
-                const savedTheme = localStorage.getItem('app-theme-preference');
-                const systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-                const shouldBeDark = savedTheme === 'dark' || ((!savedTheme || savedTheme === 'system') && systemDark);
-                
-                document.documentElement.style.backgroundColor = shouldBeDark ? '#1d232a' : '#FAFBFC';
-                
-                if (shouldBeDark) {
-                    document.documentElement.classList.add('dark');
-                } else {
-                    document.documentElement.classList.remove('dark');
-                }
-            } catch (e) {
-                console.error('Failed to apply theme:', e);
-            }
-        })();
-    </script>
+    <style>
+        html {
+            background-color: #FAFBFC;
+        }
+        body {
+            background-color: #FAFBFC;
+            color: #111827;
+        }
+    </style>
 </head>
-<body class="bg-[#FAFBFC] dark:bg-[#1d232a] text-gray-900 dark:text-gray-100">
+<body class="bg-[#FAFBFC] text-gray-900">
     <div id="app"></div>
     
     <!-- 按顺序加载模块 -->

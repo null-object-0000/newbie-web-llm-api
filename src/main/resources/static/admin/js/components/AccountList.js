@@ -164,53 +164,58 @@ const AccountList = {
                         </div>
                         <div v-if="expandedProviders.has(provider)" class="provider-content">
                             <div class="table-container">
-                                <table>
+                                <table class="account-table">
                                     <thead>
-                                        <tr>
-                                            <th>账号名称</th>
-                                            <th>创建时间</th>
-                                            <th>最后使用</th>
-                                            <th>操作</th>
+                                        <tr class="table-header-row">
+                                            <th class="table-header">账号名称</th>
+                                            <th class="table-header">创建时间</th>
+                                            <th class="table-header">最后使用</th>
+                                            <th class="table-header">操作</th>
                                         </tr>
                                     </thead>
-                                    <tbody>
-                                        <tr v-for="account in accountList" :key="account.accountId">
-                                            <td>
+                                    <tbody class="table-body">
+                                        <tr v-for="account in accountList" :key="account.accountId" class="table-row">
+                                            <td class="table-cell">
                                                 <div class="account-name-cell">
                                                     <div class="flex flex-col gap-1">
-                                                        <span style="font-weight: 500;">{{ account.accountName }}</span>
+                                                        <span class="font-medium text-sm">{{ account.accountName }}</span>
                                                         <span v-if="account.nickname" class="text-xs text-gray-500 dark:text-gray-400">
                                                             <i data-lucide="user" class="w-3 h-3 inline"></i>
                                                             {{ account.nickname }}
                                                         </span>
                                                     </div>
-                                                    <span v-if="needsLogin(provider, account)" class="badge badge-warning">
-                                                        <i data-lucide="alert-circle"></i>
-                                                        未完成登录
-                                                    </span>
-                                                    <span v-else-if="apiService.isPlaywrightProvider(provider) && account.isLoginVerified" class="badge badge-success">
-                                                        <i data-lucide="check-circle"></i>
-                                                        已登录
-                                                    </span>
+                                                    <div class="flex items-center gap-1 flex-wrap">
+                                                        <span v-if="needsLogin(provider, account)" class="badge badge-warning">
+                                                            <i data-lucide="alert-circle"></i>
+                                                            未完成登录
+                                                        </span>
+                                                        <span v-else-if="apiService.isPlaywrightProvider(provider) && account.isLoginVerified" class="badge badge-success">
+                                                            <i data-lucide="check-circle"></i>
+                                                            已登录
+                                                        </span>
+                                                    </div>
                                                 </div>
                                             </td>
-                                            <td>{{ formatTime(account.createdAt) }}</td>
-                                            <td>{{ formatTime(account.lastUsedAt) }}</td>
-                                            <td class="action-cell">
-                                                <div class="action-buttons">
+                                            <td class="table-cell">{{ formatTime(account.createdAt) }}</td>
+                                            <td class="table-cell">{{ formatTime(account.lastUsedAt) }}</td>
+                                            <td class="table-cell">
+                                                <div class="action-buttons-group">
                                                     <!-- 登录流程按钮 -->
                                                     <template v-if="needsLogin(provider, account)">
                                                         <button 
-                                                            class="btn btn-primary btn-sm" 
+                                                            class="action-btn action-btn-primary" 
                                                             @click="$emit('edit', account)"
+                                                            title="开始登录"
                                                         >
-                                                            <i data-lucide="log-in"></i>
-                                                            开始登录
+                                                            <i data-lucide="log-in" class="w-3.5 h-3.5"></i>
                                                         </button>
                                                     </template>
-                                                    <button class="btn btn-danger btn-sm" @click="deleteAccount(provider, account.accountId)" style="margin-left: auto;">
-                                                        <i data-lucide="trash-2"></i>
-                                                        删除
+                                                    <button 
+                                                        class="action-btn action-btn-delete" 
+                                                        @click="deleteAccount(provider, account.accountId)"
+                                                        title="删除"
+                                                    >
+                                                        <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
                                                     </button>
                                                 </div>
                                             </td>

@@ -11,11 +11,17 @@ html, body {
     overscroll-behavior: none;
 }
 
+html {
+    background-color: #FAFBFC;
+}
+
 body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
         'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+    background-color: #FAFBFC;
+    color: #111827;
 }
 
 /* 滚动条优化 */
@@ -54,54 +60,91 @@ body {
     overflow: hidden;
 }
 
-/* 头部样式 */
-.header {
-    padding: 1.5rem 2rem;
-    background: white;
-    border-bottom: 1px solid rgba(0, 0, 0, 0.05);
+/* 头部样式 - 对齐 Antigravity-Manager */
+.header-nav {
+    position: sticky;
+    top: 0;
+    z-index: 50;
+    padding-top: 0;
+    transition: all 0.2s;
+    background: #FAFBFC;
+    border-bottom: none;
 }
 
-.dark .header {
-    background: #1d232a;
-    border-bottom-color: rgba(255, 255, 255, 0.1);
+.dark .header-nav {
+    background: #334155; /* base-300 */
 }
 
-.header h1 {
-    font-size: 1.5rem;
-    font-weight: 600;
-    color: #111827;
-    margin-bottom: 0.5rem;
+.header-nav .max-w-7xl {
+    max-width: 80rem;
 }
 
-.dark .header h1 {
-    color: #f9fafb;
+.header-nav .px-8 {
+    padding-left: 2rem;
+    padding-right: 2rem;
 }
 
-.header p {
-    font-size: 0.875rem;
-    color: #6b7280;
+.header-nav .h-16 {
+    height: 4rem;
 }
 
-.dark .header p {
-    color: #9ca3af;
+/* 标签页样式 - 药丸形状，对齐 Antigravity-Manager */
+.tabs-nav {
+    position: sticky;
+    top: 4rem; /* 在 Header 下方 */
+    z-index: 49;
+    padding-top: 0;
+    transition: all 0.2s;
+    background: #FAFBFC;
+    border-bottom: none;
+    margin-top: 0;
 }
 
-/* 标签页样式 - 药丸形状 */
-.tabs {
-    display: flex;
-    gap: 0.25rem;
-    padding: 0.5rem;
-    background: #f3f4f6;
+.dark .tabs-nav {
+    background: #334155; /* base-300 */
+}
+
+.tabs-nav .max-w-7xl {
+    max-width: 80rem;
+}
+
+.tabs-nav .px-8 {
+    padding-left: 2rem;
+    padding-right: 2rem;
+}
+
+.tabs-nav .h-16 {
+    height: 4rem;
+}
+
+.tabs-nav .mx-auto {
+    margin-left: auto;
+    margin-right: auto;
+}
+
+/* 药丸形状的导航标签容器 */
+.tabs-nav .bg-gray-100 {
+    background-color: #f3f4f6;
+}
+
+.dark .tabs-nav .bg-gray-100 {
+    background-color: #1e293b; /* base-200 */
+}
+
+.tabs-nav .rounded-full {
     border-radius: 9999px;
-    margin: 1.5rem 2rem;
-    width: fit-content;
 }
 
-.dark .tabs {
-    background: #374151;
+.tabs-nav .p-1 {
+    padding: 0.25rem;
 }
 
-.tab {
+.tabs-nav .gap-1 {
+    gap: 0.25rem;
+}
+
+/* 导航按钮样式 */
+.tabs-nav button {
     padding: 0.5rem 1.5rem;
     border: none;
     border-radius: 9999px;
@@ -109,33 +152,35 @@ body {
     font-weight: 500;
     cursor: pointer;
     transition: all 0.2s;
-    background: transparent;
-    color: #6b7280;
 }
 
-.dark .tab {
-    color: #9ca3af;
-}
-
-.tab:hover {
-    color: #111827;
-    background: #e5e7eb;
-}
-
-.dark .tab:hover {
-    color: #f9fafb;
-    background: #4b5563;
-}
-
-.tab.active {
-    background: #111827;
+.tabs-nav button.bg-gray-900 {
+    background-color: #111827;
     color: white;
     box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
 }
 
-.dark .tab.active {
-    background: white;
+.dark .tabs-nav button.bg-gray-900 {
+    background-color: white;
     color: #111827;
+}
+
+.tabs-nav button.text-gray-700 {
+    color: #374151;
+}
+
+.dark .tabs-nav button.text-gray-700 {
+    color: #9ca3af;
+}
+
+.tabs-nav button:hover {
+    color: #111827;
+    background-color: #e5e7eb;
+}
+
+.dark .tabs-nav button:hover {
+    color: #f1f5f9; /* base-content */
+    background-color: #0f172a; /* base-100 */
 }
 
 /* 内容区域 */
@@ -245,59 +290,214 @@ body {
     height: 0.875rem;
 }
 
-/* 表格样式 */
+/* 表格样式 - 对齐 Antigravity-Manager */
 .table-container {
     overflow-x: auto;
 }
 
-table {
+.account-table {
     width: 100%;
     border-collapse: collapse;
 }
 
-th, td {
-    padding: 1rem 0.75rem;
-    text-align: left;
-    border-bottom: 1px solid rgba(0, 0, 0, 0.05);
-    vertical-align: middle;
-}
-
-td {
-    padding: 1rem 0.75rem;
-}
-
-.dark th, .dark td {
-    border-bottom-color: rgba(255, 255, 255, 0.1);
-}
-
-th {
+.account-table .table-header-row {
+    border-bottom: 1px solid #f3f4f6;
     background: #f9fafb;
-    font-weight: 600;
+}
+
+.dark .account-table .table-header-row {
+    border-bottom-color: #1e293b; /* base-200 */
+    background: #1e293b; /* base-200 */
+}
+
+.account-table .table-header {
+    padding: 0.5rem 1rem;
+    text-align: left;
     font-size: 0.75rem;
+    font-weight: 500;
     text-transform: uppercase;
     letter-spacing: 0.05em;
     color: #6b7280;
+    white-space: nowrap;
 }
 
-.dark th {
-    background: #374151;
+.dark .account-table .table-header {
     color: #9ca3af;
 }
 
-tr {
+.account-table .table-body {
+    border-top: none;
+}
+
+.account-table .table-row {
+    border-bottom: 1px solid #f3f4f6;
     transition: background-color 0.15s ease;
 }
 
-tr:hover {
+.dark .account-table .table-row {
+    border-bottom-color: #1e293b; /* base-200 */
+}
+
+.account-table .table-row:hover {
     background: #f9fafb;
 }
 
-.dark tr:hover {
-    background: #374151;
+.dark .account-table .table-row:hover {
+    background: #1e293b; /* base-200 */
 }
 
-tr:last-child td {
+.account-table .table-row:last-child {
     border-bottom: none;
+}
+
+.account-table .table-cell {
+    padding: 0.5rem 1rem;
+    text-align: left;
+    vertical-align: middle;
+    font-size: 0.875rem;
+}
+
+.account-table .table-cell .text-sm {
+    font-size: 0.875rem;
+}
+
+.account-table .table-cell .text-xs {
+    font-size: 0.75rem;
+}
+
+/* 操作按钮组样式 - 对齐 Antigravity-Manager */
+.action-buttons-group {
+    display: flex;
+    align-items: center;
+    gap: 0.125rem;
+    opacity: 0.6;
+    transition: opacity 0.2s;
+}
+
+.table-row:hover .action-buttons-group {
+    opacity: 1;
+}
+
+.action-btn {
+    padding: 0.375rem;
+    border: none;
+    border-radius: 0.5rem;
+    cursor: pointer;
+    transition: all 0.2s;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    color: #6b7280;
+}
+
+.dark .action-btn {
+    color: #9ca3af;
+}
+
+.action-btn:hover {
+    background-color: rgba(0, 0, 0, 0.05);
+}
+
+.dark .action-btn:hover {
+    background-color: rgba(255, 255, 255, 0.05);
+}
+
+.action-btn i {
+    width: 0.875rem;
+    height: 0.875rem;
+    flex-shrink: 0;
+}
+
+/* 操作按钮颜色变体 */
+.action-btn-primary {
+    color: #6b7280;
+}
+
+.dark .action-btn-primary {
+    color: #9ca3af;
+}
+
+.action-btn-primary:hover {
+    color: #0284c7; /* sky-600 */
+    background-color: #e0f2fe; /* sky-50 */
+}
+
+.dark .action-btn-primary:hover {
+    color: #38bdf8; /* sky-400 */
+    background-color: rgba(14, 165, 233, 0.1); /* sky-900/30 */
+}
+
+.action-btn-switch {
+    color: #6b7280;
+}
+
+.dark .action-btn-switch {
+    color: #9ca3af;
+}
+
+.action-btn-switch:hover {
+    color: #2563eb; /* blue-600 */
+    background-color: #dbeafe; /* blue-50 */
+}
+
+.dark .action-btn-switch:hover {
+    color: #60a5fa; /* blue-400 */
+    background-color: rgba(30, 58, 138, 0.1); /* blue-900/30 */
+}
+
+.action-btn-refresh {
+    color: #6b7280;
+}
+
+.dark .action-btn-refresh {
+    color: #9ca3af;
+}
+
+.action-btn-refresh:hover {
+    color: #16a34a; /* green-600 */
+    background-color: #dcfce7; /* green-50 */
+}
+
+.dark .action-btn-refresh:hover {
+    color: #4ade80; /* green-400 */
+    background-color: rgba(20, 83, 45, 0.1); /* green-900/30 */
+}
+
+.action-btn-export {
+    color: #6b7280;
+}
+
+.dark .action-btn-export {
+    color: #9ca3af;
+}
+
+.action-btn-export:hover {
+    color: #4f46e5; /* indigo-600 */
+    background-color: #eef2ff; /* indigo-50 */
+}
+
+.dark .action-btn-export:hover {
+    color: #818cf8; /* indigo-400 */
+    background-color: rgba(55, 48, 163, 0.1); /* indigo-900/30 */
+}
+
+.action-btn-delete {
+    color: #6b7280;
+}
+
+.dark .action-btn-delete {
+    color: #9ca3af;
+}
+
+.action-btn-delete:hover {
+    color: #dc2626; /* red-600 */
+    background-color: #fee2e2; /* red-50 */
+}
+
+.dark .action-btn-delete:hover {
+    color: #f87171; /* red-400 */
+    background-color: rgba(127, 29, 29, 0.1); /* red-900/30 */
 }
 
 code {
@@ -648,6 +848,42 @@ code {
     gap: 1rem;
 }
 
+.w-10 {
+    width: 2.5rem;
+}
+
+.h-10 {
+    height: 2.5rem;
+}
+
+.w-5 {
+    width: 1.25rem;
+}
+
+.h-5 {
+    height: 1.25rem;
+}
+
+.rounded-full {
+    border-radius: 9999px;
+}
+
+.bg-gray-100 {
+    background-color: #f3f4f6;
+}
+
+.dark .bg-gray-100 {
+    background-color: #1e293b; /* base-200 */
+}
+
+.hover\:bg-gray-200:hover {
+    background-color: #e5e7eb;
+}
+
+.dark .hover\:bg-gray-200:hover {
+    background-color: #0f172a; /* base-100 */
+}
+
 .grid {
     display: grid;
 }
@@ -853,6 +1089,14 @@ code {
 
 .h-3\.5 {
     height: 0.875rem;
+}
+
+.w-3 {
+    width: 0.75rem;
+}
+
+.h-3 {
+    height: 0.75rem;
 }
 
 .pl-9 {
@@ -1139,9 +1383,9 @@ code {
     flex-shrink: 0;
 }
 
-/* 操作列样式优化 */
+/* 操作列样式优化 - 对齐 Antigravity-Manager */
 .action-cell {
-    min-width: 200px;
+    min-width: auto;
 }
 
 .action-buttons {
@@ -1149,6 +1393,20 @@ code {
     flex-wrap: wrap;
     gap: 0.5rem;
     align-items: flex-start;
+}
+
+/* 账号名称单元格样式优化 */
+.account-name-cell {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    flex-direction: column;
+}
+
+.account-name-cell .flex.flex-col {
+    flex: 1;
+    min-width: 0;
 }
 
 .login-status-message {
