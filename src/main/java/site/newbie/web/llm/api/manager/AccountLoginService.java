@@ -251,9 +251,38 @@ public class AccountLoginService {
                     return LoginVerificationResult.failed("登录页面已关闭，无法验证登录状态");
                 }
                 
-                // 等待页面稳定
-                page.waitForLoadState();
-                page.waitForTimeout(2000);
+                // 对于某些提供器（如 deepseek），需要重新打开新的标签页来验证登录
+                // 因为验证可能需要调用 API，使用新页面可以避免与登录页面的冲突
+                boolean needNewPage = "deepseek".equalsIgnoreCase(session.getProviderName());
+                
+                if (needNewPage) {
+                    log.info("为 {} 提供器创建新的验证页面", session.getProviderName());
+                    // 关闭旧的登录页面（如果存在且未关闭）
+                    if (page != null && !page.isClosed()) {
+                        try {
+                            page.close();
+                        } catch (Exception e) {
+                            log.debug("关闭旧页面时出错: {}", e.getMessage());
+                        }
+                    }
+                    
+                    // 创建新的验证页面
+                    context = browserManager.getOrCreateContext(session.getProviderName(), session.getAccountId());
+                    session.setBrowserContext(context);
+                    page = context.newPage();
+                    session.setLoginPage(page);
+                    
+                    // 导航到聊天页面（已登录状态）
+                    String chatUrl = getChatUrl(session.getProviderName());
+                    log.info("导航到聊天页面进行验证: {}", chatUrl);
+                    page.navigate(chatUrl);
+                    page.waitForLoadState();
+                    page.waitForTimeout(2000);
+                } else {
+                    // 等待页面稳定
+                    page.waitForLoadState();
+                    page.waitForTimeout(2000);
+                }
                 
                 // 获取提供器
                 LLMProvider provider = providerRegistry.getProviderByName(session.getProviderName());
@@ -366,7 +395,23 @@ public class AccountLoginService {
             case "openai":
                 return "https://chat.openai.com";
             case "deepseek":
-                return "https://www.deepseek.com";
+                return "https://chat.deepseek.com";
+            default:
+                throw new IllegalArgumentException("未知的提供器: " + providerName);
+        }
+    }
+    
+    /**
+     * 获取提供器的聊天 URL（用于验证登录状态）
+     */
+    private String getChatUrl(String providerName) {
+        switch (providerName.toLowerCase()) {
+            case "gemini":
+                return "https://gemini.google.com";
+            case "openai":
+                return "https://chat.openai.com";
+            case "deepseek":
+                return "https://chat.deepseek.com";
             default:
                 throw new IllegalArgumentException("未知的提供器: " + providerName);
         }
@@ -426,6 +471,7 @@ public class AccountLoginService {
      * 1. 完全匹配（忽略大小写）
      * 2. 如果期望的账号包含 @，则必须完全匹配（忽略大小写）
      * 3. 如果期望的账号不包含 @，则检查是否是实际邮箱的前缀
+     * 4. 兼容部分显示的 email（如 "ni*****en@outlook.com"），通过提取可见部分进行匹配
      */
     private boolean verifyAccountMatch(String expected, String actual) {
         if (expected == null || actual == null) {
@@ -442,23 +488,146 @@ public class AccountLoginService {
 
         // 2. 如果期望的账号包含 @，则必须完全匹配
         if (expectedLower.contains("@")) {
+            // 如果实际的 email 是部分显示的（包含 *），需要特殊处理
+            if (actualLower.contains("*")) {
+                return matchPartialEmail(expectedLower, actualLower);
+            }
             return expectedLower.equals(actualLower);
         }
 
         // 3. 如果期望的账号不包含 @，检查是否是实际邮箱的前缀
         // 例如：期望 "thien01657008216"，实际 "thien01657008216@gmail.com" 应该匹配
         if (actualLower.contains("@")) {
-            String[] actualParts = actualLower.split("@");
-            if (actualParts.length == 2) {
-                String actualPrefix = actualParts[0];
-                // 前缀完全匹配
-                if (expectedLower.equals(actualPrefix)) {
+            // 如果实际的 email 是部分显示的（包含 *），需要特殊处理
+            if (actualLower.contains("*")) {
+                // 提取实际 email 的可见部分（@ 之前的部分，去掉 *）
+                String actualVisiblePart = extractVisiblePart(actualLower.split("@")[0]);
+                if (expectedLower.equals(actualVisiblePart)) {
                     return true;
+                }
+            } else {
+                String[] actualParts = actualLower.split("@");
+                if (actualParts.length == 2) {
+                    String actualPrefix = actualParts[0];
+                    // 前缀完全匹配
+                    if (expectedLower.equals(actualPrefix)) {
+                        return true;
+                    }
                 }
             }
         }
 
         return false;
+    }
+    
+    /**
+     * 匹配部分显示的 email
+     * 例如：期望 "nichangen@outlook.com"，实际 "ni*****en@outlook.com" 应该匹配
+     */
+    private boolean matchPartialEmail(String expected, String actual) {
+        if (!expected.contains("@") || !actual.contains("@")) {
+            return false;
+        }
+        
+        String[] expectedParts = expected.split("@");
+        String[] actualParts = actual.split("@");
+        
+        if (expectedParts.length != 2 || actualParts.length != 2) {
+            return false;
+        }
+        
+        // 域名必须完全匹配
+        if (!expectedParts[1].equals(actualParts[1])) {
+            return false;
+        }
+        
+        // 匹配用户名部分（支持部分显示）
+        String expectedUser = expectedParts[0];
+        String actualUser = actualParts[0];
+        
+        // 如果实际用户名包含 *，提取开头和结尾的可见部分进行匹配
+        if (actualUser.contains("*")) {
+            // 提取开头的可见字符
+            String prefix = extractPrefix(actualUser);
+            // 提取结尾的可见字符
+            String suffix = extractSuffix(actualUser);
+            
+            // 检查期望的用户名是否以相同的前缀开头
+            boolean prefixMatch = prefix == null || prefix.isEmpty() || expectedUser.startsWith(prefix);
+            
+            // 检查期望的用户名是否以相同的后缀结尾
+            boolean suffixMatch = suffix == null || suffix.isEmpty() || expectedUser.endsWith(suffix);
+            
+            // 如果前缀或后缀匹配，则认为匹配成功（放宽匹配条件）
+            // 因为部分显示的格式可能不完全准确
+            if (prefixMatch && suffixMatch) {
+                return true;
+            }
+            
+            // 如果只有前缀匹配，也认为匹配（因为部分显示可能只显示开头）
+            if (prefixMatch && prefix.length() >= 2) {
+                return true;
+            }
+            
+            // 如果后缀匹配且后缀长度 >= 2，也认为匹配
+            if (suffixMatch && suffix.length() >= 2) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+    
+    /**
+     * 从部分显示的字符串中提取开头的可见部分
+     * 例如："ni*****en" -> "ni"
+     */
+    private String extractPrefix(String partial) {
+        if (partial == null || partial.isEmpty()) {
+            return "";
+        }
+        
+        StringBuilder prefix = new StringBuilder();
+        for (int i = 0; i < partial.length(); i++) {
+            char c = partial.charAt(i);
+            if (c == '*') {
+                break;
+            }
+            prefix.append(c);
+        }
+        
+        return prefix.toString();
+    }
+    
+    /**
+     * 从部分显示的字符串中提取结尾的可见部分
+     * 例如："ni*****en" -> "en"
+     */
+    private String extractSuffix(String partial) {
+        if (partial == null || partial.isEmpty()) {
+            return "";
+        }
+        
+        StringBuilder suffix = new StringBuilder();
+        for (int i = partial.length() - 1; i >= 0; i--) {
+            char c = partial.charAt(i);
+            if (c == '*') {
+                break;
+            }
+            suffix.insert(0, c);
+        }
+        
+        return suffix.toString();
+    }
+    
+    /**
+     * 从部分显示的字符串中提取可见部分（保留用于兼容性）
+     * 例如："ni*****en" -> "nien"（提取开头和结尾的可见字符）
+     */
+    private String extractVisiblePart(String partial) {
+        String prefix = extractPrefix(partial);
+        String suffix = extractSuffix(partial);
+        return prefix + suffix;
     }
     
     /**

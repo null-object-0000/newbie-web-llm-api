@@ -142,39 +142,37 @@ public class ApiKeyManager {
     }
     
     /**
-     * 创建 API 密钥（关联多个提供器的账号）
-     * @param providerAccounts 提供器名称到账号ID的映射
+     * 创建 API 密钥（可以关联多个提供器的账号，也可以不关联）
+     * @param providerAccounts 提供器名称到账号ID的映射，可以为空或 null
      * @param name 密钥名称
      * @param description 密钥描述
      * @return API 密钥
      */
     public String createApiKey(Map<String, String> providerAccounts, String name, String description) {
-        if (providerAccounts == null || providerAccounts.isEmpty()) {
-            throw new IllegalArgumentException("至少需要关联一个提供器的账号");
-        }
-        
-        // 验证所有账号是否存在
-        for (Map.Entry<String, String> entry : providerAccounts.entrySet()) {
-            String providerName = entry.getKey();
-            String accountId = entry.getValue();
-            AccountManager.AccountInfo account = accountManager.getAccount(accountId);
-            if (account == null) {
-                throw new IllegalArgumentException("账号不存在: " + accountId);
-            }
-            if (!account.getProviderName().equals(providerName)) {
-                throw new IllegalArgumentException("账号 " + accountId + " 不属于提供器 " + providerName);
+        // 如果提供了账号，验证所有账号是否存在
+        if (providerAccounts != null && !providerAccounts.isEmpty()) {
+            for (Map.Entry<String, String> entry : providerAccounts.entrySet()) {
+                String providerName = entry.getKey();
+                String accountId = entry.getValue();
+                AccountManager.AccountInfo account = accountManager.getAccount(accountId);
+                if (account == null) {
+                    throw new IllegalArgumentException("账号不存在: " + accountId);
+                }
+                if (!account.getProviderName().equals(providerName)) {
+                    throw new IllegalArgumentException("账号 " + accountId + " 不属于提供器 " + providerName);
+                }
             }
         }
         
         String apiKey = generateApiKey();
         ApiKeyInfo info = new ApiKeyInfo();
         info.setApiKey(apiKey);
-        info.setProviderAccounts(new HashMap<>(providerAccounts));
+        info.setProviderAccounts(providerAccounts != null ? new HashMap<>(providerAccounts) : new HashMap<>());
         info.setName(name != null ? name : "API Key");
         info.setDescription(description);
         
         // 兼容旧版本：如果只有一个提供器，也设置 accountId 和 providerName
-        if (providerAccounts.size() == 1) {
+        if (providerAccounts != null && providerAccounts.size() == 1) {
             Map.Entry<String, String> entry = providerAccounts.entrySet().iterator().next();
             info.setProviderName(entry.getKey());
             info.setAccountId(entry.getValue());
@@ -183,8 +181,10 @@ public class ApiKeyManager {
         apiKeysCache.put(apiKey, info);
         
         // 更新反向索引
-        for (String accountId : providerAccounts.values()) {
-            accountToApiKeys.computeIfAbsent(accountId, k -> ConcurrentHashMap.newKeySet()).add(apiKey);
+        if (providerAccounts != null) {
+            for (String accountId : providerAccounts.values()) {
+                accountToApiKeys.computeIfAbsent(accountId, k -> ConcurrentHashMap.newKeySet()).add(apiKey);
+            }
         }
         
         saveApiKeys();
@@ -314,6 +314,79 @@ public class ApiKeyManager {
         
         saveApiKeys();
         log.info("更新 API 密钥: apiKey={}, name={}, enabled={}", apiKey, name, enabled);
+    }
+    
+    /**
+     * 更新 API 密钥关联的账号
+     * @param apiKey API 密钥
+     * @param providerAccounts 提供器名称到账号ID的映射，可以为空或 null（表示不关联任何账号）
+     */
+    public void updateProviderAccounts(String apiKey, Map<String, String> providerAccounts) {
+        ApiKeyInfo info = apiKeysCache.get(apiKey);
+        if (info == null) {
+            throw new IllegalArgumentException("API 密钥不存在: " + apiKey);
+        }
+        
+        // 如果提供了账号，验证所有账号是否存在
+        if (providerAccounts != null && !providerAccounts.isEmpty()) {
+            for (Map.Entry<String, String> entry : providerAccounts.entrySet()) {
+                String providerName = entry.getKey();
+                String accountId = entry.getValue();
+                AccountManager.AccountInfo account = accountManager.getAccount(accountId);
+                if (account == null) {
+                    throw new IllegalArgumentException("账号不存在: " + accountId);
+                }
+                if (!account.getProviderName().equals(providerName)) {
+                    throw new IllegalArgumentException("账号 " + accountId + " 不属于提供器 " + providerName);
+                }
+            }
+        }
+        
+        // 从旧的反向索引中移除
+        if (info.getProviderAccounts() != null) {
+            for (String accountId : info.getProviderAccounts().values()) {
+                Set<String> apiKeys = accountToApiKeys.get(accountId);
+                if (apiKeys != null) {
+                    apiKeys.remove(apiKey);
+                    if (apiKeys.isEmpty()) {
+                        accountToApiKeys.remove(accountId);
+                    }
+                }
+            }
+        } else if (info.getAccountId() != null) {
+            // 兼容旧版本
+            Set<String> apiKeys = accountToApiKeys.get(info.getAccountId());
+            if (apiKeys != null) {
+                apiKeys.remove(apiKey);
+                if (apiKeys.isEmpty()) {
+                    accountToApiKeys.remove(info.getAccountId());
+                }
+            }
+        }
+        
+        // 更新 providerAccounts
+        info.setProviderAccounts(providerAccounts != null ? new HashMap<>(providerAccounts) : new HashMap<>());
+        
+        // 兼容旧版本：如果只有一个提供器，也设置 accountId 和 providerName
+        if (providerAccounts != null && providerAccounts.size() == 1) {
+            Map.Entry<String, String> entry = providerAccounts.entrySet().iterator().next();
+            info.setProviderName(entry.getKey());
+            info.setAccountId(entry.getValue());
+        } else {
+            // 如果为空或多个，清除旧版本字段
+            info.setProviderName(null);
+            info.setAccountId(null);
+        }
+        
+        // 更新新的反向索引
+        if (providerAccounts != null) {
+            for (String accountId : providerAccounts.values()) {
+                accountToApiKeys.computeIfAbsent(accountId, k -> ConcurrentHashMap.newKeySet()).add(apiKey);
+            }
+        }
+        
+        saveApiKeys();
+        log.info("更新 API 密钥关联账号: apiKey={}, providerAccounts={}", apiKey, providerAccounts);
     }
     
     /**

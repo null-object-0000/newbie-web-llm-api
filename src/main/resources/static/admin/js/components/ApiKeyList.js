@@ -1,4 +1,4 @@
-// 使用全局 apiService
+// 使用全局 apiService（优先使用全局的 apiService）
 const apiService = window.apiService || {
     getApiKeys: async (accountId) => {
         const url = accountId
@@ -19,13 +19,18 @@ const apiService = window.apiService || {
 
 const ApiKeyList = {
     name: 'ApiKeyList',
+    components: {
+        ApiKeyAccountForm: window.ApiKeyAccountForm
+    },
     emits: ['edit'],
     data() {
         return {
             apiKeys: [],
             loading: false,
             error: null,
-            searchQuery: '' // 搜索查询
+            searchQuery: '', // 搜索查询
+            showAccountForm: false, // 显示关联账号表单
+            selectedApiKey: null // 选中的 API 密钥（用于关联账号）
         };
     },
     mounted() {
@@ -98,6 +103,18 @@ const ApiKeyList = {
             return apiKey.enabled 
                 ? 'text-green-600 dark:text-green-400' 
                 : 'text-gray-500 dark:text-gray-400';
+        },
+        openAccountForm(apiKey) {
+            this.selectedApiKey = apiKey;
+            this.showAccountForm = true;
+        },
+        closeAccountForm() {
+            this.showAccountForm = false;
+            this.selectedApiKey = null;
+        },
+        onAccountsSaved() {
+            this.closeAccountForm();
+            this.loadApiKeys();
         }
     },
     computed: {
@@ -191,6 +208,13 @@ const ApiKeyList = {
                                     <td class="table-cell">
                                         <div class="action-buttons-group">
                                             <button 
+                                                class="action-btn action-btn-primary" 
+                                                @click="openAccountForm(apiKey)"
+                                                title="关联账号"
+                                            >
+                                                <i data-lucide="link" class="w-3.5 h-3.5"></i>
+                                            </button>
+                                            <button 
                                                 class="action-btn action-btn-switch" 
                                                 @click="toggleApiKey(apiKey.apiKey, !apiKey.enabled)"
                                                 :title="apiKey.enabled ? '禁用' : '启用'"
@@ -209,6 +233,26 @@ const ApiKeyList = {
                                 </tr>
                             </tbody>
                         </table>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 关联账号模态框 -->
+            <div v-if="showAccountForm" class="modal" @click.self="closeAccountForm">
+                <div class="modal-content" style="max-width: 900px; width: 95%;">
+                    <div class="modal-header">
+                        <h2>关联账号 - {{ selectedApiKey?.name || selectedApiKey?.apiKey }}</h2>
+                        <button class="close" @click="closeAccountForm">
+                            <i data-lucide="x" class="w-5 h-5"></i>
+                        </button>
+                    </div>
+                    <div class="modal-body">
+                        <ApiKeyAccountForm 
+                            v-if="selectedApiKey"
+                            :apiKey="selectedApiKey"
+                            @saved="onAccountsSaved"
+                            @cancel="closeAccountForm"
+                        />
                     </div>
                 </div>
             </div>

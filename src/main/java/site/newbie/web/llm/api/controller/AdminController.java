@@ -11,6 +11,7 @@ import site.newbie.web.llm.api.manager.ApiKeyManager;
 import site.newbie.web.llm.api.provider.ProviderRegistry;
 import site.newbie.web.llm.api.provider.ProviderType;
 
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -60,8 +61,16 @@ public class AdminController {
                 result.put("accounts", accounts);
                 result.put("count", accounts.size());
             } else {
-                // 获取所有账号
-                Map<String, List<AccountManager.AccountInfo>> allAccounts = accountManager.getAllAccounts();
+                // 以代码中实际注册的提供器为基准
+                Map<String, Object> allProviders = providerRegistry.getAllProviders();
+                Map<String, List<AccountManager.AccountInfo>> allAccounts = new HashMap<>();
+                
+                // 对于每个注册的提供器，获取其账号（如果没有则返回空列表）
+                for (String providerName : allProviders.keySet()) {
+                    List<AccountManager.AccountInfo> accounts = accountManager.getAccountsByProvider(providerName);
+                    allAccounts.put(providerName, accounts);
+                }
+                
                 result.put("accounts", allAccounts);
                 int totalCount = allAccounts.values().stream()
                     .mapToInt(List::size)
@@ -282,7 +291,7 @@ public class AdminController {
     }
     
     /**
-     * 创建 API 密钥
+     * 创建 API 密钥（可以不关联账号）
      */
     @PostMapping("/api-keys")
     public ResponseEntity<Map<String, Object>> createApiKey(@RequestBody CreateApiKeyRequest request) {
@@ -304,8 +313,12 @@ public class AdminController {
                     request.getDescription()
                 );
             } else {
-                return ResponseEntity.status(HttpStatus.BAD_REQUEST)
-                    .body(Map.of("error", "至少需要关联一个提供器的账号"));
+                // 允许创建不关联账号的 API 密钥
+                apiKey = apiKeyManager.createApiKey(
+                    (Map<String, String>) null,
+                    request.getName(),
+                    request.getDescription()
+                );
             }
             
             Map<String, Object> result = new HashMap<>();
@@ -344,6 +357,27 @@ public class AdminController {
     }
     
     /**
+     * 更新 API 密钥关联的账号
+     */
+    @PutMapping("/api-keys/{apiKey}/accounts")
+    public ResponseEntity<Map<String, Object>> updateApiKeyAccounts(
+            @PathVariable String apiKey,
+            @RequestBody UpdateApiKeyAccountsRequest request) {
+        try {
+            apiKeyManager.updateProviderAccounts(
+                apiKey,
+                request.getProviderAccounts()
+            );
+            
+            return ResponseEntity.ok(Map.of("success", true, "message", "关联账号已更新"));
+        } catch (Exception e) {
+            log.error("更新 API 密钥关联账号失败: apiKey={}", apiKey, e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(Map.of("error", e.getMessage()));
+        }
+    }
+    
+    /**
      * 删除 API 密钥
      */
     @DeleteMapping("/api-keys/{apiKey}")
@@ -362,23 +396,30 @@ public class AdminController {
     
     /**
      * 获取统计信息
+     * 以代码中实际注册的提供器为基准，而不是以 JSON 文件为基准
      */
     @GetMapping("/stats")
     public ResponseEntity<Map<String, Object>> getStats() {
         try {
             Map<String, Object> stats = new HashMap<>();
             
-            // 账号统计
+            // 获取代码中注册的所有提供器
+            Map<String, Object> allProviders = providerRegistry.getAllProviders();
+            
+            // 获取账号统计（以代码中注册的提供器为基准）
             Map<String, List<AccountManager.AccountInfo>> allAccounts = accountManager.getAllAccounts();
             int totalAccounts = allAccounts.values().stream()
                 .mapToInt(List::size)
                 .sum();
             stats.put("totalAccounts", totalAccounts);
-            stats.put("accountsByProvider", allAccounts.entrySet().stream()
-                .collect(Collectors.toMap(
-                    Map.Entry::getKey,
-                    e -> e.getValue().size()
-                )));
+            
+            // 以代码中注册的提供器为基准，统计每个提供器的账号数量
+            Map<String, Integer> accountsByProvider = new HashMap<>();
+            for (String providerName : allProviders.keySet()) {
+                List<AccountManager.AccountInfo> providerAccounts = allAccounts.getOrDefault(providerName, Collections.emptyList());
+                accountsByProvider.put(providerName, providerAccounts.size());
+            }
+            stats.put("accountsByProvider", accountsByProvider);
             
             // API 密钥统计
             List<ApiKeyManager.ApiKeyInfo> allApiKeys = apiKeyManager.getAllApiKeys();
@@ -389,7 +430,6 @@ public class AdminController {
             stats.put("enabledApiKeys", enabledApiKeys);
             
             // 提供器统计
-            Map<String, Object> allProviders = providerRegistry.getAllProviders();
             stats.put("totalProviders", allProviders.size());
             stats.put("providers", allProviders.keySet());
             
@@ -424,6 +464,11 @@ public class AdminController {
         private String name;
         private String description;
         private Boolean enabled;
+    }
+    
+    @Data
+    public static class UpdateApiKeyAccountsRequest {
+        private Map<String, String> providerAccounts; // providerName -> accountId
     }
     
     @Data

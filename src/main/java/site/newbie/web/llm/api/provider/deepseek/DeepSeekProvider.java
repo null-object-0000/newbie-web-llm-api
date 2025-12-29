@@ -1,8 +1,11 @@
 package site.newbie.web.llm.api.provider.deepseek;
 
+import com.microsoft.playwright.APIRequestContext;
+import com.microsoft.playwright.APIResponse;
 import com.microsoft.playwright.Frame;
 import com.microsoft.playwright.Locator;
 import com.microsoft.playwright.Page;
+import com.microsoft.playwright.options.RequestOptions;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.MediaType;
@@ -12,6 +15,7 @@ import site.newbie.web.llm.api.manager.BrowserManager;
 import site.newbie.web.llm.api.model.ChatCompletionRequest;
 import site.newbie.web.llm.api.model.ChatCompletionResponse;
 import site.newbie.web.llm.api.provider.LLMProvider;
+import site.newbie.web.llm.api.provider.AccountInfo;
 import site.newbie.web.llm.api.model.LoginInfo;
 import site.newbie.web.llm.api.manager.LoginSessionManager;
 import site.newbie.web.llm.api.provider.ModelConfig;
@@ -183,6 +187,164 @@ public class DeepSeekProvider implements LLMProvider {
         }
         
         return LoginInfo.loggedIn();
+    }
+    
+    @Override
+    public AccountInfo getCurrentAccountInfo(Page page) {
+        try {
+            if (page == null || page.isClosed()) {
+                return AccountInfo.failed("页面为空或已关闭");
+            }
+            
+            // 等待页面加载完成
+            page.waitForLoadState();
+            page.waitForTimeout(2000);
+            
+            // 检查是否已登录
+            if (!checkLoginStatus(page)) {
+                return AccountInfo.failed("未登录");
+            }
+            
+            // 等待页面完全初始化，确保 token 已经加载
+            page.waitForTimeout(2000);
+            
+            // 从 localStorage 获取 token（这个必须使用 evaluate，因为 Playwright 没有直接访问 localStorage 的 API）
+            String token = (String) page.evaluate("""
+                () => {
+                    try {
+                        const userTokenStr = localStorage.getItem('userToken');
+                        if (userTokenStr) {
+                            const userTokenObj = JSON.parse(userTokenStr);
+                            if (userTokenObj && userTokenObj.value) {
+                                return userTokenObj.value;
+                            }
+                        }
+                    } catch (e) {
+                        console.error('获取 token 失败:', e);
+                    }
+                    return null;
+                }
+                """);
+            
+            if (token == null || token.isEmpty()) {
+                return AccountInfo.failed("无法获取 token，请确保已登录。localStorage.userToken 不存在或格式不正确");
+            }
+            
+            log.debug("已获取 token，长度: {}", token.length());
+            
+            // 使用 Playwright 的 APIRequestContext 发送 HTTP 请求
+            APIRequestContext requestContext = page.context().request();
+            
+            APIResponse response;
+            try {
+                response = requestContext.get("https://chat.deepseek.com/api/v0/users/current", 
+                    RequestOptions.create()
+                        .setHeader("accept", "*/*")
+                        .setHeader("accept-language", "zh-CN,zh;q=0.9")
+                        .setHeader("authorization", "Bearer " + token)
+                        .setHeader("sec-fetch-dest", "empty")
+                        .setHeader("sec-fetch-mode", "cors")
+                        .setHeader("sec-fetch-site", "same-origin")
+                        .setHeader("x-app-version", "20241129.1")
+                        .setHeader("x-client-locale", "zh_CN")
+                        .setHeader("x-client-platform", "web")
+                        .setHeader("x-client-version", "1.6.0"));
+            } catch (Exception e) {
+                log.error("API 请求失败: {}", e.getMessage(), e);
+                return AccountInfo.failed("API 请求失败: " + e.getMessage());
+            }
+            
+            if (response.status() != 200) {
+                String errorText = response.text();
+                log.error("API 请求失败，状态码: {}, 响应: {}", response.status(), errorText);
+                return AccountInfo.failed("API 请求失败: " + response.status() + ", " + errorText);
+            }
+            
+            String resultJson = response.text();
+            if (resultJson == null || resultJson.isEmpty()) {
+                log.error("API 调用返回空结果");
+                return AccountInfo.failed("无法获取用户信息：API 返回空结果");
+            }
+            
+            log.debug("API 响应长度: {} 字符", resultJson.length());
+            
+            // 解析响应
+            JsonNode json;
+            try {
+                json = objectMapper.readTree(resultJson);
+            } catch (Exception e) {
+                log.error("解析 API 响应失败: {}, 响应内容前200字符: {}", e.getMessage(), 
+                    resultJson.length() > 200 ? resultJson.substring(0, 200) : resultJson);
+                return AccountInfo.failed("解析 API 响应失败: " + e.getMessage());
+            }
+            
+            // 检查响应中的错误
+            if (json.has("code") && json.get("code").asInt() != 0) {
+                String errorMsg = json.has("msg") ? json.get("msg").asString() : "获取用户信息失败";
+                log.error("API 返回错误: code={}, msg={}", json.get("code").asInt(), errorMsg);
+                return AccountInfo.failed(errorMsg);
+            }
+            
+            // 解析响应结构
+            if (json.has("code") && json.get("code").asInt() != 0) {
+                String msg = json.has("msg") ? json.get("msg").asString() : "获取用户信息失败";
+                return AccountInfo.failed(msg);
+            }
+            
+            // 提取用户信息
+            JsonNode data = json.get("data");
+            if (data == null || !data.has("biz_data")) {
+                return AccountInfo.failed("响应格式不正确");
+            }
+            
+            JsonNode bizData = data.get("biz_data");
+            String email = null;
+            String nickname = null;
+            
+            // 提取 email（可能是部分显示的）
+            if (bizData.has("email")) {
+                JsonNode emailNode = bizData.get("email");
+                if (emailNode != null && !emailNode.isNull()) {
+                    email = emailNode.asString();
+                }
+            }
+            
+            // 提取昵称（从 id_profiles 中获取）
+            if (bizData.has("id_profiles") && bizData.get("id_profiles").isArray()) {
+                JsonNode idProfiles = bizData.get("id_profiles");
+                if (idProfiles.size() > 0) {
+                    JsonNode firstProfile = idProfiles.get(0);
+                    if (firstProfile.has("name")) {
+                        JsonNode nameNode = firstProfile.get("name");
+                        if (nameNode != null && !nameNode.isNull()) {
+                            nickname = nameNode.asString();
+                        }
+                    }
+                }
+            }
+            
+            // 如果没有昵称，尝试从 id_profile 获取
+            if (nickname == null && bizData.has("id_profile")) {
+                JsonNode idProfile = bizData.get("id_profile");
+                if (idProfile.has("name")) {
+                    JsonNode nameNode = idProfile.get("name");
+                    if (nameNode != null && !nameNode.isNull()) {
+                        nickname = nameNode.asString();
+                    }
+                }
+            }
+            
+            if (email == null || email.isEmpty()) {
+                return AccountInfo.failed("无法获取邮箱信息");
+            }
+            
+            // 返回账号信息（email 作为 accountId，nickname 作为 accountName）
+            return AccountInfo.success(nickname != null && !nickname.isEmpty() ? nickname : email, email);
+            
+        } catch (Exception e) {
+            log.error("获取 DeepSeek 账号信息失败: {}", e.getMessage(), e);
+            return AccountInfo.failed("获取账号信息失败: " + e.getMessage());
+        }
     }
     
     @Override

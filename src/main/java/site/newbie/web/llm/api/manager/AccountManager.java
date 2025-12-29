@@ -15,6 +15,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Stream;
 
 /**
  * 全局账号管理服务
@@ -51,6 +52,9 @@ public class AccountManager {
             
             loadAccounts();
             log.info("账号管理服务初始化完成，共加载 {} 个提供器的账号", accountsCache.size());
+            
+            // 清理不存在的账号对应的 Chrome 配置
+            cleanupOrphanedBrowserDirectories();
         } catch (Exception e) {
             log.error("初始化账号管理服务失败: {}", e.getMessage(), e);
         }
@@ -226,6 +230,112 @@ public class AccountManager {
             log.debug("已保存账号到文件: {}", accountsFile);
         } catch (Exception e) {
             log.error("保存账号到文件失败: {}", e.getMessage(), e);
+        }
+    }
+    
+    /**
+     * 清理不存在的账号对应的 Chrome 配置目录
+     * 在应用启动时调用，删除那些账号已不存在的浏览器数据目录
+     */
+    private void cleanupOrphanedBrowserDirectories() {
+        try {
+            Path storageDir = Paths.get(userDataDir);
+            if (!Files.exists(storageDir) || !Files.isDirectory(storageDir)) {
+                return;
+            }
+            
+            // 构建所有有效账号的目录路径集合
+            Set<Path> validAccountDirs = new HashSet<>();
+            for (Map.Entry<String, Map<String, AccountInfo>> providerEntry : accountsCache.entrySet()) {
+                String providerName = providerEntry.getKey();
+                for (String accountId : providerEntry.getValue().keySet()) {
+                    Path accountDir = storageDir.resolve(providerName).resolve(accountId);
+                    validAccountDirs.add(accountDir);
+                }
+            }
+            
+            // 扫描 user-data 目录下的所有提供器目录
+            try (Stream<Path> providerDirs = Files.list(storageDir)) {
+                for (Path providerDir : providerDirs.toList()) {
+                    if (!Files.isDirectory(providerDir)) {
+                        continue;
+                    }
+                    
+                    String providerName = providerDir.getFileName().toString();
+                    
+                    // 跳过一些已知的非账号目录
+                    if (providerName.equals("accounts.json") || 
+                        providerName.equals("api-keys.json") ||
+                        providerName.equals("gemini-images") ||
+                        providerName.startsWith(".")) {
+                        continue;
+                    }
+                    
+                    // 扫描该提供器目录下的所有账号目录
+                    try (Stream<Path> accountDirs = Files.list(providerDir)) {
+                        for (Path accountDir : accountDirs.toList()) {
+                            if (!Files.isDirectory(accountDir)) {
+                                continue;
+                            }
+                            
+                            String accountId = accountDir.getFileName().toString();
+                            
+                            // 跳过一些已知的非账号目录（如浏览器缓存目录等）
+                            // 账号ID 是 UUID 格式，格式为：xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+                            if (accountId.equals("Default") ||
+                                accountId.equals("Crashpad") ||
+                                accountId.equals("Safe Browsing") ||
+                                accountId.startsWith(".")) {
+                                continue;
+                            }
+                            
+                            // 只处理 UUID 格式的目录名（账号ID 都是 UUID 格式）
+                            if (!accountId.matches("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")) {
+                                continue;
+                            }
+                            
+                            // 检查该目录是否对应一个有效的账号
+                            if (!validAccountDirs.contains(accountDir)) {
+                                // 账号不存在，删除该目录
+                                try {
+                                    deleteDirectoryRecursively(accountDir);
+                                    log.info("已清理不存在的账号对应的 Chrome 配置目录: {}", accountDir);
+                                } catch (Exception e) {
+                                    log.warn("清理 Chrome 配置目录失败: {}, 错误: {}", accountDir, e.getMessage());
+                                }
+                            }
+                        }
+                    } catch (IOException e) {
+                        log.warn("扫描提供器目录失败: {}, 错误: {}", providerDir, e.getMessage());
+                    }
+                }
+            } catch (IOException e) {
+                log.warn("扫描 user-data 目录失败: {}", e.getMessage());
+            }
+            
+            log.info("Chrome 配置目录清理完成");
+        } catch (Exception e) {
+            log.error("清理 Chrome 配置目录时出错: {}", e.getMessage(), e);
+        }
+    }
+    
+    /**
+     * 递归删除目录及其所有内容
+     */
+    private void deleteDirectoryRecursively(Path directory) throws IOException {
+        if (!Files.exists(directory)) {
+            return;
+        }
+        
+        try (Stream<Path> paths = Files.walk(directory)) {
+            paths.sorted(Comparator.reverseOrder())
+                 .forEach(path -> {
+                     try {
+                         Files.delete(path);
+                     } catch (IOException e) {
+                         log.warn("删除文件/目录失败: {}, 错误: {}", path, e.getMessage());
+                     }
+                 });
         }
     }
 }

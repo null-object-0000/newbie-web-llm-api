@@ -51,6 +51,11 @@ const apiService = {
         return response.data;
     },
     
+    async updateApiKeyAccounts(apiKey, providerAccounts) {
+        const response = await axios.put(`${API_BASE}/admin/api-keys/${apiKey}/accounts`, { providerAccounts });
+        return response.data;
+    },
+    
     async deleteApiKey(apiKey) {
         const response = await axios.delete(`${API_BASE}/admin/api-keys/${apiKey}`);
         return response.data;
