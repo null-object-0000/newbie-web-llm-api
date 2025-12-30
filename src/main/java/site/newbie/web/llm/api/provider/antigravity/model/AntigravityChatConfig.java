@@ -2,7 +2,6 @@ package site.newbie.web.llm.api.provider.antigravity.model;
 
 import com.microsoft.playwright.Page;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import site.newbie.web.llm.api.model.ChatCompletionRequest;

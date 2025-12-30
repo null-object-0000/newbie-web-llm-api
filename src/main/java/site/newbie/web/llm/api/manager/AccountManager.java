@@ -13,7 +13,15 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Stream;
 
@@ -75,12 +83,14 @@ public class AccountManager {
         @JsonProperty("isLoginVerified")
         @JsonAlias("loginVerified") // 兼容旧的 JSON 文件中的字段名
         private boolean isLoginVerified; // 是否已完成登录验证（仅对 Playwright 类提供器有效）
+        private Boolean browserHeadless; // 浏览器是否无界面运行（null 表示使用全局配置，仅对 Playwright 类提供器有效）
         
         public AccountInfo() {
             this.metadata = new HashMap<>();
             this.createdAt = System.currentTimeMillis();
             this.lastUsedAt = System.currentTimeMillis();
             this.isLoginVerified = false; // 默认未完成登录验证
+            this.browserHeadless = null; // 默认使用全局配置
         }
     }
     

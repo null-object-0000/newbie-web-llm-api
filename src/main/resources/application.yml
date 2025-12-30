@@ -1,0 +1,19 @@
+debug: false
+server:
+  port: 24753
+spring:
+  application.name: newbie-web-llm-api
+  threads.virtual.enabled: true
+app:
+  server.base-url: http://localhost:24753
+  browser:
+    headless: false
+    user-data-dir: ./user-data
+
+openai.monitor.mode: sse
+
+newbie.http.logging:
+  enabled: true
+  sse-rules:
+    - url-pattern: /v1/chat/completions
+      body-json-expression: "stream == true"

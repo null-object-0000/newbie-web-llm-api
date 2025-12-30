@@ -1,6 +1,5 @@
 package site.newbie.web.llm.api.controller;
 
-import com.microsoft.playwright.Page;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
@@ -14,28 +13,27 @@ import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
-import site.newbie.web.llm.api.manager.AccountManager;
+import site.newbie.web.llm.api.config.ApiKeyScopedValue;
 import site.newbie.web.llm.api.manager.ApiKeyManager;
-import site.newbie.web.llm.api.manager.BrowserManager;
 import site.newbie.web.llm.api.model.ChatCompletionRequest;
-import site.newbie.web.llm.api.provider.command.CommandParserFactory;
 import site.newbie.web.llm.api.model.ChatCompletionResponse;
 import site.newbie.web.llm.api.model.ImageGenerationRequest;
 import site.newbie.web.llm.api.model.ImageGenerationResponse;
 import site.newbie.web.llm.api.model.ModelResponse;
 import site.newbie.web.llm.api.provider.LLMProvider;
-import site.newbie.web.llm.api.provider.gemini.GeminiProvider;
 import site.newbie.web.llm.api.provider.ProviderRegistry;
-import site.newbie.web.llm.api.util.ConversationIdUtils;
 import site.newbie.web.llm.api.provider.command.Command;
 import site.newbie.web.llm.api.provider.command.CommandHandler;
 import site.newbie.web.llm.api.provider.command.CommandParser;
-import site.newbie.web.llm.api.config.ApiKeyScopedValue;
+import site.newbie.web.llm.api.provider.gemini.GeminiProvider;
+import site.newbie.web.llm.api.util.ConversationIdUtils;
 import tools.jackson.databind.ObjectMapper;
+
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @Slf4j
 @RestController
@@ -44,36 +42,27 @@ import java.util.UUID;
 public class OpenAiController {
 
     private final ProviderRegistry providerRegistry;
-    private final BrowserManager browserManager;
     private final ObjectMapper objectMapper;
-    private final AccountManager accountManager;
     private final ApiKeyManager apiKeyManager;
-    private final CommandParserFactory commandParserFactory;
-    
+
     @Value("${app.server.base-url:http://localhost:24753}")
     private String serverBaseUrl;
-    
+
     @Value("${app.browser.user-data-dir:./user-data}")
     private String userDataDir;
 
-    public OpenAiController(ProviderRegistry providerRegistry, BrowserManager browserManager, 
-                           ObjectMapper objectMapper,
-                           AccountManager accountManager, ApiKeyManager apiKeyManager,
-                           CommandParserFactory commandParserFactory) {
+    public OpenAiController(ProviderRegistry providerRegistry, ObjectMapper objectMapper, ApiKeyManager apiKeyManager) {
         this.providerRegistry = providerRegistry;
-        this.browserManager = browserManager;
         this.objectMapper = objectMapper;
-        this.accountManager = accountManager;
         this.apiKeyManager = apiKeyManager;
-        this.commandParserFactory = commandParserFactory;
     }
 
     @PostMapping(value = "/chat/completions", produces = {MediaType.TEXT_EVENT_STREAM_VALUE, MediaType.APPLICATION_JSON_VALUE})
     public Object chat(
             @RequestBody ChatCompletionRequest request,
-            @RequestHeader(value = "Authorization", required = false) String authorizationHeader,
             @RequestHeader(value = "X-Web-Search", required = false) String webSearchHeader,
             @RequestHeader(value = "X-Conversation-ID", required = false) String conversationIdHeader) {
+
         String apiKeyFromHeader = null;
         try {
             // 1. 简单的参数校验
@@ -82,7 +71,7 @@ public class OpenAiController {
                 return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                         .body(Map.of("error", Map.of("message", "Request body is required", "type", "invalid_request_error")));
             }
-            
+
             if (request.getMessages() == null || request.getMessages().isEmpty()) {
                 System.err.println("消息列表为空");
                 return ResponseEntity.status(HttpStatus.BAD_REQUEST)
@@ -100,15 +89,15 @@ public class OpenAiController {
             if (webSearchHeader != null && !webSearchHeader.isEmpty()) {
                 request.setWebSearch(Boolean.parseBoolean(webSearchHeader));
             }
-            
+
             // 3. 从 Header 读取 conversationId（如果请求体中没有设置）
             if (conversationIdHeader != null && !conversationIdHeader.isEmpty()) {
                 request.setConversationId(conversationIdHeader);
             }
-            
+
             // 4. 从 ScopedValue 读取 API 密钥（拦截器已验证并存储）
             apiKeyFromHeader = ApiKeyScopedValue.getApiKey();
-            
+
             // 注意：
             // - 深度思考模式现在完全根据模型名称自动判断，不再接收外部参数
             // - 是否新对话现在完全根据是否有 conversationId 来判断，不再接收外部参数
@@ -129,25 +118,25 @@ public class OpenAiController {
             return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                     .body(Map.of("error", Map.of("message", "Unsupported model: " + request.getModel(), "type", "invalid_request_error")));
         }
-        
+
         // 4. 从 API 密钥解析 accountId（需要知道提供器后才能正确解析）
         // 注意：拦截器已经验证了 API key 的基本有效性，这里只需要验证 provider 特定逻辑
         String providerName = provider.getProviderName();
         // 检查 API key 是否支持该提供器（从 ScopedValue 检查）
         if (!ApiKeyScopedValue.supportsProvider(providerName)) {
             return ResponseEntity.status(HttpStatus.FORBIDDEN)
-                    .body(Map.of("error", Map.of("message", 
-                        "API key does not support provider: " + providerName, 
-                        "type", "invalid_request_error")));
+                    .body(Map.of("error", Map.of("message",
+                            "API key does not support provider: " + providerName,
+                            "type", "invalid_request_error")));
         }
         String accountIdFromApiKey = apiKeyManager.getAccountIdByApiKey(apiKeyFromHeader, providerName);
         if (accountIdFromApiKey == null) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
                     .body(Map.of("error", Map.of(
-                        "message", "Invalid API Key",
-                        "param", "Please provide valid API Key, Format: Authorization: Bearer <your-api-key> or api-key: <your-api-key>",
-                        "code", "401",
-                        "type", "invalid_key"
+                            "message", "Invalid API Key",
+                            "param", "Please provide valid API Key, Format: Authorization: Bearer <your-api-key> or api-key: <your-api-key>",
+                            "code", "401",
+                            "type", "invalid_key"
                     )));
         }
         // 从 API key 设置 accountId
@@ -164,7 +153,7 @@ public class OpenAiController {
     // 处理流式请求 (SSE)
     private Object handleStreamRequest(ChatCompletionRequest request, LLMProvider provider) {
         String providerName = provider.getProviderName();
-        
+
         // 统一检查是否是指令对话（在 Controller 层统一处理，避免每个 provider 重复实现）
         String userMessage = null;
         if (request.getMessages() != null) {
@@ -174,13 +163,13 @@ public class OpenAiController {
                     .map(ChatCompletionRequest.Message::getContent)
                     .orElse(null);
         }
-        
+
         // 从 provider 获取 CommandParser（可能包含 provider 特定指令）
         CommandParser commandParser = provider.getCommandParser();
         if (commandParser != null && userMessage != null && commandParser.isCommandOnly(userMessage)) {
             // 是指令对话，统一在 Controller 层处理
             log.info("检测到指令对话，在 Controller 层统一处理");
-            
+
             // 解析指令，检查是否需要页面或登录（以决定是否需要锁）
             CommandParser.ParseResult parseResult = commandParser.parse(userMessage);
             final boolean needsLock;
@@ -197,18 +186,18 @@ public class OpenAiController {
             } else {
                 needsLock = false;
             }
-            
+
             SseEmitter emitter = new SseEmitter(300000L);
-            
+
             // 设置响应头（使用 AtomicBoolean 防止重复释放锁）
-            java.util.concurrent.atomic.AtomicBoolean lockReleased = new java.util.concurrent.atomic.AtomicBoolean(false);
+            AtomicBoolean lockReleased = new AtomicBoolean(false);
             Runnable releaseLock = () -> {
                 if (needsLock && lockReleased.compareAndSet(false, true)) {
                     providerRegistry.releaseLock(providerName);
                     log.debug("已释放锁: {}", providerName);
                 }
             };
-            
+
             emitter.onError((ex) -> {
                 log.error("SSE Error: {}", ex.getMessage(), ex);
                 releaseLock.run();
@@ -222,7 +211,7 @@ public class OpenAiController {
                 log.info("SSE Completed");
                 releaseLock.run(); // 这里也会尝试释放，但只会释放一次
             });
-            
+
             // 只有需要页面或登录的指令才需要获取锁
             if (needsLock) {
                 if (!providerRegistry.tryAcquireLock(providerName)) {
@@ -237,7 +226,7 @@ public class OpenAiController {
                                 .id(id).object("chat.completion.chunk")
                                 .created(System.currentTimeMillis() / 1000)
                                 .model(request.getModel()).choices(List.of(choice)).build();
-                        
+
                         MediaType APPLICATION_JSON_UTF8 = new MediaType("application", "json", StandardCharsets.UTF_8);
                         emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(response), APPLICATION_JSON_UTF8));
                         emitter.send(SseEmitter.event().data("[DONE]", MediaType.TEXT_PLAIN));
@@ -248,7 +237,7 @@ public class OpenAiController {
                     return emitter;
                 }
             }
-            
+
             // 使用 CommandHandler 统一处理指令
             CommandHandler.handleCommandOnly(
                     request, emitter, provider, commandParser,
@@ -258,10 +247,10 @@ public class OpenAiController {
                     objectMapper,
                     provider.getCommandSuccessCallback(), // 从 provider 获取成功回调
                     releaseLock); // 传入释放锁的回调，确保指令执行完成后立即释放锁
-            
+
             return emitter;
         }
-        
+
         // 获取对话ID（用于标识登录对话）
         // 只从历史消息中提取登录对话ID
         String conversationId = null;
@@ -271,12 +260,12 @@ public class OpenAiController {
                 log.debug("从历史消息中提取到对话ID: {}", conversationId);
             }
         }
-        
+
         boolean isNewConversation = (conversationId == null || conversationId.isEmpty());
-        
-        log.debug("处理请求: providerName={}, conversationId={}, isNewConversation={}", 
-            providerName, conversationId, isNewConversation);
-        
+
+        log.debug("处理请求: providerName={}, conversationId={}, isNewConversation={}",
+                providerName, conversationId, isNewConversation);
+
         // 获取锁
         if (!providerRegistry.tryAcquireLock(providerName)) {
             log.warn("提供器 {} 正忙，拒绝请求", providerName);
@@ -287,30 +276,30 @@ public class OpenAiController {
                             "type", "provider_busy_error"
                     )));
         }
-        
+
         SseEmitter emitter = new SseEmitter(5 * 60 * 1000L);
-        
+
         // 设置响应头
         emitter.onError((ex) -> {
             System.err.println("SSE Error: " + ex.getMessage());
             ex.printStackTrace();
             providerRegistry.releaseLock(providerName);
         });
-        
+
         emitter.onTimeout(() -> {
             System.err.println("SSE Timeout");
             emitter.complete();
             providerRegistry.releaseLock(providerName);
         });
-        
+
         emitter.onCompletion(() -> {
             System.out.println("SSE Completed");
             providerRegistry.releaseLock(providerName);
         });
-        
+
         // 直接调用提供者处理请求（登录功能已移至管理后台）
         provider.streamChat(request, emitter);
-        
+
         return emitter;
     }
 
@@ -322,7 +311,7 @@ public class OpenAiController {
     public ResponseEntity<Map<String, Object>> getProviders() {
         return ResponseEntity.ok(providerRegistry.getAllProviders());
     }
-    
+
     /**
      * 获取所有可用的模型列表（OpenAI 兼容格式）
      * 前端可以使用 OpenAI SDK: openai.models.list()
@@ -332,8 +321,8 @@ public class OpenAiController {
     public ResponseEntity<ModelResponse> getModels() {
         return ResponseEntity.ok(providerRegistry.getOpenAIModels());
     }
-    
-    
+
+
     /**
      * 图片生成 API（OpenAI 兼容）
      * POST /v1/images/generations
@@ -343,16 +332,16 @@ public class OpenAiController {
             @RequestBody ImageGenerationRequest request,
             @RequestHeader(value = "Authorization", required = false) String authorizationHeader) {
         try {
-            log.info("收到图片生成请求: prompt={}, model={}, response_format={}, n={}", 
+            log.info("收到图片生成请求: prompt={}, model={}, response_format={}, n={}",
                     request != null ? (request.getPrompt() != null ? request.getPrompt().substring(0, Math.min(50, request.getPrompt().length())) : "null") : "null",
                     request != null ? request.getModel() : "null",
                     request != null ? request.getResponseFormat() : "null",
                     request != null ? request.getN() : "null");
-            
+
             // API Key 验证（拦截器已验证基本有效性，这里只验证 provider 特定逻辑）
             // 从 ScopedValue 获取 API key
             String apiKeyFromHeader = ApiKeyScopedValue.getApiKey();
-            
+
             // 验证 API key 是否支持 Gemini 提供器（图片生成使用 Gemini）
             if (!ApiKeyScopedValue.supportsProvider("gemini")) {
                 log.warn("API key 不支持 Gemini 提供器");
@@ -362,60 +351,58 @@ public class OpenAiController {
                                 .data(List.of())
                                 .build());
             }
-            
+
             String accountIdFromApiKey = apiKeyManager.getAccountIdByApiKey(apiKeyFromHeader, "gemini");
             if (accountIdFromApiKey == null) {
                 log.warn("无效的 API key for Gemini provider");
                 return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
                         .body(Map.of("error", Map.of(
-                            "message", "Invalid API Key",
-                            "param", "Please provide valid API Key, Format: Authorization: Bearer <your-api-key> or api-key: <your-api-key>",
-                            "code", "401",
-                            "type", "invalid_key"
+                                "message", "Invalid API Key",
+                                "param", "Please provide valid API Key, Format: Authorization: Bearer <your-api-key> or api-key: <your-api-key>",
+                                "code", "401",
+                                "type", "invalid_key"
                         )));
             }
-            
+
             // 参数校验
             if (request == null || request.getPrompt() == null || request.getPrompt().trim().isEmpty()) {
                 log.warn("图片生成请求参数错误: prompt 为空");
                 throw new IllegalArgumentException("Prompt is required");
             }
-            
+
             // 获取 Gemini Provider
             LLMProvider geminiProvider = providerRegistry.getProviderByModel("gemini-web-imagegen");
-            if (geminiProvider == null || !(geminiProvider instanceof GeminiProvider)) {
+            if (!(geminiProvider instanceof GeminiProvider provider)) {
                 throw new IllegalArgumentException("Image generation model not available");
             }
-            
-            GeminiProvider provider = (GeminiProvider) geminiProvider;
-            
+
             // 确定响应格式（默认 b64_json，支持 url）
             String responseFormat = request.getResponseFormat();
             if (responseFormat == null || responseFormat.isEmpty()) {
                 responseFormat = "b64_json";
             }
             boolean returnBase64 = "b64_json".equals(responseFormat);
-            
+
             // 生成图片（同步方法，返回文件名列表）
-            log.info("开始调用 generateImageSync，prompt: {}, accountId: {}", 
-                    request.getPrompt().substring(0, Math.min(50, request.getPrompt().length())), 
+            log.info("开始调用 generateImageSync，prompt: {}, accountId: {}",
+                    request.getPrompt().substring(0, Math.min(50, request.getPrompt().length())),
                     accountIdFromApiKey);
             List<String> imageFilenames = provider.generateImageSync(request.getPrompt(), request.getN(), accountIdFromApiKey);
             log.info("generateImageSync 返回，文件名数量: {}", imageFilenames != null ? imageFilenames.size() : 0);
-            
+
             if (imageFilenames == null || imageFilenames.isEmpty()) {
                 log.error("图片生成失败：返回的文件名列表为空");
                 throw new RuntimeException("Failed to generate image");
             }
-            
+
             log.info("成功生成图片，文件名: {}", imageFilenames);
-            
+
             // 构建响应数据
             List<ImageGenerationResponse.ImageData> imageDataList = new java.util.ArrayList<>();
-            
+
             for (String filename : imageFilenames) {
                 ImageGenerationResponse.ImageData.ImageDataBuilder builder = ImageGenerationResponse.ImageData.builder();
-                
+
                 if (returnBase64) {
                     // 读取图片文件并转换为 base64
                     String base64Image = readImageAsBase64(filename);
@@ -431,18 +418,18 @@ public class OpenAiController {
                     String imageUrl = buildImageUrl(filename);
                     builder.url(imageUrl);
                 }
-                
+
                 // 添加修订后的提示词（与原始提示词相同，因为 Gemini 不提供修订）
                 builder.revisedPrompt(request.getPrompt());
-                
+
                 imageDataList.add(builder.build());
             }
-            
+
             ImageGenerationResponse response = ImageGenerationResponse.builder()
                     .created(System.currentTimeMillis() / 1000)
                     .data(imageDataList)
                     .build();
-            
+
             // 记录响应日志（用于调试）
             try {
                 String responseJson = objectMapper.writeValueAsString(response);
@@ -450,9 +437,9 @@ public class OpenAiController {
             } catch (Exception e) {
                 log.warn("序列化响应失败: {}", e.getMessage());
             }
-            
+
             return ResponseEntity.ok(response);
-            
+
         } catch (IllegalArgumentException e) {
             log.error("图片生成请求参数错误: {}", e.getMessage());
             return ResponseEntity.status(HttpStatus.BAD_REQUEST)
@@ -469,7 +456,7 @@ public class OpenAiController {
                             .build());
         }
     }
-    
+
     /**
      * 构建图片 URL
      */
@@ -483,7 +470,7 @@ public class OpenAiController {
         }
         return baseUrl + "/api/images/" + filename;
     }
-    
+
     /**
      * 读取图片文件并转换为 base64
      */
@@ -492,21 +479,21 @@ public class OpenAiController {
             String imagesSubdir = "gemini-images";
             java.nio.file.Path imagePath = java.nio.file.Paths.get(userDataDir, imagesSubdir, filename);
             java.io.File imageFile = imagePath.toFile();
-            
+
             if (!imageFile.exists() || !imageFile.isFile()) {
                 log.warn("图片文件不存在: {}", imagePath.toAbsolutePath());
                 return null;
             }
-            
+
             // 读取文件
             byte[] imageBytes = java.nio.file.Files.readAllBytes(imagePath);
-            
+
             // 转换为 base64
             String base64Image = java.util.Base64.getEncoder().encodeToString(imageBytes);
             log.debug("成功读取图片并转换为 base64: {} ({} bytes)", filename, imageBytes.length);
-            
+
             return base64Image;
-            
+
         } catch (Exception e) {
             log.error("读取图片文件失败: {}", e.getMessage(), e);
             return null;

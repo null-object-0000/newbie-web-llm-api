@@ -27,6 +27,11 @@ export const apiService = {
     return response.data;
   },
   
+  async updateAccount(provider, accountId, updates) {
+    const response = await axios.put(`${API_BASE}/admin/api/accounts/${provider}/${accountId}`, updates);
+    return response.data;
+  },
+  
   async deleteAccount(provider, accountId) {
     const response = await axios.delete(`${API_BASE}/admin/api/accounts/${provider}/${accountId}`);
     return response.data;
@@ -81,6 +86,18 @@ export const apiService = {
   isPlaywrightProvider(providerName) {
     const playwrightProviders = ['gemini', 'openai', 'deepseek'];
     return playwrightProviders.includes(providerName?.toLowerCase());
+  },
+  
+  // 打开浏览器（基于账号）
+  async openBrowser(providerName, accountId) {
+    const response = await axios.post(`${API_BASE}/admin/api/accounts/${providerName}/${accountId}/open-browser`);
+    return response.data;
+  },
+  
+  // 获取应用状态（包括 Playwright 初始化状态）
+  async getStatus() {
+    const response = await axios.get(`${API_BASE}/admin/api/status`);
+    return response.data;
   }
 };
 

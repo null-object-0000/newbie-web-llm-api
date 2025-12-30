@@ -9,7 +9,6 @@ import site.newbie.web.llm.api.provider.command.CommandHandler;
 import site.newbie.web.llm.api.provider.command.CommandParser;
 
 import java.util.List;
-import java.util.function.Function;
 
 /**
  * LLM 提供者接口

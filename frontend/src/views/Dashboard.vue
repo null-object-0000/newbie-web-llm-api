@@ -79,9 +79,9 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUpdated } from 'vue';
-import { apiService } from '../services/api';
-import { message } from '../utils/message';
+import {onMounted, onUpdated, ref} from 'vue';
+import {apiService} from '../services/api';
+import {message} from '../utils/message';
 
 const stats = ref({
   totalAccounts: 0,

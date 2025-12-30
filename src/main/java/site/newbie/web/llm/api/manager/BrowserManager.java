@@ -4,22 +4,45 @@ import com.microsoft.playwright.BrowserContext;
 import com.microsoft.playwright.BrowserType;
 import com.microsoft.playwright.Page;
 import com.microsoft.playwright.Playwright;
-import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
 
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 @Slf4j
 @Service
 public class BrowserManager {
 
+    /**
+     * Playwright 初始化状态
+     */
+    public enum InitStatus {
+        INITIALIZING,  // 初始化中
+        INITIALIZED,   // 初始化完成
+        FAILED         // 初始化失败
+    }
+
+    private volatile InitStatus initStatus = InitStatus.INITIALIZING;
+    private volatile String initErrorMessage = null;
     private Playwright playwright;
+    private CompletableFuture<Void> initFuture;
+    private final ExecutorService initExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "playwright-init");
+        t.setDaemon(true);
+        return t;
+    });
 
     // 每个提供器+账号有独立的 BrowserContext，避免并发冲突
     // Key 格式: "providerName" 或 "providerName:accountId"
@@ -31,32 +54,111 @@ public class BrowserManager {
 
     @Value("${app.browser.user-data-dir:./user-data}")
     private String userDataDir;
+    
+    private final AccountManager accountManager;
+    
+    public BrowserManager(AccountManager accountManager) {
+        this.accountManager = accountManager;
+    }
 
-    @PostConstruct
-    public void init() {
-        log.info("正在启动 Playwright 引擎...");
-        log.info("浏览器模式: {}, 基础数据存储路径: {}", headless ? "Headless (无头)" : "Headed (有界面)", userDataDir);
+    /**
+     * 在应用启动完成后异步初始化 Playwright
+     * 使用 ApplicationReadyEvent 确保应用完全启动后再初始化，不阻塞启动过程
+     */
+    @EventListener(ApplicationReadyEvent.class)
+    public void onApplicationReady() {
+        // 在后台线程中异步初始化 Playwright
+        initFuture = CompletableFuture.runAsync(() -> {
+            try {
+                log.info("正在启动 Playwright 引擎...");
+                log.info("浏览器模式: {}, 基础数据存储路径: {}", headless ? "Headless (无头)" : "Headed (有界面)", userDataDir);
 
-        // 设置系统属性，阻止 Playwright Java 自动下载浏览器
-        // 我们已经通过 Dockerfile 手动安装了 Chromium
-        String browsersPath = System.getenv("PLAYWRIGHT_BROWSERS_PATH");
-        if (browsersPath != null && !browsersPath.isEmpty()) {
-            System.setProperty("playwright.browsers.path", browsersPath);
-            log.info("设置 Playwright 浏览器路径: {}", browsersPath);
+                // 设置系统属性，阻止 Playwright Java 自动下载浏览器
+                // 我们已经通过 Dockerfile 手动安装了 Chromium
+                String browsersPath = System.getenv("PLAYWRIGHT_BROWSERS_PATH");
+                if (browsersPath != null && !browsersPath.isEmpty()) {
+                    System.setProperty("playwright.browsers.path", browsersPath);
+                    log.info("设置 Playwright 浏览器路径: {}", browsersPath);
+                }
+
+                // 设置系统属性跳过浏览器下载
+                System.setProperty("playwright.cli.skip.install", "true");
+
+                playwright = Playwright.create();
+
+                initStatus = InitStatus.INITIALIZED;
+                log.info("Playwright 启动成功！各提供器的 BrowserContext 将按需创建。");
+            } catch (Exception e) {
+                initStatus = InitStatus.FAILED;
+                initErrorMessage = e.getMessage();
+                log.error("Playwright 启动失败", e);
+                throw new RuntimeException(e);
+            }
+        }, initExecutor);
+    }
+
+    /**
+     * 获取 Playwright 初始化状态
+     */
+    public InitStatus getInitStatus() {
+        return initStatus;
+    }
+
+    /**
+     * 获取初始化错误信息（如果初始化失败）
+     */
+    public String getInitErrorMessage() {
+        return initErrorMessage;
+    }
+
+    /**
+     * 检查 Playwright 是否已初始化完成
+     */
+    public boolean isInitialized() {
+        return initStatus == InitStatus.INITIALIZED;
+    }
+
+    /**
+     * 等待 Playwright 初始化完成
+     * @param timeoutSeconds 超时时间（秒）
+     * @throws TimeoutException 如果超时仍未完成初始化
+     */
+    public void waitForInitialization(long timeoutSeconds) throws TimeoutException, InterruptedException {
+        if (initFuture == null) {
+            throw new IllegalStateException("Playwright 初始化尚未开始");
         }
-
-        // 设置系统属性跳过浏览器下载
-        System.setProperty("playwright.cli.skip.install", "true");
-
-        playwright = Playwright.create();
-
-        log.info("Playwright 启动成功！各提供器的 BrowserContext 将按需创建。");
+        
+        try {
+            initFuture.get(timeoutSeconds, TimeUnit.SECONDS);
+        } catch (java.util.concurrent.TimeoutException e) {
+            throw new TimeoutException("等待 Playwright 初始化超时（" + timeoutSeconds + " 秒）");
+        } catch (java.util.concurrent.ExecutionException e) {
+            // 初始化失败已在 initAsync 中处理，这里不需要额外处理
+            throw new RuntimeException("Playwright 初始化失败", e.getCause());
+        }
     }
 
     /**
      * 检查并确保 Playwright 实例有效，如果无效则重新创建
+     * 如果 Playwright 尚未初始化，会等待初始化完成
      */
     private synchronized void ensurePlaywrightValid() {
+        // 如果 Playwright 正在初始化，等待初始化完成
+        if (initStatus == InitStatus.INITIALIZING) {
+            try {
+                log.info("等待 Playwright 初始化完成...");
+                waitForInitialization(60); // 等待最多 60 秒
+            } catch (Exception e) {
+                log.error("等待 Playwright 初始化失败", e);
+                throw new RuntimeException("Playwright 初始化失败或超时", e);
+            }
+        }
+
+        // 如果初始化失败，抛出异常
+        if (initStatus == InitStatus.FAILED) {
+            throw new RuntimeException("Playwright 初始化失败: " + initErrorMessage);
+        }
+
         if (playwright == null) {
             log.warn("Playwright 实例为 null，重新创建...");
             playwright = Playwright.create();
@@ -106,6 +208,18 @@ public class BrowserManager {
      * @param accountId 账号ID，如果为 null 则使用默认账号（兼容旧代码）
      */
     public synchronized BrowserContext getOrCreateContext(String providerName, String accountId) {
+        return getOrCreateContext(providerName, accountId, null);
+    }
+    
+    /**
+     * 获取或创建指定提供器和账号的 BrowserContext（支持强制指定 headless 模式）
+     * 每个提供器+账号有独立的浏览器上下文，避免并发冲突
+     * 如果 context 已关闭会自动重新创建
+     * @param providerName 提供器名称
+     * @param accountId 账号ID，如果为 null 则使用默认账号（兼容旧代码）
+     * @param forceHeadless 强制指定 headless 模式，null 表示使用账号配置或全局配置
+     */
+    public synchronized BrowserContext getOrCreateContext(String providerName, String accountId, Boolean forceHeadless) {
         String contextKey = accountId != null && !accountId.isEmpty() 
                 ? providerName + ":" + accountId 
                 : providerName;
@@ -150,11 +264,31 @@ public class BrowserManager {
                 ? userDataDir + "/" + providerName + "/" + accountId
                 : userDataDir + "/" + providerName;
 
-        // Gemini 和 OpenAI 强制使用 headed 模式（有界面），其他提供器使用配置的模式
+        // 决定是否使用 headless 模式
+        // 优先级：强制指定 > 账号配置 > 全局配置
         boolean useHeadless = headless;
-        if ("gemini".equals(providerName) || "openai".equals(providerName)) {
-            useHeadless = false;
-            log.info("提供器 {} 强制使用 Headed 模式（有界面）", providerName);
+        
+        // 如果强制指定了 headless 模式，直接使用
+        if (forceHeadless != null) {
+            useHeadless = forceHeadless;
+            log.info("提供器 {} 账号 {} 强制使用浏览器模式: {}", 
+                providerName, accountId, useHeadless ? "Headless (无界面)" : "Headed (有界面)");
+        } else {
+            // 如果提供了 accountId，尝试从账号配置中读取 browserHeadless 设置
+            if (accountId != null && !accountId.isEmpty()) {
+                AccountManager.AccountInfo account = accountManager.getAccount(providerName, accountId);
+                if (account != null && account.getBrowserHeadless() != null) {
+                    useHeadless = account.getBrowserHeadless();
+                    log.info("提供器 {} 账号 {} 使用账号配置的浏览器模式: {}", 
+                        providerName, accountId, useHeadless ? "Headless (无界面)" : "Headed (有界面)");
+                } else {
+                    log.info("提供器 {} 账号 {} 使用全局配置的浏览器模式: {}", 
+                        providerName, accountId, useHeadless ? "Headless (无界面)" : "Headed (有界面)");
+                }
+            } else {
+                log.info("提供器 {} 使用全局配置的浏览器模式: {}", 
+                    providerName, useHeadless ? "Headless (无界面)" : "Headed (有界面)");
+            }
         }
 
         // 配置启动选项
@@ -273,13 +407,24 @@ public class BrowserManager {
      * 如果 context 已关闭会自动重新创建并重试
      */
     public synchronized Page newPage(String providerName, String accountId) {
+        return newPage(providerName, accountId, null);
+    }
+    
+    /**
+     * 为指定提供器和账号获取一个新的页面（支持强制指定 headless 模式）
+     * 如果 context 已关闭会自动重新创建并重试
+     * @param providerName 提供器名称
+     * @param accountId 账号ID
+     * @param forceHeadless 强制指定 headless 模式，null 表示使用账号配置或全局配置
+     */
+    public synchronized Page newPage(String providerName, String accountId, Boolean forceHeadless) {
         String contextKey = accountId != null && !accountId.isEmpty() 
                 ? providerName + ":" + accountId 
                 : providerName;
         int maxRetries = 3;
         for (int attempt = 0; attempt < maxRetries; attempt++) {
             try {
-                BrowserContext context = getOrCreateContext(providerName, accountId);
+                BrowserContext context = getOrCreateContext(providerName, accountId, forceHeadless);
                 return context.newPage();
             } catch (Exception e) {
                 // context 可能已关闭，移除并重新创建
@@ -365,6 +510,18 @@ public class BrowserManager {
         if (playwright != null) {
             playwright.close();
         }
+        
+        // 关闭初始化线程池
+        initExecutor.shutdown();
+        try {
+            if (!initExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                initExecutor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            initExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+        
         log.info("Playwright 已关闭");
     }
 }

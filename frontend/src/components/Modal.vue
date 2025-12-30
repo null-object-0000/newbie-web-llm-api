@@ -15,7 +15,7 @@
 </template>
 
 <script setup>
-import { onUpdated } from 'vue';
+import {onUpdated} from 'vue';
 
 const props = defineProps({
   title: {

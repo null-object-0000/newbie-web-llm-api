@@ -385,6 +385,17 @@ body {
     flex-shrink: 0;
 }
 
+.action-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    pointer-events: none;
+}
+
+.action-btn:disabled:hover {
+    background-color: transparent;
+    color: inherit;
+}
+
 /* 鎿嶄綔鎸夐挳棰滆壊鍙樹綋 */
 .action-btn-primary {
     color: #6b7280;

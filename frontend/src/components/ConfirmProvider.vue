@@ -13,9 +13,9 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue';
+import {onMounted, ref} from 'vue';
 import ConfirmModal from './ConfirmModal.vue';
-import { setConfirmModalInstance } from '../utils/message';
+import {setConfirmModalInstance} from '../utils/message';
 
 const visible = ref(false);
 const config = ref({});

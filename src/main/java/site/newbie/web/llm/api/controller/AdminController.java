@@ -1,21 +1,30 @@
 package site.newbie.web.llm.api.controller;
 
+import com.microsoft.playwright.Page;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
-import site.newbie.web.llm.api.manager.AccountManager;
+import org.springframework.web.bind.annotation.CrossOrigin;
+import org.springframework.web.bind.annotation.DeleteMapping;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
 import site.newbie.web.llm.api.manager.AccountLoginService;
+import site.newbie.web.llm.api.manager.AccountManager;
 import site.newbie.web.llm.api.manager.ApiKeyManager;
+import site.newbie.web.llm.api.manager.BrowserManager;
 import site.newbie.web.llm.api.provider.ProviderRegistry;
-import site.newbie.web.llm.api.provider.ProviderType;
 
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.stream.Collectors;
 
 /**
  * 管理后台 Controller
@@ -32,15 +41,18 @@ public class AdminController {
     private final ApiKeyManager apiKeyManager;
     private final ProviderRegistry providerRegistry;
     private final AccountLoginService accountLoginService;
+    private final BrowserManager browserManager;
     
     public AdminController(AccountManager accountManager, 
                           ApiKeyManager apiKeyManager,
                           ProviderRegistry providerRegistry,
-                          AccountLoginService accountLoginService) {
+                          AccountLoginService accountLoginService,
+                          BrowserManager browserManager) {
         this.accountManager = accountManager;
         this.apiKeyManager = apiKeyManager;
         this.providerRegistry = providerRegistry;
         this.accountLoginService = accountLoginService;
+        this.browserManager = browserManager;
     }
     
     // ==================== 账号管理 API ====================
@@ -115,6 +127,12 @@ public class AdminController {
             );
             
             AccountManager.AccountInfo account = accountManager.getAccount(accountId);
+            
+            // 如果提供了 browserHeadless 配置，更新账号配置
+            if (request.getBrowserHeadless() != null && account != null) {
+                account.setBrowserHeadless(request.getBrowserHeadless());
+                accountManager.saveAccounts();
+            }
             
             Map<String, Object> result = new HashMap<>();
             result.put("accountId", accountId);
@@ -237,6 +255,37 @@ public class AdminController {
     }
     
     /**
+     * 更新账号配置
+     */
+    @PutMapping("/accounts/{provider}/{accountId}")
+    public ResponseEntity<Map<String, Object>> updateAccount(
+            @PathVariable String provider,
+            @PathVariable String accountId,
+            @RequestBody UpdateAccountRequest request) {
+        try {
+            AccountManager.AccountInfo account = accountManager.getAccount(provider, accountId);
+            if (account == null) {
+                return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                    .body(Map.of("error", "账号不存在"));
+            }
+            
+            // 更新浏览器模式配置
+            if (request.getBrowserHeadless() != null) {
+                account.setBrowserHeadless(request.getBrowserHeadless());
+                accountManager.saveAccounts();
+                log.info("更新账号浏览器模式配置: provider={}, accountId={}, browserHeadless={}", 
+                    provider, accountId, request.getBrowserHeadless());
+            }
+            
+            return ResponseEntity.ok(Map.of("success", true, "message", "账号配置已更新", "account", account));
+        } catch (Exception e) {
+            log.error("更新账号配置失败: provider={}, accountId={}", provider, accountId, e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(Map.of("error", e.getMessage()));
+        }
+    }
+    
+    /**
      * 删除账号
      */
     @DeleteMapping("/accounts/{provider}/{accountId}")
@@ -255,6 +304,80 @@ public class AdminController {
             log.error("删除账号失败: provider={}, accountId={}", provider, accountId, e);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                 .body(Map.of("error", e.getMessage()));
+        }
+    }
+    
+    /**
+     * 打开 Chrome 浏览器（基于账号）
+     * 为指定账号创建或获取浏览器上下文，并打开一个新页面
+     */
+    @PostMapping("/accounts/{providerName}/{accountId}/open-browser")
+    public ResponseEntity<Map<String, Object>> openBrowser(
+            @PathVariable String providerName,
+            @PathVariable String accountId) {
+        try {
+            AccountManager.AccountInfo account = accountManager.getAccount(providerName, accountId);
+            if (account == null) {
+                return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                    .body(Map.of("error", "账号不存在"));
+            }
+            
+            // 检查提供器是否存在
+            if (providerRegistry.getProviderByName(providerName) == null) {
+                return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                    .body(Map.of("error", "提供器不存在"));
+            }
+            
+            // 检查提供器是否为 Playwright 类型（支持浏览器操作）
+            // Playwright 类型的提供器：gemini, openai, deepseek
+            String lowerProviderName = providerName.toLowerCase();
+            if (!"gemini".equals(lowerProviderName) && 
+                !"openai".equals(lowerProviderName) && 
+                !"deepseek".equals(lowerProviderName)) {
+                return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                    .body(Map.of("error", "该提供器不支持浏览器操作"));
+            }
+            
+            // 清理已存在的浏览器上下文，确保重新创建
+            browserManager.clearContext(providerName, accountId);
+            
+            // 获取或创建浏览器上下文（前端打开浏览器时强制使用有界面模式）
+            // 即使用户配置了无界面模式，手动打开浏览器时也应该显示浏览器窗口
+            Page page = browserManager.newPage(providerName, accountId, false);
+            
+            // 导航到提供器的默认页面
+            String defaultUrl = getDefaultUrl(providerName);
+            page.navigate(defaultUrl);
+            page.waitForLoadState();
+            
+            Map<String, Object> result = new HashMap<>();
+            result.put("success", true);
+            result.put("message", "浏览器已打开");
+            result.put("url", defaultUrl);
+            
+            log.info("为提供器 {} 账号 {} 打开浏览器，URL: {}", providerName, accountId, defaultUrl);
+            
+            return ResponseEntity.ok(result);
+        } catch (Exception e) {
+            log.error("打开浏览器失败: providerName={}, accountId={}", providerName, accountId, e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(Map.of("error", e.getMessage()));
+        }
+    }
+    
+    /**
+     * 获取提供器的默认 URL
+     */
+    private String getDefaultUrl(String providerName) {
+        switch (providerName.toLowerCase()) {
+            case "gemini":
+                return "https://gemini.google.com";
+            case "openai":
+                return "https://chat.openai.com";
+            case "deepseek":
+                return "https://chat.deepseek.com";
+            default:
+                return "https://www.google.com";
         }
     }
     
@@ -392,6 +515,38 @@ public class AdminController {
         }
     }
     
+    // ==================== 应用状态 API ====================
+    
+    /**
+     * 获取应用状态（包括 Playwright 初始化状态）
+     */
+    @GetMapping("/status")
+    public ResponseEntity<Map<String, Object>> getStatus() {
+        try {
+            Map<String, Object> status = new HashMap<>();
+            
+            // Playwright 初始化状态
+            BrowserManager.InitStatus playwrightStatus = browserManager.getInitStatus();
+            Map<String, Object> playwrightInfo = new HashMap<>();
+            playwrightInfo.put("status", playwrightStatus.name().toLowerCase());
+            playwrightInfo.put("initialized", browserManager.isInitialized());
+            if (playwrightStatus == BrowserManager.InitStatus.FAILED) {
+                String errorMessage = browserManager.getInitErrorMessage();
+                playwrightInfo.put("error", errorMessage != null ? errorMessage : "未知错误");
+            } else {
+                playwrightInfo.put("error", null);
+            }
+            status.put("playwright", playwrightInfo);
+            
+            return ResponseEntity.ok(status);
+        } catch (Exception e) {
+            log.error("获取应用状态失败", e);
+            String errorMessage = e.getMessage();
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(Map.of("error", errorMessage != null ? errorMessage : "获取应用状态失败"));
+        }
+    }
+    
     // ==================== 统计信息 API ====================
     
     /**
@@ -447,6 +602,12 @@ public class AdminController {
     public static class CreateAccountRequest {
         private String provider;
         private String accountName;
+        private Boolean browserHeadless; // 浏览器是否无界面运行（null 表示使用全局配置）
+    }
+    
+    @Data
+    public static class UpdateAccountRequest {
+        private Boolean browserHeadless; // 浏览器是否无界面运行（null 表示使用全局配置）
     }
     
     @Data

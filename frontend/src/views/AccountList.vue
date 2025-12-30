@@ -1,5 +1,31 @@
 <template>
   <div class="h-full flex flex-col p-5 gap-4 max-w-7xl mx-auto w-full">
+    <!-- 编辑浏览器模式模态框 -->
+    <Modal 
+      v-if="showBrowserModeModal" 
+      title="编辑浏览器运行模式"
+      @close="closeBrowserModeModal"
+    >
+      <div class="form-group">
+        <label>浏览器运行模式</label>
+        <select v-model="editingBrowserMode" class="w-full">
+          <option :value="null">使用全局配置</option>
+          <option :value="false">有界面运行（Headed）</option>
+          <option :value="true">无界面运行（Headless）</option>
+        </select>
+        <small class="text-gray-500 dark:text-gray-400">
+          选择该账号对应的 Chrome 浏览器运行模式。有界面模式适合需要手动操作或调试的场景，无界面模式适合自动化运行。
+        </small>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn btn-secondary" @click="closeBrowserModeModal">
+          取消
+        </button>
+        <button type="button" class="btn btn-primary" @click="saveBrowserMode" :disabled="savingBrowserMode">
+          {{ savingBrowserMode ? '保存中...' : '保存' }}
+        </button>
+      </div>
+    </Modal>
     <!-- 顶部工具栏 -->
     <div class="flex-none flex items-center gap-4">
       <div class="flex-1 max-w-md relative">
@@ -25,7 +51,11 @@
       </div>
       <div class="flex-1"></div>
                 <div class="flex items-center gap-2">
-                    <button class="btn btn-primary" @click="openAccountModal(null)">
+                    <button 
+                        class="btn btn-primary" 
+                        @click="openAccountModal(null)"
+                        :disabled="!playwrightInitialized"
+                    >
                         <i data-lucide="plus" class="w-3.5 h-3.5"></i>
                         添加账号
                     </button>
@@ -57,6 +87,7 @@
                 <th class="table-header">提供器</th>
                 <th class="table-header">账号名称</th>
                 <th class="table-header">状态</th>
+                <th class="table-header">浏览器模式</th>
                 <th class="table-header">创建时间</th>
                 <th class="table-header">最后使用</th>
                 <th class="table-header">操作</th>
@@ -81,6 +112,14 @@
                     {{ getAccountStatus(account) }}
                   </span>
                 </td>
+                <td class="table-cell">
+                  <span v-if="apiService.isPlaywrightProvider(account.providerName)" class="text-xs">
+                    <span v-if="account.browserHeadless === true" class="badge badge-warning">无界面</span>
+                    <span v-else-if="account.browserHeadless === false" class="badge badge-success">有界面</span>
+                    <span v-else class="badge badge-secondary">全局配置</span>
+                  </span>
+                  <span v-else class="text-gray-400 dark:text-gray-500 text-xs">-</span>
+                </td>
                 <td class="table-cell">{{ formatTime(account.createdAt) }}</td>
                 <td class="table-cell">{{ formatTime(account.lastUsedAt) }}</td>
                 <td class="table-cell">
@@ -90,14 +129,35 @@
                         class="action-btn action-btn-primary" 
                         @click="openAccountLoginModal(account)"
                         title="开始登录"
+                        :disabled="!playwrightInitialized"
                       >
                         <i data-lucide="log-in" class="w-3.5 h-3.5"></i>
                       </button>
                     </template>
+                    <template v-if="apiService.isPlaywrightProvider(account.providerName)">
+                      <button 
+                        class="action-btn action-btn-secondary" 
+                        @click="openBrowser(account)"
+                        title="打开浏览器"
+                        :disabled="!playwrightInitialized"
+                      >
+                        <i data-lucide="external-link" class="w-3.5 h-3.5"></i>
+                      </button>
+                    </template>
+                    <button 
+                      v-if="apiService.isPlaywrightProvider(account.providerName)"
+                      class="action-btn action-btn-secondary" 
+                      @click="editAccountBrowserMode(account)"
+                      title="编辑浏览器模式"
+                      :disabled="!playwrightInitialized"
+                    >
+                      <i data-lucide="settings" class="w-3.5 h-3.5"></i>
+                    </button>
                     <button 
                       class="action-btn action-btn-delete" 
                       @click="deleteAccount(account)"
                       title="删除"
+                      :disabled="!playwrightInitialized"
                     >
                       <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
                     </button>
@@ -113,18 +173,24 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUpdated, inject } from 'vue';
-import { apiService } from '../services/api';
-import { message, confirm } from '../utils/message';
+import {computed, inject, onMounted, onUpdated, ref} from 'vue';
+import {apiService} from '../services/api';
+import {confirm, message} from '../utils/message';
+import Modal from '../components/Modal.vue';
 
 const openAccountLoginModal = inject('openAccountLoginModal', () => {});
 const openAccountModal = inject('openAccountModal', () => {});
+const playwrightInitialized = inject('playwrightInitialized', ref(true));
 
 const accounts = ref({});
 const loading = ref(false);
 const error = ref(null);
 const searchQuery = ref('');
 const selectedProvider = ref('');
+const showBrowserModeModal = ref(false);
+const editingAccountForBrowserMode = ref(null);
+const editingBrowserMode = ref(null);
+const savingBrowserMode = ref(false);
 
 const availableProviders = computed(() => {
   return Object.keys(accounts.value).sort();
@@ -198,6 +264,51 @@ const deleteAccount = async (account) => {
     loadAccounts();
   } catch (err) {
     message.error('删除失败: ' + (err.response?.data?.error || err.message));
+  }
+};
+
+const openBrowser = async (account) => {
+  try {
+    await apiService.openBrowser(account.providerName, account.accountId);
+    message.success('浏览器已打开');
+  } catch (err) {
+    message.error('打开浏览器失败: ' + (err.response?.data?.error || err.message));
+  }
+};
+
+const editAccountBrowserMode = (account) => {
+  editingAccountForBrowserMode.value = account;
+  editingBrowserMode.value = account.browserHeadless !== undefined ? account.browserHeadless : null;
+  showBrowserModeModal.value = true;
+};
+
+const closeBrowserModeModal = () => {
+  showBrowserModeModal.value = false;
+  editingAccountForBrowserMode.value = null;
+  editingBrowserMode.value = null;
+};
+
+const saveBrowserMode = async () => {
+  if (!editingAccountForBrowserMode.value) {
+    return;
+  }
+  
+  savingBrowserMode.value = true;
+  try {
+    await apiService.updateAccount(
+      editingAccountForBrowserMode.value.providerName, 
+      editingAccountForBrowserMode.value.accountId, 
+      {
+        browserHeadless: editingBrowserMode.value
+      }
+    );
+    message.success('浏览器模式配置已更新');
+    closeBrowserModeModal();
+    loadAccounts();
+  } catch (err) {
+    message.error('更新失败: ' + (err.response?.data?.error || err.message));
+  } finally {
+    savingBrowserMode.value = false;
   }
 };
 

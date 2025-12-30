@@ -28,6 +28,18 @@
         </small>
       </div>
       
+      <div v-if="isPlaywrightProvider" class="form-group">
+        <label>浏览器运行模式</label>
+        <select v-model="form.browserHeadless" :disabled="loading" class="w-full">
+          <option :value="null">使用全局配置</option>
+          <option :value="false">有界面运行（Headed）</option>
+          <option :value="true">无界面运行（Headless）</option>
+        </select>
+        <small class="text-gray-500 dark:text-gray-400">
+          选择该账号对应的 Chrome 浏览器运行模式。有界面模式适合需要手动操作或调试的场景，无界面模式适合自动化运行。
+        </small>
+      </div>
+      
       <div class="form-actions">
         <button type="button" class="btn btn-secondary" @click="cancel" :disabled="loading">
           取消
@@ -112,9 +124,9 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUpdated } from 'vue';
-import { apiService } from '../services/api';
-import { message } from '../utils/message';
+import {computed, onMounted, onUpdated, ref} from 'vue';
+import {apiService} from '../services/api';
+import {message} from '../utils/message';
 
 const props = defineProps({
   account: {
@@ -129,7 +141,8 @@ const PLAYWRIGHT_PROVIDERS = ['gemini', 'openai', 'deepseek'];
 
 const form = ref({
   provider: '',
-  accountName: ''
+  accountName: '',
+  browserHeadless: null // null 表示使用全局配置
 });
 const loading = ref(false);
 const error = ref(null);
@@ -157,7 +170,8 @@ onMounted(() => {
   if (props.account) {
     form.value = {
       provider: props.account.providerName || '',
-      accountName: props.account.accountName || ''
+      accountName: props.account.accountName || '',
+      browserHeadless: props.account.browserHeadless !== undefined ? props.account.browserHeadless : null
     };
     if (isPlaywrightProvider.value && props.account.accountId) {
       createdAccount.value = props.account;

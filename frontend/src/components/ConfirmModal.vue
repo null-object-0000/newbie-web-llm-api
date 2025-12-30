@@ -27,7 +27,7 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted, onUpdated } from 'vue';
+import {computed, onMounted, onUpdated, ref, watch} from 'vue';
 
 const props = defineProps({
   modelValue: {

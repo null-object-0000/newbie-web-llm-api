@@ -13,7 +13,11 @@
       </div>
       <div class="flex-1"></div>
       <div class="flex items-center gap-2">
-        <button class="btn btn-primary" @click="openApiKeyModal(null)">
+        <button 
+          class="btn btn-primary" 
+          @click="openApiKeyModal(null)"
+          :disabled="!playwrightInitialized"
+        >
           <i data-lucide="plus" class="w-3.5 h-3.5"></i>
           创建 API 密钥
         </button>
@@ -86,6 +90,7 @@
                       class="action-btn action-btn-primary" 
                       @click="openAccountForm(apiKey)"
                       title="关联账号"
+                      :disabled="!playwrightInitialized"
                     >
                       <i data-lucide="link" class="w-3.5 h-3.5"></i>
                     </button>
@@ -93,6 +98,7 @@
                       class="action-btn action-btn-primary" 
                       @click="copyApiKey(apiKey.apiKey)"
                       title="复制 API 密钥"
+                      :disabled="!playwrightInitialized"
                     >
                       <i data-lucide="copy" class="w-3.5 h-3.5"></i>
                     </button>
@@ -100,6 +106,7 @@
                       class="action-btn action-btn-switch" 
                       @click="toggleApiKeyEnabled(apiKey)"
                       :title="apiKey.enabled ? '禁用' : '启用'"
+                      :disabled="!playwrightInitialized"
                     >
                       <i :data-lucide="apiKey.enabled ? 'toggle-right' : 'toggle-left'" class="w-3.5 h-3.5"></i>
                     </button>
@@ -107,6 +114,7 @@
                       class="action-btn action-btn-delete" 
                       @click="deleteApiKey(apiKey.apiKey)"
                       title="删除"
+                      :disabled="!playwrightInitialized"
                     >
                       <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
                     </button>
@@ -142,12 +150,13 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUpdated, inject } from 'vue';
-import { apiService } from '../services/api';
+import {computed, inject, onMounted, onUpdated, ref} from 'vue';
+import {apiService} from '../services/api';
 import ApiKeyAccountForm from '../components/ApiKeyAccountForm.vue';
-import { message, confirm } from '../utils/message';
+import {confirm, message} from '../utils/message';
 
 const openApiKeyModal = inject('openApiKeyModal', () => {});
+const playwrightInitialized = inject('playwrightInitialized', ref(true));
 
 const apiKeys = ref([]);
 const loading = ref(false);

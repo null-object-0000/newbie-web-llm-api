@@ -8,20 +8,19 @@ import com.microsoft.playwright.Page;
 import com.microsoft.playwright.options.RequestOptions;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import site.newbie.web.llm.api.manager.BrowserManager;
+import site.newbie.web.llm.api.manager.LoginSessionManager;
 import site.newbie.web.llm.api.model.ChatCompletionRequest;
 import site.newbie.web.llm.api.model.ChatCompletionResponse;
-import site.newbie.web.llm.api.provider.LLMProvider;
-import site.newbie.web.llm.api.provider.AccountInfo;
 import site.newbie.web.llm.api.model.LoginInfo;
-import site.newbie.web.llm.api.manager.LoginSessionManager;
+import site.newbie.web.llm.api.provider.AccountInfo;
+import site.newbie.web.llm.api.provider.LLMProvider;
 import site.newbie.web.llm.api.provider.ModelConfig;
 import site.newbie.web.llm.api.provider.ProviderRegistry;
-import org.springframework.context.annotation.Lazy;
-import site.newbie.web.llm.api.provider.command.CommandHandler;
 import site.newbie.web.llm.api.provider.command.CommandParser;
 import site.newbie.web.llm.api.provider.deepseek.model.DeepSeekModelConfig;
 import site.newbie.web.llm.api.provider.deepseek.model.DeepSeekModelConfig.DeepSeekContext;
@@ -29,8 +28,8 @@ import site.newbie.web.llm.api.util.ConversationIdUtils;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
-import java.awt.Graphics2D;
-import java.awt.RenderingHints;
+import javax.imageio.ImageIO;
+import java.awt.*;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -42,7 +41,6 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.List;
-import javax.imageio.ImageIO;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -1684,6 +1682,8 @@ public class DeepSeekProvider implements LLMProvider {
                                     else if ("RESPONSE".equals(type)) responseText.append(content);
                                 }
                             }
+                            // 更新当前活动索引为最后创建的 fragment
+                            currentActiveIndex = nextIndex;
                             nextIndex++;
                         }
                     }
@@ -1694,15 +1694,23 @@ public class DeepSeekProvider implements LLMProvider {
                 if (path != null && path.contains("fragments/") && path.endsWith("/content")) {
                     Integer idx = extractFragmentIndex(path);
                     if (idx != null) {
-                        currentActiveIndex = idx;
-                        String type = fragmentTypeMap.get(idx);
-                        if (json.has("v") && json.get("v").isString()) {
-                            String content = json.get("v").asString();
-                            if (content != null && !content.isEmpty()) {
-                                log.trace("Fragment {} 内容更新 (type={}): {}", idx, type, content);
-                                if ("THINK".equals(type)) thinkingText.append(content);
-                                else responseText.append(content);
+                        // 处理 -1 索引（表示最后一个 fragment）
+                        if (idx == -1 && !fragmentTypeMap.isEmpty()) {
+                            idx = fragmentTypeMap.keySet().stream().mapToInt(Integer::intValue).max().orElse(-1);
+                        }
+                        if (idx >= 0 && fragmentTypeMap.containsKey(idx)) {
+                            currentActiveIndex = idx;
+                            String type = fragmentTypeMap.get(idx);
+                            if (json.has("v") && json.get("v").isString()) {
+                                String content = json.get("v").asString();
+                                if (content != null && !content.isEmpty()) {
+                                    log.trace("Fragment {} 内容更新 (type={}): {}", idx, type, content);
+                                    if ("THINK".equals(type)) thinkingText.append(content);
+                                    else responseText.append(content);
+                                }
                             }
+                        } else {
+                            log.info("Fragment 索引无效或不存在: idx={}, path={}", idx, path);
                         }
                     } else {
                         log.info("无法从路径提取索引: {}", path);
@@ -1713,9 +1721,49 @@ public class DeepSeekProvider implements LLMProvider {
                     String content = json.get("v").asString();
                     if (content != null && !content.isEmpty()) {
                         // 根据当前活动的 fragment 类型决定是思考还是回复
-                        boolean isThinking = currentActiveIndex != null && 
-                                "THINK".equals(fragmentTypeMap.get(currentActiveIndex));
-                        log.trace("简单格式内容 (activeIdx={}, isThinking={}): {}", currentActiveIndex, isThinking, content);
+                        boolean isThinking = false;
+                        
+                        if (currentActiveIndex != null && fragmentTypeMap.containsKey(currentActiveIndex)) {
+                            // 如果当前活动 fragment 类型已知，直接使用
+                            isThinking = "THINK".equals(fragmentTypeMap.get(currentActiveIndex));
+                        } else {
+                            // 如果 fragment 类型未知，使用启发式判断：
+                            boolean hasThinkFragment = fragmentTypeMap.values().stream().anyMatch("THINK"::equals);
+                            boolean hasResponseFragment = fragmentTypeMap.values().stream().anyMatch("RESPONSE"::equals);
+                            
+                            // 启发式规则：
+                            // 1. 如果有 THINK fragment 且还没有 RESPONSE fragment，说明还在思考阶段
+                            // 2. 如果已有思考内容但还没有回复内容，继续当作思考内容（深度思考进行中）
+                            // 3. 如果已有回复内容，继续当作回复内容
+                            // 4. 如果只有 RESPONSE fragment（没有 THINK fragment），说明是不带思考的响应
+                            if (hasThinkFragment && !hasResponseFragment) {
+                                // 有思考 fragment 但还没有回复 fragment，说明还在思考
+                                isThinking = true;
+                            } else if (thinkingText.length() > 0 && responseText.length() == 0) {
+                                // 已有思考内容但还没有回复内容，说明还在深度思考中
+                                isThinking = true;
+                            } else if (responseText.length() > 0) {
+                                // 已有回复内容，继续当作回复内容
+                                isThinking = false;
+                            } else if (hasResponseFragment && !hasThinkFragment) {
+                                // 只有 RESPONSE fragment，没有 THINK fragment，说明是不带思考的响应
+                                isThinking = false;
+                            } else if (fragmentTypeMap.isEmpty()) {
+                                // fragmentTypeMap 为空时，如果已有思考内容，继续当作思考内容
+                                // 否则当作回复内容（保守策略，因为大多数情况下是不带思考的）
+                                isThinking = thinkingText.length() > 0;
+                            } else {
+                                // 其他情况，默认当作回复内容
+                                isThinking = false;
+                            }
+                        }
+                        
+                        log.trace("简单格式内容 (activeIdx={}, isThinking={}, hasThink={}, hasResponse={}, thinkingLen={}, responseLen={}): {}", 
+                                currentActiveIndex, isThinking, 
+                                fragmentTypeMap.values().stream().anyMatch("THINK"::equals),
+                                fragmentTypeMap.values().stream().anyMatch("RESPONSE"::equals),
+                                thinkingText.length(), responseText.length(),
+                                content.length() > 50 ? content.substring(0, 50) + "..." : content);
                         if (isThinking) {
                             thinkingText.append(content);
                         } else {
@@ -1746,6 +1794,8 @@ public class DeepSeekProvider implements LLMProvider {
                                                 else if ("RESPONSE".equals(type)) responseText.append(content);
                                             }
                                         }
+                                        // 更新当前活动索引为最后创建的 fragment
+                                        currentActiveIndex = nextIndex;
                                         nextIndex++;
                                     }
                                 }
@@ -1757,14 +1807,22 @@ public class DeepSeekProvider implements LLMProvider {
                         if (itemPath != null && itemPath.contains("fragments/") && itemPath.endsWith("/content")) {
                             Integer idx = extractFragmentIndex(itemPath);
                             if (idx != null) {
-                                currentActiveIndex = idx;
-                                String type = fragmentTypeMap.get(idx);
-                                if (item.get("v").isString()) {
-                                    String content = item.get("v").asString();
-                                    if (content != null && !content.isEmpty()) {
-                                        if ("THINK".equals(type)) thinkingText.append(content);
-                                        else if ("RESPONSE".equals(type)) responseText.append(content);
+                                // 处理 -1 索引（表示最后一个 fragment）
+                                if (idx == -1 && !fragmentTypeMap.isEmpty()) {
+                                    idx = fragmentTypeMap.keySet().stream().mapToInt(Integer::intValue).max().orElse(-1);
+                                }
+                                if (idx >= 0 && fragmentTypeMap.containsKey(idx)) {
+                                    currentActiveIndex = idx;
+                                    String type = fragmentTypeMap.get(idx);
+                                    if (item.get("v").isString()) {
+                                        String content = item.get("v").asString();
+                                        if (content != null && !content.isEmpty()) {
+                                            if ("THINK".equals(type)) thinkingText.append(content);
+                                            else if ("RESPONSE".equals(type)) responseText.append(content);
+                                        }
                                     }
+                                } else {
+                                    log.info("BATCH Fragment 索引无效或不存在: idx={}, path={}", idx, itemPath);
                                 }
                             }
                         }

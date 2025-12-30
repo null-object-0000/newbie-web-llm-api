@@ -1,6 +1,6 @@
-import { createApp } from 'vue';
+import {createApp} from 'vue';
 import axios from 'axios';
-import { createIcons, icons } from 'lucide';
+import {createIcons, icons} from 'lucide';
 import App from './App.vue';
 import router from './router';
 import './styles/main.css';

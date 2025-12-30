@@ -1,7 +1,6 @@
 package site.newbie.web.llm.api.manager;
 
 import com.microsoft.playwright.BrowserContext;
-import com.microsoft.playwright.Locator;
 import com.microsoft.playwright.Page;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
@@ -15,8 +14,8 @@ import site.newbie.web.llm.api.provider.ProviderRegistry;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.regex.Pattern;
 import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * 账号登录服务

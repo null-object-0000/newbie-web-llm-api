@@ -23,7 +23,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUpdated } from 'vue';
+import {onMounted, onUpdated, ref} from 'vue';
 
 const toasts = ref([]);
 let toastId = 0;
