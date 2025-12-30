@@ -3,6 +3,8 @@ package site.newbie.web.llm.api.provider;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
+import site.newbie.web.llm.api.config.ApiKeyContext;
+import site.newbie.web.llm.api.config.ApiKeyScopedValue;
 import site.newbie.web.llm.api.manager.LoginStorageService;
 import site.newbie.web.llm.api.model.LoginInfo;
 import site.newbie.web.llm.api.model.ModelResponse;
@@ -121,37 +123,47 @@ public class ProviderRegistry {
     
     /**
      * 获取所有提供者信息
+     * 如果存在 API key 上下文，则根据 API key 过滤，只返回 API key 支持的 providers
+     * 如果是 admin 请求（没有 API key 上下文），则返回所有 providers
      */
     public Map<String, Object> getAllProviders() {
         Map<String, Object> result = new HashMap<>();
+        ApiKeyContext context = ApiKeyScopedValue.getContext();
+        boolean shouldFilter = (context != null); // 只有存在 API key 上下文时才过滤
+        
         for (LLMProvider provider : providers) {
+            String providerName = provider.getProviderName();
+            // 如果存在 API key 上下文且不支持该 provider，则跳过
+            if (shouldFilter && context != null && !context.supportsProvider(providerName)) {
+                continue;
+            }
             Map<String, Object> providerInfo = new HashMap<>();
-            providerInfo.put("name", provider.getProviderName());
+            providerInfo.put("name", providerName);
             providerInfo.put("models", provider.getSupportedModels());
-            result.put(provider.getProviderName(), providerInfo);
+            result.put(providerName, providerInfo);
         }
         return result;
     }
-    
-    /**
-     * 获取所有可用的模型列表（自定义格式）
-     */
-    public List<Map<String, String>> getAllModels() {
-        return modelToProvider.entrySet().stream()
-                .map(entry -> {
-                    Map<String, String> modelInfo = new HashMap<>();
-                    modelInfo.put("model", entry.getKey());
-                    modelInfo.put("provider", entry.getValue().getProviderName());
-                    return modelInfo;
-                })
-                .collect(Collectors.toList());
-    }
-    
+
     /**
      * 获取符合 OpenAI 格式的模型列表
+     * 如果存在 API key 上下文，则根据 API key 过滤，只返回 API key 支持的 providers 的模型
+     * 如果是 admin 请求（没有 API key 上下文），则返回所有模型
      */
     public ModelResponse getOpenAIModels() {
+        ApiKeyContext context = ApiKeyScopedValue.getContext();
+        boolean shouldFilter = (context != null); // 只有存在 API key 上下文时才过滤
+        
         List<ModelResponse.ModelData> modelDataList = modelToProvider.entrySet().stream()
+                .filter(entry -> {
+                    // 如果存在 API key 上下文，只返回 API key 支持的 provider 的模型
+                    if (shouldFilter && context != null) {
+                        String providerName = entry.getValue().getProviderName();
+                        return context.supportsProvider(providerName);
+                    }
+                    // 如果没有 API key 上下文（admin 请求），返回所有模型
+                    return true;
+                })
                 .map(entry -> ModelResponse.ModelData.builder()
                         .id(entry.getKey())
                         .object("model")

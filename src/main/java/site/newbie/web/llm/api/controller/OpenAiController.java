@@ -30,9 +30,8 @@ import site.newbie.web.llm.api.util.ConversationIdUtils;
 import site.newbie.web.llm.api.provider.command.Command;
 import site.newbie.web.llm.api.provider.command.CommandHandler;
 import site.newbie.web.llm.api.provider.command.CommandParser;
+import site.newbie.web.llm.api.config.ApiKeyScopedValue;
 import tools.jackson.databind.ObjectMapper;
-
-import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
@@ -107,18 +106,8 @@ public class OpenAiController {
                 request.setConversationId(conversationIdHeader);
             }
             
-            // 4. 从 Authorization Header 读取 API 密钥
-            if (authorizationHeader != null && !authorizationHeader.isEmpty()) {
-                // 支持 "Bearer sk-xxx" 或 "sk-xxx" 格式
-                String apiKey = authorizationHeader;
-                if (authorizationHeader.startsWith("Bearer ")) {
-                    apiKey = authorizationHeader.substring(7).trim();
-                }
-                
-                if (apiKey.startsWith("sk-")) {
-                    apiKeyFromHeader = apiKey;
-                }
-            }
+            // 4. 从 ScopedValue 读取 API 密钥（拦截器已验证并存储）
+            apiKeyFromHeader = ApiKeyScopedValue.getApiKey();
             
             // 注意：
             // - 深度思考模式现在完全根据模型名称自动判断，不再接收外部参数
@@ -142,28 +131,27 @@ public class OpenAiController {
         }
         
         // 4. 从 API 密钥解析 accountId（需要知道提供器后才能正确解析）
+        // 注意：拦截器已经验证了 API key 的基本有效性，这里只需要验证 provider 特定逻辑
         String providerName = provider.getProviderName();
-        String accountIdFromApiKey = null;
-        if (apiKeyFromHeader != null) {
-            // 检查 API key 是否支持该提供器
-            if (!apiKeyManager.supportsProvider(apiKeyFromHeader, providerName)) {
-                return ResponseEntity.status(HttpStatus.FORBIDDEN)
-                        .body(Map.of("error", Map.of("message", 
-                            "API key does not support provider: " + providerName, 
-                            "type", "invalid_request_error")));
-            }
-            accountIdFromApiKey = apiKeyManager.getAccountIdByApiKey(apiKeyFromHeader, providerName);
-            if (accountIdFromApiKey == null) {
-                return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
-                        .body(Map.of("error", Map.of("message", "Invalid API key", "type", "invalid_request_error")));
-            }
-            // 从 API key 设置 accountId
-            request.setAccountId(accountIdFromApiKey);
-        } else {
-            // API key 是必需的
-            return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
-                    .body(Map.of("error", Map.of("message", "API key is required. Please provide a valid API key in the Authorization header.", "type", "invalid_request_error")));
+        // 检查 API key 是否支持该提供器（从 ScopedValue 检查）
+        if (!ApiKeyScopedValue.supportsProvider(providerName)) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN)
+                    .body(Map.of("error", Map.of("message", 
+                        "API key does not support provider: " + providerName, 
+                        "type", "invalid_request_error")));
         }
+        String accountIdFromApiKey = apiKeyManager.getAccountIdByApiKey(apiKeyFromHeader, providerName);
+        if (accountIdFromApiKey == null) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                    .body(Map.of("error", Map.of(
+                        "message", "Invalid API Key",
+                        "param", "Please provide valid API Key, Format: Authorization: Bearer <your-api-key> or api-key: <your-api-key>",
+                        "code", "401",
+                        "type", "invalid_key"
+                    )));
+        }
+        // 从 API key 设置 accountId
+        request.setAccountId(accountIdFromApiKey);
 
         // 4. 判断是流式 (Stream) 还是 普通请求
         if (request.isStream()) {
@@ -328,6 +316,7 @@ public class OpenAiController {
 
     /**
      * 获取所有可用的提供者和模型
+     * 注意：API key 验证由拦截器处理
      */
     @GetMapping("/providers")
     public ResponseEntity<Map<String, Object>> getProviders() {
@@ -337,24 +326,54 @@ public class OpenAiController {
     /**
      * 获取所有可用的模型列表（OpenAI 兼容格式）
      * 前端可以使用 OpenAI SDK: openai.models.list()
+     * 注意：API key 验证由拦截器处理
      */
     @GetMapping("/models")
     public ResponseEntity<ModelResponse> getModels() {
         return ResponseEntity.ok(providerRegistry.getOpenAIModels());
     }
     
+    
     /**
      * 图片生成 API（OpenAI 兼容）
      * POST /v1/images/generations
      */
     @PostMapping(value = "/images/generations", produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<ImageGenerationResponse> generateImage(@RequestBody ImageGenerationRequest request) {
+    public ResponseEntity<?> generateImage(
+            @RequestBody ImageGenerationRequest request,
+            @RequestHeader(value = "Authorization", required = false) String authorizationHeader) {
         try {
             log.info("收到图片生成请求: prompt={}, model={}, response_format={}, n={}", 
                     request != null ? (request.getPrompt() != null ? request.getPrompt().substring(0, Math.min(50, request.getPrompt().length())) : "null") : "null",
                     request != null ? request.getModel() : "null",
                     request != null ? request.getResponseFormat() : "null",
                     request != null ? request.getN() : "null");
+            
+            // API Key 验证（拦截器已验证基本有效性，这里只验证 provider 特定逻辑）
+            // 从 ScopedValue 获取 API key
+            String apiKeyFromHeader = ApiKeyScopedValue.getApiKey();
+            
+            // 验证 API key 是否支持 Gemini 提供器（图片生成使用 Gemini）
+            if (!ApiKeyScopedValue.supportsProvider("gemini")) {
+                log.warn("API key 不支持 Gemini 提供器");
+                return ResponseEntity.status(HttpStatus.FORBIDDEN)
+                        .body(ImageGenerationResponse.builder()
+                                .created(System.currentTimeMillis() / 1000)
+                                .data(List.of())
+                                .build());
+            }
+            
+            String accountIdFromApiKey = apiKeyManager.getAccountIdByApiKey(apiKeyFromHeader, "gemini");
+            if (accountIdFromApiKey == null) {
+                log.warn("无效的 API key for Gemini provider");
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                        .body(Map.of("error", Map.of(
+                            "message", "Invalid API Key",
+                            "param", "Please provide valid API Key, Format: Authorization: Bearer <your-api-key> or api-key: <your-api-key>",
+                            "code", "401",
+                            "type", "invalid_key"
+                        )));
+            }
             
             // 参数校验
             if (request == null || request.getPrompt() == null || request.getPrompt().trim().isEmpty()) {
@@ -378,8 +397,10 @@ public class OpenAiController {
             boolean returnBase64 = "b64_json".equals(responseFormat);
             
             // 生成图片（同步方法，返回文件名列表）
-            log.info("开始调用 generateImageSync，prompt: {}", request.getPrompt().substring(0, Math.min(50, request.getPrompt().length())));
-            List<String> imageFilenames = provider.generateImageSync(request.getPrompt(), request.getN());
+            log.info("开始调用 generateImageSync，prompt: {}, accountId: {}", 
+                    request.getPrompt().substring(0, Math.min(50, request.getPrompt().length())), 
+                    accountIdFromApiKey);
+            List<String> imageFilenames = provider.generateImageSync(request.getPrompt(), request.getN(), accountIdFromApiKey);
             log.info("generateImageSync 返回，文件名数量: {}", imageFilenames != null ? imageFilenames.size() : 0);
             
             if (imageFilenames == null || imageFilenames.isEmpty()) {

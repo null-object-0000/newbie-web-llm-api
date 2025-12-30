@@ -284,14 +284,15 @@ public class OpenAIProvider implements LLMProvider {
     @Override
     public Page getOrCreatePage(ChatCompletionRequest request) {
         String model = request.getModel();
+        String accountId = request.getAccountId();
         String conversationId = getConversationId(request);
         boolean isNew = isNewConversation(request);
         
         if (!isNew && conversationId != null) {
             String conversationUrl = buildUrlFromConversationId(conversationId);
-            return findOrCreatePageForUrl(conversationUrl, model);
+            return findOrCreatePageForUrl(conversationUrl, model, accountId);
         } else {
-            return createNewConversationPage(model);
+            return createNewConversationPage(model, accountId);
         }
     }
     
@@ -316,8 +317,8 @@ public class OpenAIProvider implements LLMProvider {
         return conversationId == null || conversationId.isEmpty() || conversationId.startsWith("login-");
     }
     
-    private Page findOrCreatePageForUrl(String url, String model) {
-        Page page = findPageByUrl(url);
+    private Page findOrCreatePageForUrl(String url, String model, String accountId) {
+        Page page = findPageByUrl(url, accountId);
             if (page != null && !page.isClosed()) {
                 if (!page.url().equals(url)) {
                     page.navigate(url);
@@ -328,7 +329,7 @@ public class OpenAIProvider implements LLMProvider {
                 return page;
             }
             
-            page = browserManager.newPage(getProviderName());
+            page = browserManager.newPage(getProviderName(), accountId);
             modelPages.put(model, page);
             page.navigate(url);
             page.waitForLoadState();
@@ -336,13 +337,13 @@ public class OpenAIProvider implements LLMProvider {
             return page;
     }
     
-    private Page createNewConversationPage(String model) {
+    private Page createNewConversationPage(String model, String accountId) {
         Page oldPage = modelPages.remove(model);
         if (oldPage != null && !oldPage.isClosed()) {
             try { oldPage.close(); } catch (Exception e) { }
         }
         
-        Page page = browserManager.newPage(getProviderName());
+        Page page = browserManager.newPage(getProviderName(), accountId);
         modelPages.put(model, page);
         page.navigate("https://chatgpt.com/");
         page.waitForLoadState();
@@ -352,7 +353,7 @@ public class OpenAIProvider implements LLMProvider {
         return page;
     }
     
-    private Page findPageByUrl(String targetUrl) {
+    private Page findPageByUrl(String targetUrl, String accountId) {
         if (targetUrl == null) return null;
         for (String model : modelPages.keySet()) {
             Page page = modelPages.get(model);
@@ -361,7 +362,7 @@ public class OpenAIProvider implements LLMProvider {
             }
         }
         try {
-            for (Page page : browserManager.getAllPages(getProviderName())) {
+            for (Page page : browserManager.getAllPages(getProviderName(), accountId)) {
                 if (page != null && !page.isClosed() && targetUrl.equals(page.url())) {
                     return page;
                 }

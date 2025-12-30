@@ -480,7 +480,8 @@ public class GeminiProvider implements LLMProvider {
 
             // 如果找不到已保留的 tab，尝试通过 URL 查找（但不创建新页面）
             String conversationUrl = buildUrlFromConversationId(conversationId);
-            Page foundPage = findPageByUrl(conversationUrl);
+            String accountId = request.getAccountId();
+            Page foundPage = findPageByUrl(conversationUrl, accountId);
 
             if (foundPage != null && !foundPage.isClosed()) {
                 // 找到了页面，更新映射
@@ -541,7 +542,7 @@ public class GeminiProvider implements LLMProvider {
         return page;
     }
 
-    private Page findPageByUrl(String targetUrl) {
+    private Page findPageByUrl(String targetUrl, String accountId) {
         if (targetUrl == null) return null;
         for (String model : modelPages.keySet()) {
             Page page = modelPages.get(model);
@@ -550,7 +551,6 @@ public class GeminiProvider implements LLMProvider {
             }
         }
         try {
-            String accountId = null; // TODO: 从 request 中获取 accountId
             for (Page page : browserManager.getAllPages(getProviderName(), accountId)) {
                 if (page != null && !page.isClosed() && targetUrl.equals(page.url())) {
                     return page;
@@ -1027,9 +1027,10 @@ public class GeminiProvider implements LLMProvider {
      * 同步生成图片（用于 OpenAI 兼容的图片生成 API）
      * @param prompt 图片描述提示词
      * @param n 生成图片数量
+     * @param accountId 账号ID，用于创建页面
      * @return 图片文件名列表（不是 URL）
      */
-    public List<String> generateImageSync(String prompt, int n) {
+    public List<String> generateImageSync(String prompt, int n, String accountId) {
         List<String> imageUrls = new java.util.ArrayList<>();
         // 创建一个自定义的 ResponseHandler 来收集图片文件名
         final List<String> collectedFilenames = new java.util.ArrayList<>();
@@ -1045,6 +1046,7 @@ public class GeminiProvider implements LLMProvider {
                 ))
                 .stream(false)
                 .newConversation(true)
+                .accountId(accountId) // 设置 accountId，用于创建页面
                 .build();
         
         // 使用 CountDownLatch 等待结果
@@ -1131,8 +1133,7 @@ public class GeminiProvider implements LLMProvider {
                     throw new IllegalArgumentException("图片生成模型不可用");
                 }
                 
-                // 从 request 中获取 accountId（如果存在）
-                String accountId = request.getAccountId();
+                // 使用传入的 accountId 创建页面
                 page = createNewConversationPage("gemini-web-imagegen", accountId);
                 if (page == null) {
                     throw new RuntimeException("无法创建页面");

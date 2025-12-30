@@ -242,9 +242,6 @@ public class DeepSeekProvider implements LLMProvider {
                         .setHeader("accept", "*/*")
                         .setHeader("accept-language", "zh-CN,zh;q=0.9")
                         .setHeader("authorization", "Bearer " + token)
-                        .setHeader("sec-fetch-dest", "empty")
-                        .setHeader("sec-fetch-mode", "cors")
-                        .setHeader("sec-fetch-site", "same-origin")
                         .setHeader("x-app-version", "20241129.1")
                         .setHeader("x-client-locale", "zh_CN")
                         .setHeader("x-client-platform", "web")
@@ -354,8 +351,9 @@ public class DeepSeekProvider implements LLMProvider {
         try {
             log.info("开始处理 DeepSeek 登录流程，登录方式: {}", session.getLoginMethod());
             
-            // 获取或创建登录页面
-            page = getOrCreateLoginPage();
+            // 获取或创建登录页面（从 request 中获取 accountId）
+            String accountId = request.getAccountId();
+            page = getOrCreateLoginPage(accountId);
             
             // 等待页面加载
             page.waitForLoadState();
@@ -391,8 +389,9 @@ public class DeepSeekProvider implements LLMProvider {
     
     /**
      * 获取或创建登录页面
+     * @param accountId 账号ID，用于创建页面
      */
-    private Page getOrCreateLoginPage() {
+    private Page getOrCreateLoginPage(String accountId) {
         // 查找是否已有登录页面
         for (Page existingPage : modelPages.values()) {
             if (existingPage != null && !existingPage.isClosed()) {
@@ -414,9 +413,9 @@ public class DeepSeekProvider implements LLMProvider {
             }
         }
         
-        // 创建新的登录页面
-        log.info("创建新的登录页面");
-        Page page = browserManager.newPage(getProviderName());
+        // 创建新的登录页面（使用 accountId）
+        log.info("创建新的登录页面，accountId: {}", accountId);
+        Page page = browserManager.newPage(getProviderName(), accountId);
         page.navigate("https://chat.deepseek.com/");
         page.waitForLoadState();
         return page;
@@ -1116,15 +1115,16 @@ public class DeepSeekProvider implements LLMProvider {
     @Override
     public Page getOrCreatePage(ChatCompletionRequest request) {
         String model = request.getModel();
+        String accountId = request.getAccountId();
         String conversationId = getConversationId(request);
         boolean isNewConversation = isNewConversation(request);
         
         Page page;
         if (!isNewConversation && conversationId != null) {
             String conversationUrl = buildUrlFromConversationId(conversationId);
-            page = findOrCreatePageForUrl(conversationUrl, model);
+            page = findOrCreatePageForUrl(conversationUrl, model, accountId);
         } else {
-            page = createNewConversationPage(model);
+            page = createNewConversationPage(model, accountId);
         }
         
         return page;
@@ -1151,11 +1151,11 @@ public class DeepSeekProvider implements LLMProvider {
         return conversationId == null || conversationId.isEmpty() || conversationId.startsWith("login-");
     }
     
-    private Page findOrCreatePageForUrl(String url, String model) {
+    private Page findOrCreatePageForUrl(String url, String model, String accountId) {
         log.info("检测到对话 URL，尝试复用: {}", url);
         
         // 查找已有页面
-        Page page = findPageByUrl(url);
+        Page page = findPageByUrl(url, accountId);
         
         if (page != null && !page.isClosed()) {
             String currentUrl = page.url();
@@ -1170,8 +1170,8 @@ public class DeepSeekProvider implements LLMProvider {
             return page;
         }
         
-        // 创建新页面
-        page = browserManager.newPage(getProviderName());
+        // 创建新页面（使用 accountId）
+        page = browserManager.newPage(getProviderName(), accountId);
         modelPages.put(model, page);
         page.navigate(url);
         page.waitForLoadState();
@@ -1182,8 +1182,8 @@ public class DeepSeekProvider implements LLMProvider {
         return page;
     }
     
-    private Page createNewConversationPage(String model) {
-        log.info("开启新对话");
+    private Page createNewConversationPage(String model, String accountId) {
+        log.info("开启新对话，accountId: {}", accountId);
         
         // 关闭旧页面
         Page oldPage = modelPages.remove(model);
@@ -1191,8 +1191,8 @@ public class DeepSeekProvider implements LLMProvider {
             try { oldPage.close(); } catch (Exception e) { log.warn("关闭旧页面时出错", e); }
         }
         
-        // 创建新页面
-        Page page = browserManager.newPage(getProviderName());
+        // 创建新页面（使用 accountId）
+        Page page = browserManager.newPage(getProviderName(), accountId);
         modelPages.put(model, page);
         page.navigate("https://chat.deepseek.com/");
         page.waitForLoadState();
@@ -1232,7 +1232,7 @@ public class DeepSeekProvider implements LLMProvider {
         }
     }
     
-    private Page findPageByUrl(String targetUrl) {
+    private Page findPageByUrl(String targetUrl, String accountId) {
         if (targetUrl == null) return null;
         
         // 检查 modelPages
@@ -1246,9 +1246,9 @@ public class DeepSeekProvider implements LLMProvider {
             }
         }
         
-        // 检查该提供器的所有 tab
+        // 检查该提供器的所有 tab（使用 accountId）
         try {
-            for (Page page : browserManager.getAllPages(getProviderName())) {
+            for (Page page : browserManager.getAllPages(getProviderName(), accountId)) {
                 if (page != null && !page.isClosed() && targetUrl.equals(page.url())) {
                     return page;
                 }
