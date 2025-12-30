@@ -18,7 +18,7 @@ export default defineConfig({
     port: 3174,
     proxy: {
       // 只代理 API 请求到后端
-      '/admin/api': {
+      '/admin/api/': {
         target: 'http://localhost:24753',
         changeOrigin: true
       }

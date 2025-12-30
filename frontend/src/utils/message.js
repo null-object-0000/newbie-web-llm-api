@@ -55,7 +55,7 @@ export const confirm = (options) => {
     
     const {
       title = '确认',
-      message,
+      message = '确认操作？',
       type = 'warning',
       confirmText = '确定',
       cancelText = '取消'
@@ -63,7 +63,7 @@ export const confirm = (options) => {
     
     confirmModalInstance.show({
       title,
-      message,
+      message: message || '确认操作？',
       type,
       confirmText,
       cancelText

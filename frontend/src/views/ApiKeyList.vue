@@ -44,8 +44,22 @@
                 <td class="table-cell">
                   <span class="font-medium text-sm">{{ apiKey.name || '-' }}</span>
                 </td>
-                <td class="table-cell">
-                  <code class="text-xs bg-gray-100 dark:bg-base-200 px-2 py-1 rounded font-mono">{{ maskApiKey(apiKey.apiKey) }}</code>
+                <td class="table-cell" style="min-width: 320px; width: 380px;">
+                  <div class="flex items-start gap-2">
+                    <code 
+                      class="text-xs bg-gray-100 dark:bg-base-200 px-2 py-1 rounded font-mono inline-block" 
+                      style="word-break: break-all; overflow-wrap: anywhere; white-space: normal; max-width: none; overflow: visible; text-overflow: clip; width: 260px; min-width: 260px;"
+                    >
+                      {{ isApiKeyVisible(apiKey.apiKey) ? apiKey.apiKey : maskApiKey(apiKey.apiKey) }}
+                    </code>
+                    <button 
+                      class="p-1 hover:bg-gray-200 dark:hover:bg-gray-700 rounded transition-colors flex-shrink-0"
+                      @click="toggleApiKeyVisibility(apiKey.apiKey)"
+                      :title="isApiKeyVisible(apiKey.apiKey) ? '隐藏' : '查看'"
+                    >
+                      <i :data-lucide="isApiKeyVisible(apiKey.apiKey) ? 'eye-off' : 'eye'" class="w-4 h-4 text-gray-600 dark:text-gray-400"></i>
+                    </button>
+                  </div>
                 </td>
                 <td class="table-cell">
                   <div class="flex flex-wrap gap-1">
@@ -76,11 +90,18 @@
                       <i data-lucide="link" class="w-3.5 h-3.5"></i>
                     </button>
                     <button 
+                      class="action-btn action-btn-primary" 
+                      @click="copyApiKey(apiKey.apiKey)"
+                      title="复制 API 密钥"
+                    >
+                      <i data-lucide="copy" class="w-3.5 h-3.5"></i>
+                    </button>
+                    <button 
                       class="action-btn action-btn-switch" 
-                      @click="toggleApiKey(apiKey.apiKey, !apiKey.enabled)"
+                      @click="toggleApiKeyEnabled(apiKey)"
                       :title="apiKey.enabled ? '禁用' : '启用'"
                     >
-                      <i :data-lucide="apiKey.enabled ? 'eye-off' : 'eye'" class="w-3.5 h-3.5"></i>
+                      <i :data-lucide="apiKey.enabled ? 'toggle-right' : 'toggle-left'" class="w-3.5 h-3.5"></i>
                     </button>
                     <button 
                       class="action-btn action-btn-delete" 
@@ -134,6 +155,8 @@ const error = ref(null);
 const searchQuery = ref('');
 const showAccountForm = ref(false);
 const selectedApiKey = ref(null);
+// 跟踪哪些 API 密钥是显示完整内容的
+const visibleApiKeys = ref(new Set());
 
 const hasApiKeys = computed(() => {
   return filteredApiKeys.value.length > 0;
@@ -165,13 +188,58 @@ const loadApiKeys = async () => {
   }
 };
 
-const toggleApiKey = async (apiKey, enabled) => {
+const toggleApiKeyVisibility = (apiKey) => {
+  if (visibleApiKeys.value.has(apiKey)) {
+    visibleApiKeys.value.delete(apiKey);
+  } else {
+    visibleApiKeys.value.add(apiKey);
+  }
+};
+
+const isApiKeyVisible = (apiKey) => {
+  return visibleApiKeys.value.has(apiKey);
+};
+
+const copyApiKey = async (apiKey) => {
   try {
-    await apiService.updateApiKey(apiKey, { enabled });
-    loadApiKeys();
-    message.success(enabled ? 'API 密钥已启用' : 'API 密钥已禁用');
+    await navigator.clipboard.writeText(apiKey);
+    message.success('API 密钥已复制到剪贴板');
   } catch (err) {
-    message.error('操作失败: ' + (err.response?.data?.error || err.message));
+    // 降级方案：使用传统方法
+    const textArea = document.createElement('textarea');
+    textArea.value = apiKey;
+    textArea.style.position = 'fixed';
+    textArea.style.opacity = '0';
+    document.body.appendChild(textArea);
+    textArea.select();
+    try {
+      document.execCommand('copy');
+      message.success('API 密钥已复制到剪贴板');
+    } catch (e) {
+      message.error('复制失败，请手动复制');
+    }
+    document.body.removeChild(textArea);
+  }
+};
+
+const toggleApiKeyEnabled = async (apiKey) => {
+  const action = apiKey.enabled ? '禁用' : '启用';
+  const confirmed = await confirm({
+    title: `${action} API 密钥`,
+    message: `确定要${action} API 密钥 "${apiKey.name || apiKey.apiKey.substring(0, 20)}..." 吗？`,
+    type: apiKey.enabled ? 'warning' : 'info'
+  });
+  
+  if (!confirmed) {
+    return;
+  }
+  
+  try {
+    await apiService.updateApiKey(apiKey.apiKey, { enabled: !apiKey.enabled });
+    await loadApiKeys();
+    message.success(`API 密钥已${action}`);
+  } catch (err) {
+    message.error(`${action}失败: ` + (err.response?.data?.error || err.message));
   }
 };
 
@@ -207,7 +275,15 @@ const formatTime = (timestamp) => {
 
 const maskApiKey = (apiKey) => {
   if (!apiKey) return '';
-  return apiKey.substring(0, 20) + '...';
+  if (apiKey.length <= 8) {
+    // 如果密钥很短，全部用星号代替
+    return '*'.repeat(apiKey.length);
+  }
+  // 显示前 4 个字符和后 4 个字符，中间用星号代替
+  const prefix = apiKey.substring(0, 4);
+  const suffix = apiKey.substring(apiKey.length - 4);
+  const maskedLength = apiKey.length - 8;
+  return prefix + '*'.repeat(Math.min(maskedLength, 12)) + suffix;
 };
 
 const getProviders = (apiKey) => {
