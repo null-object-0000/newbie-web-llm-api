@@ -20,7 +20,9 @@ const apiService = window.apiService || {
 const ApiKeyList = {
     name: 'ApiKeyList',
     components: {
-        ApiKeyAccountForm: window.ApiKeyAccountForm
+        ApiKeyAccountForm: window.ApiKeyAccountForm || {
+            template: '<div class="error-message">关联账号组件加载失败，请刷新页面重试</div>'
+        }
     },
     emits: ['edit'],
     data() {

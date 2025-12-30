@@ -24,7 +24,7 @@ import java.util.stream.Collectors;
  */
 @Slf4j
 @RestController
-@RequestMapping("/admin")
+@RequestMapping("/admin/api")
 @CrossOrigin(origins = "*")
 public class AdminController {
     

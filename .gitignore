@@ -33,3 +33,5 @@ build/
 
 user-data
 logs
+
+node_modules/

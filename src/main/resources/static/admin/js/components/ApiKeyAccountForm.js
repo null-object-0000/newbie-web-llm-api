@@ -128,7 +128,19 @@ const ApiKeyAccountForm = {
                     </p>
                 </div>
                 
-                <div class="provider-accounts-grid">
+                <div v-if="availableProviders.length === 0" class="empty-state">
+                    <div class="flex flex-col items-center justify-center text-center py-8">
+                        <i data-lucide="inbox" class="w-12 h-12 text-gray-300 dark:text-gray-600 mb-4"></i>
+                        <p class="text-gray-400 dark:text-gray-500 text-sm font-medium mb-1.5">
+                            暂无可用账号
+                        </p>
+                        <p class="text-xs text-gray-400 dark:text-gray-500 max-w-xs">
+                            请先在"账号"页面添加账号，然后再进行关联
+                        </p>
+                    </div>
+                </div>
+                
+                <div v-else class="provider-accounts-grid">
                     <div 
                         v-for="provider in availableProviders" 
                         :key="provider" 
