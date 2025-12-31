@@ -47,7 +47,7 @@ public interface Command {
     
     /**
      * 判断指令是否需要登录
-     * @return true 如果需要登录，false 如果不需要（如 help 和 login 指令）
+     * @return true 如果需要登录，false 如果不需要（如 help 指令）
      */
     default boolean requiresLogin() {
         return true;

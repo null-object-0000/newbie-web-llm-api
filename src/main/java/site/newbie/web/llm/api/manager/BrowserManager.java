@@ -217,7 +217,7 @@ public class BrowserManager {
      * 如果 context 已关闭会自动重新创建
      * @param providerName 提供器名称
      * @param accountId 账号ID，如果为 null 则使用默认账号（兼容旧代码）
-     * @param forceHeadless 强制指定 headless 模式，null 表示使用账号配置或全局配置
+     * @param forceHeadless 强制指定 headless 模式，null 表示使用账号配置
      */
     public synchronized BrowserContext getOrCreateContext(String providerName, String accountId, Boolean forceHeadless) {
         String contextKey = accountId != null && !accountId.isEmpty() 
@@ -265,8 +265,8 @@ public class BrowserManager {
                 : userDataDir + "/" + providerName;
 
         // 决定是否使用 headless 模式
-        // 优先级：强制指定 > 账号配置 > 全局配置
-        boolean useHeadless = headless;
+        // 优先级：强制指定 > 账号配置
+        boolean useHeadless = false; // 默认有界面运行
         
         // 如果强制指定了 headless 模式，直接使用
         if (forceHeadless != null) {
@@ -274,7 +274,7 @@ public class BrowserManager {
             log.info("提供器 {} 账号 {} 强制使用浏览器模式: {}", 
                 providerName, accountId, useHeadless ? "Headless (无界面)" : "Headed (有界面)");
         } else {
-            // 如果提供了 accountId，尝试从账号配置中读取 browserHeadless 设置
+            // 如果提供了 accountId，从账号配置中读取 browserHeadless 设置
             if (accountId != null && !accountId.isEmpty()) {
                 AccountManager.AccountInfo account = accountManager.getAccount(providerName, accountId);
                 if (account != null && account.getBrowserHeadless() != null) {
@@ -282,12 +282,15 @@ public class BrowserManager {
                     log.info("提供器 {} 账号 {} 使用账号配置的浏览器模式: {}", 
                         providerName, accountId, useHeadless ? "Headless (无界面)" : "Headed (有界面)");
                 } else {
-                    log.info("提供器 {} 账号 {} 使用全局配置的浏览器模式: {}", 
-                        providerName, accountId, useHeadless ? "Headless (无界面)" : "Headed (有界面)");
+                    // 账号配置不存在，使用默认值（有界面运行）
+                    useHeadless = false;
+                    log.info("提供器 {} 账号 {} 未配置浏览器模式，使用默认值（有界面运行）", 
+                        providerName, accountId);
                 }
             } else {
-                log.info("提供器 {} 使用全局配置的浏览器模式: {}", 
-                    providerName, useHeadless ? "Headless (无界面)" : "Headed (有界面)");
+                // 没有提供 accountId，使用默认值（有界面运行）
+                useHeadless = false;
+                log.info("提供器 {} 未指定账号，使用默认浏览器模式（有界面运行）", providerName);
             }
         }
 
@@ -415,7 +418,7 @@ public class BrowserManager {
      * 如果 context 已关闭会自动重新创建并重试
      * @param providerName 提供器名称
      * @param accountId 账号ID
-     * @param forceHeadless 强制指定 headless 模式，null 表示使用账号配置或全局配置
+     * @param forceHeadless 强制指定 headless 模式，null 表示使用账号配置
      */
     public synchronized Page newPage(String providerName, String accountId, Boolean forceHeadless) {
         String contextKey = accountId != null && !accountId.isEmpty() 

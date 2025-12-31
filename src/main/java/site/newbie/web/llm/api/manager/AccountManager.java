@@ -83,14 +83,14 @@ public class AccountManager {
         @JsonProperty("isLoginVerified")
         @JsonAlias("loginVerified") // 兼容旧的 JSON 文件中的字段名
         private boolean isLoginVerified; // 是否已完成登录验证（仅对 Playwright 类提供器有效）
-        private Boolean browserHeadless; // 浏览器是否无界面运行（null 表示使用全局配置，仅对 Playwright 类提供器有效）
+        private Boolean browserHeadless; // 浏览器是否无界面运行（仅对 Playwright 类提供器有效）
         
         public AccountInfo() {
             this.metadata = new HashMap<>();
             this.createdAt = System.currentTimeMillis();
             this.lastUsedAt = System.currentTimeMillis();
             this.isLoginVerified = false; // 默认未完成登录验证
-            this.browserHeadless = null; // 默认使用全局配置
+            this.browserHeadless = false; // 默认有界面运行
         }
     }
     

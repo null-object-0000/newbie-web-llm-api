@@ -98,10 +98,6 @@ public class CommandHandler {
             boolean onlyHelpCommand = parseResult.getCommands().size() == 1 && 
                                      "help".equals(parseResult.getCommands().get(0).getName());
             
-            // 检查是否只有 login 指令（login 指令需要页面但不需要登录检查）
-            boolean onlyLoginCommand = parseResult.getCommands().size() == 1 && 
-                                      "login".equals(parseResult.getCommands().get(0).getName());
-            
             // help 指令完全独立，跳过所有页面和登录相关操作
             if (onlyHelpCommand) {
                 log.info("检测到 help 指令，跳过页面获取和登录检查");
@@ -123,15 +119,6 @@ public class CommandHandler {
                     // 如果是新对话但 page 为 null，说明创建失败
                     sendCommandResult(emitter, model, "❌ 无法创建或获取页面", false, objectMapper);
                     return;
-                }
-
-                // login 指令不需要检查登录状态（它本身就是用来登录的）
-                if (!onlyLoginCommand) {
-                    // 检查登录状态
-                    if (!provider.checkLoginStatus(page)) {
-                        sendCommandResult(emitter, model, "❌ 未登录，请先登录", false, objectMapper);
-                        return;
-                    }
                 }
             }
 
@@ -219,9 +206,9 @@ public class CommandHandler {
             // 发送最终结果（只显示成功或失败）
             String finalMessage = allSuccess ? "✅ 指令执行成功" : "❌ 指令执行失败";
 
-            // 如果提供了成功回调，且不是 help/login 指令，调用回调处理 provider 特定的逻辑
+            // 如果提供了成功回调，且不是 help 指令，调用回调处理 provider 特定的逻辑
             boolean handledByCallback = false;
-            if (successCallback != null && allSuccess && !onlyHelpCommand && !onlyLoginCommand && page != null && !page.isClosed()) {
+            if (successCallback != null && allSuccess && !onlyHelpCommand && page != null && !page.isClosed()) {
                 handledByCallback = successCallback.onSuccess(page, model, emitter, finalMessage, allSuccess);
             }
 

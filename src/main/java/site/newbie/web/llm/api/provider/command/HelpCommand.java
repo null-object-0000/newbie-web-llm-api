@@ -133,8 +133,8 @@ public class HelpCommand implements Command {
         }
         
         progressCallback.onProgress("说明：");
-        progressCallback.onProgress("- 指令对话：只包含指令（如 /login），会独立处理，不发送给 AI");
-        progressCallback.onProgress("- 普通对话：指令+实际内容（如 /login 请检查状态），会先执行指令，然后发送消息给 AI");
+        progressCallback.onProgress("- 指令对话：只包含指令（如 /help），会独立处理，不发送给 AI");
+        progressCallback.onProgress("- 普通对话：指令+实际内容（如 /help 请显示帮助），会先执行指令，然后发送消息给 AI");
     }
     
     /**

@@ -9,7 +9,6 @@
       <div class="form-group">
         <label>浏览器运行模式</label>
         <select v-model="editingBrowserMode" class="w-full">
-          <option :value="null">使用全局配置</option>
           <option :value="false">有界面运行（Headed）</option>
           <option :value="true">无界面运行（Headless）</option>
         </select>
@@ -115,8 +114,7 @@
                 <td class="table-cell">
                   <span v-if="apiService.isPlaywrightProvider(account.providerName)" class="text-xs">
                     <span v-if="account.browserHeadless === true" class="badge badge-warning">无界面</span>
-                    <span v-else-if="account.browserHeadless === false" class="badge badge-success">有界面</span>
-                    <span v-else class="badge badge-secondary">全局配置</span>
+                    <span v-else class="badge badge-success">有界面</span>
                   </span>
                   <span v-else class="text-gray-400 dark:text-gray-500 text-xs">-</span>
                 </td>
@@ -278,7 +276,7 @@ const openBrowser = async (account) => {
 
 const editAccountBrowserMode = (account) => {
   editingAccountForBrowserMode.value = account;
-  editingBrowserMode.value = account.browserHeadless !== undefined ? account.browserHeadless : null;
+  editingBrowserMode.value = account.browserHeadless !== undefined ? account.browserHeadless : false;
   showBrowserModeModal.value = true;
 };
 

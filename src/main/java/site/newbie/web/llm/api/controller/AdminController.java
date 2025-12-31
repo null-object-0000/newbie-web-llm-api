@@ -602,12 +602,12 @@ public class AdminController {
     public static class CreateAccountRequest {
         private String provider;
         private String accountName;
-        private Boolean browserHeadless; // 浏览器是否无界面运行（null 表示使用全局配置）
+        private Boolean browserHeadless; // 浏览器是否无界面运行
     }
     
     @Data
     public static class UpdateAccountRequest {
-        private Boolean browserHeadless; // 浏览器是否无界面运行（null 表示使用全局配置）
+        private Boolean browserHeadless; // 浏览器是否无界面运行
     }
     
     @Data

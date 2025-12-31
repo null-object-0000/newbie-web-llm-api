@@ -31,7 +31,6 @@
       <div v-if="isPlaywrightProvider" class="form-group">
         <label>浏览器运行模式</label>
         <select v-model="form.browserHeadless" :disabled="loading" class="w-full">
-          <option :value="null">使用全局配置</option>
           <option :value="false">有界面运行（Headed）</option>
           <option :value="true">无界面运行（Headless）</option>
         </select>
@@ -142,7 +141,7 @@ const PLAYWRIGHT_PROVIDERS = ['gemini', 'openai', 'deepseek'];
 const form = ref({
   provider: '',
   accountName: '',
-  browserHeadless: null // null 表示使用全局配置
+  browserHeadless: false // 默认有界面运行
 });
 const loading = ref(false);
 const error = ref(null);
@@ -171,7 +170,7 @@ onMounted(() => {
     form.value = {
       provider: props.account.providerName || '',
       accountName: props.account.accountName || '',
-      browserHeadless: props.account.browserHeadless !== undefined ? props.account.browserHeadless : null
+      browserHeadless: props.account.browserHeadless !== undefined ? props.account.browserHeadless : false
     };
     if (isPlaywrightProvider.value && props.account.accountId) {
       createdAccount.value = props.account;
