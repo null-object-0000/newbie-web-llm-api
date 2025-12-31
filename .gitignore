@@ -35,3 +35,6 @@ user-data
 logs
 
 node_modules/
+
+src/main/resources/static/admin/assets/
+src/main/resources/static/admin/index.html
