@@ -7,6 +7,7 @@ import com.microsoft.playwright.Locator;
 import com.microsoft.playwright.Page;
 import com.microsoft.playwright.options.RequestOptions;
 import jakarta.annotation.PreDestroy;
+import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.http.MediaType;
@@ -20,6 +21,7 @@ import site.newbie.web.llm.api.model.LoginInfo;
 import site.newbie.web.llm.api.provider.AccountInfo;
 import site.newbie.web.llm.api.provider.LLMProvider;
 import site.newbie.web.llm.api.provider.ModelConfig;
+import site.newbie.web.llm.api.provider.ProviderLoginHandler;
 import site.newbie.web.llm.api.provider.ProviderRegistry;
 import site.newbie.web.llm.api.provider.command.CommandParser;
 import site.newbie.web.llm.api.provider.deepseek.model.DeepSeekModelConfig;
@@ -40,6 +42,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -55,7 +58,7 @@ import java.util.stream.Collectors;
  */
 @Slf4j
 @Component
-public class DeepSeekProvider implements LLMProvider {
+public class DeepSeekProvider implements LLMProvider, ProviderLoginHandler {
 
     private final BrowserManager browserManager;
     private final ObjectMapper objectMapper;
@@ -1938,6 +1941,345 @@ public class DeepSeekProvider implements LLMProvider {
     }
     
     
+    // ==================== ProviderLoginHandler 实现 ====================
+    
+    // 登录会话管理（用于 admin 登录）
+    private final ConcurrentHashMap<String, LoginSession> adminLoginSessions = new ConcurrentHashMap<>();
+    
+    @Data
+    private static class LoginSession {
+        private String sessionId;
+        private String accountId;
+        private Page loginPage;
+        private String qrCodeImageUrl;
+        private long createdAt;
+        
+        public LoginSession() {
+            this.sessionId = UUID.randomUUID().toString();
+            this.createdAt = System.currentTimeMillis();
+        }
+    }
+    
+    @Override
+    public Map<String, Object> startManualLogin(String accountId) {
+        try {
+            log.info("启动 DeepSeek 手动登录流程，accountId: {}", accountId);
+            
+            // 创建登录页面
+            Page page = getOrCreateLoginPage(accountId);
+            page.navigate("https://chat.deepseek.com/");
+            page.waitForLoadState();
+            
+            // 创建登录会话
+            LoginSession session = new LoginSession();
+            session.setAccountId(accountId);
+            session.setLoginPage(page);
+            adminLoginSessions.put(session.getSessionId(), session);
+            
+            Map<String, Object> result = new HashMap<>();
+            result.put("sessionId", session.getSessionId());
+            result.put("message", "浏览器已打开，请在浏览器中完成登录");
+            result.put("success", true);
+            
+            return result;
+        } catch (Exception e) {
+            log.error("启动手动登录失败: accountId={}", accountId, e);
+            return Map.of("success", false, "error", e.getMessage());
+        }
+    }
+    
+    @Override
+    public Map<String, Object> startAccountPasswordLogin(String accountId, String account, String password) {
+        try {
+            log.info("启动 DeepSeek 账号+密码登录，accountId: {}, account: {}", accountId, account);
+            
+            // 创建登录页面
+            Page page = getOrCreateLoginPage(accountId);
+            page.navigate("https://chat.deepseek.com/");
+            page.waitForLoadState();
+            page.waitForTimeout(1000);
+            
+            // 创建登录会话
+            LoginSession session = new LoginSession();
+            session.setAccountId(accountId);
+            session.setLoginPage(page);
+            adminLoginSessions.put(session.getSessionId(), session);
+            
+            // 创建 LoginSessionManager.LoginSession 用于登录流程
+            LoginSessionManager.LoginSession loginSession = loginSessionManager.getOrCreateSession(
+                getProviderName(), "admin-" + session.getSessionId());
+            loginSession.setLoginMethod(LoginSessionManager.LoginMethod.ACCOUNT_PASSWORD);
+            loginSession.setAccount(account);
+            loginSession.setPassword(password);
+            loginSession.setState(LoginSessionManager.LoginSessionState.LOGGING_IN);
+            
+            // 执行登录
+            boolean success = handleAccountPasswordLogin(page, loginSession);
+            
+            Map<String, Object> result = new HashMap<>();
+            result.put("sessionId", session.getSessionId());
+            result.put("success", success);
+            if (success) {
+                result.put("message", "登录成功");
+            } else {
+                String errorMsg = loginSession.getLoginError();
+                result.put("message", errorMsg != null ? errorMsg : "登录失败");
+                result.put("error", errorMsg);
+            }
+            
+            return result;
+        } catch (Exception e) {
+            log.error("账号+密码登录失败: accountId={}", accountId, e);
+            return Map.of("success", false, "error", e.getMessage());
+        }
+    }
+    
+    @Override
+    public Map<String, Object> startQrCodeLogin(String accountId) {
+        try {
+            log.info("启动 DeepSeek 二维码登录，accountId: {}", accountId);
+            
+            // 创建登录页面
+            Page page = getOrCreateLoginPage(accountId);
+            page.navigate("https://chat.deepseek.com/");
+            page.waitForLoadState();
+            page.waitForTimeout(1000);
+            
+            // 创建登录会话
+            LoginSession session = new LoginSession();
+            session.setAccountId(accountId);
+            session.setLoginPage(page);
+            adminLoginSessions.put(session.getSessionId(), session);
+            
+            // 创建 LoginSessionManager.LoginSession 用于登录流程
+            String conversationId = "admin-" + session.getSessionId();
+            LoginSessionManager.LoginSession loginSession = loginSessionManager.getOrCreateSession(
+                getProviderName(), conversationId);
+            loginSession.setLoginMethod(LoginSessionManager.LoginMethod.WECHAT_SCAN);
+            loginSession.setConversationId(conversationId);
+            loginSession.setState(LoginSessionManager.LoginSessionState.WAITING_WECHAT_SCAN);
+            
+            // 获取二维码（不使用 SSE）
+            String qrCodeImageUrl = getQrCodeImageUrl(page, loginSession);
+            
+            Map<String, Object> result = new HashMap<>();
+            result.put("sessionId", session.getSessionId());
+            
+            if (qrCodeImageUrl != null && !qrCodeImageUrl.isEmpty()) {
+                // 下载二维码并转换为 base64
+                String qrCodeBase64 = downloadImageAsBase64(qrCodeImageUrl);
+                
+                result.put("success", true);
+                result.put("message", "二维码已生成");
+                result.put("qrCodeImageUrl", qrCodeImageUrl);
+                if (qrCodeBase64 != null) {
+                    result.put("qrCodeBase64", qrCodeBase64);
+                }
+                session.setQrCodeImageUrl(qrCodeImageUrl);
+            } else {
+                String errorMsg = loginSession.getLoginError();
+                result.put("success", false);
+                result.put("message", errorMsg != null ? errorMsg : "获取二维码失败");
+                result.put("error", errorMsg);
+            }
+            
+            return result;
+        } catch (Exception e) {
+            log.error("二维码登录失败: accountId={}", accountId, e);
+            return Map.of("success", false, "error", e.getMessage());
+        }
+    }
+    
+    /**
+     * 获取二维码图片 URL（不通过 SSE）
+     */
+    private String getQrCodeImageUrl(Page page, LoginSessionManager.LoginSession session) {
+        try {
+            log.info("开始获取微信二维码");
+            
+            // 1. 查找并点击微信登录按钮
+            Locator wechatButton = page.locator("button:has-text('微信')")
+                    .or(page.locator("button:has-text('WeChat')"))
+                    .or(page.locator(".ds-sign-in-with-wechat-block"))
+                    .or(page.locator("[class*='wechat']"))
+                    .or(page.locator("[class*='WeChat']"));
+            
+            if (wechatButton.count() == 0) {
+                log.error("未找到微信登录按钮");
+                session.setLoginError("未找到微信登录按钮");
+                return null;
+            }
+            
+            log.info("找到微信登录按钮，准备点击");
+            wechatButton.first().click();
+            page.waitForTimeout(1000);
+            
+            // 2. 等待二维码 iframe 加载
+            log.info("等待微信二维码加载...");
+            page.waitForTimeout(2000);
+            
+            // 3. 查找二维码 iframe
+            Locator qrCodeIframe = page.locator("iframe[src*='weixin.gg']")
+                    .or(page.locator("iframe[src*='wechat']"))
+                    .or(page.locator("iframe#wxLogin"))
+                    .or(page.locator("iframe"));
+            
+            if (qrCodeIframe.count() == 0) {
+                log.error("未找到微信二维码 iframe");
+                session.setLoginError("未找到微信二维码");
+                return null;
+            }
+            
+            log.info("找到微信二维码 iframe");
+            
+            // 4. 获取 iframe 内容
+            Frame iframeFrame = qrCodeIframe.first().elementHandle().contentFrame();
+            if (iframeFrame == null) {
+                log.error("无法获取 iframe 内容");
+                session.setLoginError("无法加载微信二维码");
+                return null;
+            }
+            
+            // 等待 iframe 内容加载
+            iframeFrame.waitForLoadState();
+            try {
+                Thread.sleep(2000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            
+            // 5. 在 iframe 中查找二维码图片
+            String qrCodeImageSrc = (String) iframeFrame.evaluate("""
+                () => {
+                    const img = document.querySelector('img.js_qrcode_img') || 
+                                document.querySelector('img.web_qrcode_img') ||
+                                document.querySelector('img[src*="qrcode"]') ||
+                                document.querySelector('img');
+                    return img ? img.src : null;
+                }
+                """);
+            
+            if (qrCodeImageSrc == null || qrCodeImageSrc.isEmpty()) {
+                log.error("未找到二维码图片");
+                session.setLoginError("未找到二维码图片");
+                return null;
+            }
+            
+            // 6. 处理相对路径
+            String qrCodeImageUrl = qrCodeImageSrc;
+            if (qrCodeImageSrc.startsWith("/")) {
+                String iframeUrl = iframeFrame.url();
+                if (iframeUrl.contains("weixin.gg") || iframeUrl.contains("wechat")) {
+                    int protocolIndex = iframeUrl.indexOf("://");
+                    int pathIndex = iframeUrl.indexOf("/", protocolIndex + 3);
+                    if (pathIndex > 0) {
+                        String baseUrl = iframeUrl.substring(0, pathIndex);
+                        qrCodeImageUrl = baseUrl + qrCodeImageSrc;
+                    } else {
+                        qrCodeImageUrl = iframeUrl.substring(0, iframeUrl.indexOf("/", protocolIndex + 3)) + qrCodeImageSrc;
+                    }
+                } else {
+                    qrCodeImageUrl = "https://open.weixin.gg.com" + qrCodeImageSrc;
+                }
+            }
+            
+            log.info("获取到二维码图片 URL: {}", qrCodeImageUrl);
+            
+            // 7. 保存二维码信息到会话
+            session.setQrCodeImageUrl(qrCodeImageUrl);
+            session.setState(LoginSessionManager.LoginSessionState.WAITING_WECHAT_SCAN);
+            loginSessionManager.saveSession(getProviderName(), session.getConversationId(), session);
+            
+            return qrCodeImageUrl;
+            
+        } catch (Exception e) {
+            log.error("获取二维码图片 URL 时出错: {}", e.getMessage(), e);
+            session.setLoginError("获取二维码出错: " + e.getMessage());
+            return null;
+        }
+    }
+    
+    @Override
+    public Map<String, Object> confirmQrCodeScanned(String accountId, String sessionId) {
+        try {
+            log.info("确认二维码已扫码，accountId: {}, sessionId: {}", accountId, sessionId);
+            
+            LoginSession session = adminLoginSessions.get(sessionId);
+            if (session == null) {
+                return Map.of("success", false, "error", "登录会话不存在");
+            }
+            
+            Page page = session.getLoginPage();
+            if (page == null || page.isClosed()) {
+                return Map.of("success", false, "error", "登录页面已关闭");
+            }
+            
+            // 创建 LoginSessionManager.LoginSession
+            String conversationId = "admin-" + sessionId;
+            LoginSessionManager.LoginSession loginSession = loginSessionManager.getOrCreateSession(
+                getProviderName(), conversationId);
+            loginSession.setLoginMethod(LoginSessionManager.LoginMethod.WECHAT_SCAN);
+            loginSession.setState(LoginSessionManager.LoginSessionState.LOGGING_IN);
+            
+            // 检查登录状态
+            boolean success = checkWechatLoginStatus(page, loginSession);
+            
+            Map<String, Object> result = new HashMap<>();
+            result.put("success", success);
+            if (success) {
+                result.put("message", "登录成功");
+            } else {
+                result.put("message", "登录尚未完成，请确认已扫码");
+            }
+            
+            return result;
+        } catch (Exception e) {
+            log.error("确认扫码失败: accountId={}, sessionId={}", accountId, sessionId, e);
+            return Map.of("success", false, "error", e.getMessage());
+        }
+    }
+    
+    @Override
+    public Map<String, Object> verifyLogin(String accountId) {
+        try {
+            log.info("验证 DeepSeek 登录状态，accountId: {}", accountId);
+            
+            // 获取或创建页面
+            Page page = getOrCreateLoginPage(accountId);
+            page.navigate("https://chat.deepseek.com/");
+            page.waitForLoadState();
+            page.waitForTimeout(2000);
+            
+            // 检查登录状态
+            boolean isLoggedIn = checkLoginStatus(page);
+            if (!isLoggedIn) {
+                return Map.of("success", false, "message", "未登录");
+            }
+            
+            // 获取账号信息
+            AccountInfo accountInfo = getCurrentAccountInfo(page);
+            if (accountInfo == null || !accountInfo.isSuccess()) {
+                return Map.of("success", false, "message", "无法获取账号信息");
+            }
+            
+            Map<String, Object> result = new HashMap<>();
+            result.put("success", true);
+            result.put("message", "登录验证成功");
+            result.put("actualAccount", accountInfo.getAccountId());
+            result.put("nickname", accountInfo.getAccountName());
+            
+            return result;
+        } catch (Exception e) {
+            log.error("验证登录失败: accountId={}", accountId, e);
+            return Map.of("success", false, "error", e.getMessage());
+        }
+    }
+    
+    @Override
+    public Page getLoginPage(String accountId) {
+        return getOrCreateLoginPage(accountId);
+    }
+    
     @PreDestroy
     public void cleanup() {
         log.info("清理页面，共 {} 个", modelPages.size());
@@ -1945,6 +2287,18 @@ public class DeepSeekProvider implements LLMProvider {
             try { if (page != null && !page.isClosed()) page.close(); } catch (Exception e) { }
         });
         modelPages.clear();
+        
+        // 清理 admin 登录会话
+        adminLoginSessions.values().forEach(session -> {
+            if (session.getLoginPage() != null && !session.getLoginPage().isClosed()) {
+                try {
+                    session.getLoginPage().close();
+                } catch (Exception e) {
+                    log.warn("关闭登录页面失败: sessionId={}", session.getSessionId(), e);
+                }
+            }
+        });
+        adminLoginSessions.clear();
     }
 }
 

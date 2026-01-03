@@ -129,13 +129,18 @@ const props = defineProps({
 const emit = defineEmits(['saved', 'cancel']);
 
 const accounts = ref({});
+const providers = ref({});
 const selectedAccounts = ref({});
 const loading = ref(false);
 const saving = ref(false);
 const error = ref(null);
 
 const availableProviders = computed(() => {
-  return Object.keys(accounts.value).sort();
+  // 优先使用 providers 列表（即使没有账号也能看到所有 providers）
+  const providerNames = Object.keys(providers.value).length > 0 
+    ? Object.keys(providers.value).sort()
+    : Object.keys(accounts.value).sort();
+  return providerNames;
 });
 
 const hasSelectedAccounts = computed(() => {
@@ -143,6 +148,7 @@ const hasSelectedAccounts = computed(() => {
 });
 
 onMounted(() => {
+  loadProviders();
   loadAccounts();
   if (props.apiKey.providerAccounts) {
     selectedAccounts.value = { ...props.apiKey.providerAccounts };
@@ -150,6 +156,16 @@ onMounted(() => {
     selectedAccounts.value = { [props.apiKey.providerName]: props.apiKey.accountId };
   }
 });
+
+const loadProviders = async () => {
+  try {
+    const data = await apiService.getProviders();
+    providers.value = data || {};
+  } catch (err) {
+    console.error('加载提供器列表失败:', err);
+    // 不显示错误，因为这不是关键功能
+  }
+};
 
 const loadAccounts = async () => {
   loading.value = true;

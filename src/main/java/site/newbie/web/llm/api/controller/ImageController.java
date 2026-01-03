@@ -18,7 +18,6 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import site.newbie.web.llm.api.manager.BrowserManager;
-import site.newbie.web.llm.api.provider.ProviderRegistry;
 import tools.jackson.core.type.TypeReference;
 import tools.jackson.databind.ObjectMapper;
 
@@ -46,9 +45,6 @@ public class ImageController {
     
     @Autowired
     private BrowserManager browserManager;
-    
-    @Autowired
-    private ProviderRegistry providerRegistry;
     
     private final ObjectMapper objectMapper = new ObjectMapper();
     

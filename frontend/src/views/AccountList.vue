@@ -181,6 +181,7 @@ const openAccountModal = inject('openAccountModal', () => {});
 const playwrightInitialized = inject('playwrightInitialized', ref(true));
 
 const accounts = ref({});
+const providers = ref({});
 const loading = ref(false);
 const error = ref(null);
 const searchQuery = ref('');
@@ -191,7 +192,11 @@ const editingBrowserMode = ref(null);
 const savingBrowserMode = ref(false);
 
 const availableProviders = computed(() => {
-  return Object.keys(accounts.value).sort();
+  // 优先使用 providers 列表（即使没有账号也能看到所有 providers）
+  const providerNames = Object.keys(providers.value).length > 0 
+    ? Object.keys(providers.value).sort()
+    : Object.keys(accounts.value).sort();
+  return providerNames;
 });
 
 const flatAccountsList = computed(() => {
@@ -227,6 +232,16 @@ const filteredAccounts = computed(() => {
 const hasAccounts = computed(() => {
   return filteredAccounts.value.length > 0;
 });
+
+const loadProviders = async () => {
+  try {
+    const data = await apiService.getProviders();
+    providers.value = data || {};
+  } catch (err) {
+    console.error('加载提供器列表失败:', err);
+    // 不显示错误，因为这不是关键功能
+  }
+};
 
 const loadAccounts = async () => {
   loading.value = true;
@@ -340,6 +355,7 @@ const getAccountStatusClass = (account) => {
 };
 
 onMounted(() => {
+  loadProviders();
   loadAccounts();
   if (window.lucide) {
     window.lucide.createIcons();

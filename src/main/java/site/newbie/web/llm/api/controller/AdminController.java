@@ -19,7 +19,9 @@ import site.newbie.web.llm.api.manager.AccountLoginService;
 import site.newbie.web.llm.api.manager.AccountManager;
 import site.newbie.web.llm.api.manager.ApiKeyManager;
 import site.newbie.web.llm.api.manager.BrowserManager;
-import site.newbie.web.llm.api.provider.ProviderRegistry;
+import site.newbie.web.llm.api.provider.LLMProvider;
+import site.newbie.web.llm.api.provider.ProviderAdminService;
+import site.newbie.web.llm.api.provider.ProviderLoginHandler;
 
 import java.util.Collections;
 import java.util.HashMap;
@@ -39,20 +41,37 @@ public class AdminController {
     
     private final AccountManager accountManager;
     private final ApiKeyManager apiKeyManager;
-    private final ProviderRegistry providerRegistry;
+    private final ProviderAdminService providerAdminService;
     private final AccountLoginService accountLoginService;
     private final BrowserManager browserManager;
     
     public AdminController(AccountManager accountManager, 
                           ApiKeyManager apiKeyManager,
-                          ProviderRegistry providerRegistry,
+                          ProviderAdminService providerAdminService,
                           AccountLoginService accountLoginService,
                           BrowserManager browserManager) {
         this.accountManager = accountManager;
         this.apiKeyManager = apiKeyManager;
-        this.providerRegistry = providerRegistry;
+        this.providerAdminService = providerAdminService;
         this.accountLoginService = accountLoginService;
         this.browserManager = browserManager;
+    }
+    
+    // ==================== 提供器管理 API ====================
+    
+    /**
+     * 获取所有可用的提供器列表
+     */
+    @GetMapping("/providers")
+    public ResponseEntity<Map<String, Object>> getProviders() {
+        try {
+            Map<String, Object> allProviders = providerAdminService.getAllProviders();
+            return ResponseEntity.ok(allProviders);
+        } catch (Exception e) {
+            log.error("获取提供器列表失败", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(Map.of("error", e.getMessage()));
+        }
     }
     
     // ==================== 账号管理 API ====================
@@ -74,7 +93,7 @@ public class AdminController {
                 result.put("count", accounts.size());
             } else {
                 // 以代码中实际注册的提供器为基准
-                Map<String, Object> allProviders = providerRegistry.getAllProviders();
+                Map<String, Object> allProviders = providerAdminService.getAllProviders();
                 Map<String, List<AccountManager.AccountInfo>> allAccounts = new HashMap<>();
                 
                 // 对于每个注册的提供器，获取其账号（如果没有则返回空列表）
@@ -149,6 +168,7 @@ public class AdminController {
     /**
      * 启动登录流程（Playwright 类提供器）
      * 为账号创建独立的 Chrome 配置并启动浏览器
+     * 这是原有的手动登录方式，保留以兼容旧代码
      */
     @PostMapping("/accounts/{providerName}/{accountId}/login/start")
     public ResponseEntity<Map<String, Object>> startLogin(
@@ -161,20 +181,171 @@ public class AdminController {
                     .body(Map.of("error", "账号不存在"));
             }
             
-            // 启动登录流程
-            String sessionId = accountLoginService.startLogin(
-                providerName, 
-                accountId, 
-                account.getAccountName()
-            );
+            // 检查提供器是否实现了 ProviderLoginHandler
+            LLMProvider provider = providerAdminService.getProviderByName(providerName);
+            if (provider instanceof ProviderLoginHandler) {
+                // 使用新的登录处理器
+                ProviderLoginHandler loginHandler = (ProviderLoginHandler) provider;
+                Map<String, Object> result = loginHandler.startManualLogin(accountId);
+                return ResponseEntity.ok(result);
+            } else {
+                // 使用原有的登录服务
+                String sessionId = accountLoginService.startLogin(
+                    providerName, 
+                    accountId, 
+                    account.getAccountName()
+                );
+                
+                Map<String, Object> result = new HashMap<>();
+                result.put("sessionId", sessionId);
+                result.put("message", "登录流程已启动，请在浏览器中完成登录");
+                
+                return ResponseEntity.ok(result);
+            }
+        } catch (Exception e) {
+            log.error("启动登录流程失败: providerName={}, accountId={}", providerName, accountId, e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(Map.of("error", e.getMessage()));
+        }
+    }
+    
+    /**
+     * 启动账号+密码登录
+     */
+    @PostMapping("/accounts/{providerName}/{accountId}/login/account-password")
+    public ResponseEntity<Map<String, Object>> startAccountPasswordLogin(
+            @PathVariable String providerName,
+            @PathVariable String accountId,
+            @RequestBody AccountPasswordLoginRequest request) {
+        try {
+            AccountManager.AccountInfo account = accountManager.getAccount(providerName, accountId);
+            if (account == null) {
+                return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                    .body(Map.of("error", "账号不存在"));
+            }
             
-            Map<String, Object> result = new HashMap<>();
-            result.put("sessionId", sessionId);
-            result.put("message", "登录流程已启动，请在浏览器中完成登录");
+            LLMProvider provider = providerAdminService.getProviderByName(providerName);
+            if (!(provider instanceof ProviderLoginHandler)) {
+                return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                    .body(Map.of("error", "该提供器不支持账号+密码登录"));
+            }
+            
+            ProviderLoginHandler loginHandler = (ProviderLoginHandler) provider;
+            Map<String, Object> result = loginHandler.startAccountPasswordLogin(
+                accountId, request.getAccount(), request.getPassword());
             
             return ResponseEntity.ok(result);
         } catch (Exception e) {
-            log.error("启动登录流程失败: providerName={}, accountId={}", providerName, accountId, e);
+            log.error("账号+密码登录失败: providerName={}, accountId={}", providerName, accountId, e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(Map.of("error", e.getMessage()));
+        }
+    }
+    
+    /**
+     * 启动二维码登录
+     */
+    @PostMapping("/accounts/{providerName}/{accountId}/login/qr-code")
+    public ResponseEntity<Map<String, Object>> startQrCodeLogin(
+            @PathVariable String providerName,
+            @PathVariable String accountId) {
+        try {
+            AccountManager.AccountInfo account = accountManager.getAccount(providerName, accountId);
+            if (account == null) {
+                return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                    .body(Map.of("error", "账号不存在"));
+            }
+            
+            LLMProvider provider = providerAdminService.getProviderByName(providerName);
+            if (!(provider instanceof ProviderLoginHandler)) {
+                return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                    .body(Map.of("error", "该提供器不支持二维码登录"));
+            }
+            
+            ProviderLoginHandler loginHandler = (ProviderLoginHandler) provider;
+            Map<String, Object> result = loginHandler.startQrCodeLogin(accountId);
+            
+            return ResponseEntity.ok(result);
+        } catch (Exception e) {
+            log.error("启动二维码登录失败: providerName={}, accountId={}", providerName, accountId, e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(Map.of("error", e.getMessage()));
+        }
+    }
+    
+    /**
+     * 确认二维码已扫码
+     */
+    @PostMapping("/accounts/{providerName}/{accountId}/login/qr-code/confirm")
+    public ResponseEntity<Map<String, Object>> confirmQrCodeScanned(
+            @PathVariable String providerName,
+            @PathVariable String accountId,
+            @RequestBody ConfirmQrCodeRequest request) {
+        try {
+            AccountManager.AccountInfo account = accountManager.getAccount(providerName, accountId);
+            if (account == null) {
+                return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                    .body(Map.of("error", "账号不存在"));
+            }
+            
+            LLMProvider provider = providerAdminService.getProviderByName(providerName);
+            if (!(provider instanceof ProviderLoginHandler)) {
+                return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                    .body(Map.of("error", "该提供器不支持二维码登录"));
+            }
+            
+            ProviderLoginHandler loginHandler = (ProviderLoginHandler) provider;
+            Map<String, Object> result = loginHandler.confirmQrCodeScanned(
+                accountId, request.getSessionId());
+            
+            return ResponseEntity.ok(result);
+        } catch (Exception e) {
+            log.error("确认扫码失败: providerName={}, accountId={}", providerName, accountId, e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(Map.of("error", e.getMessage()));
+        }
+    }
+    
+    /**
+     * 验证登录状态（使用提供器的登录处理器）
+     */
+    @PostMapping("/accounts/{providerName}/{accountId}/login/verify")
+    public ResponseEntity<Map<String, Object>> verifyProviderLogin(
+            @PathVariable String providerName,
+            @PathVariable String accountId) {
+        try {
+            AccountManager.AccountInfo account = accountManager.getAccount(providerName, accountId);
+            if (account == null) {
+                return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                    .body(Map.of("error", "账号不存在"));
+            }
+            
+            LLMProvider provider = providerAdminService.getProviderByName(providerName);
+            if (!(provider instanceof ProviderLoginHandler)) {
+                // 降级到原有的验证方式
+                return verifyLogin(new VerifyLoginRequest() {{
+                    setSessionId(accountId); // 临时使用 accountId 作为 sessionId
+                }});
+            }
+            
+            ProviderLoginHandler loginHandler = (ProviderLoginHandler) provider;
+            Map<String, Object> result = loginHandler.verifyLogin(accountId);
+            
+            // 如果验证成功，更新账号信息
+            if (Boolean.TRUE.equals(result.get("success"))) {
+                if (result.containsKey("actualAccount")) {
+                    account.setAccountName((String) result.get("actualAccount"));
+                }
+                if (result.containsKey("nickname")) {
+                    account.setNickname((String) result.get("nickname"));
+                }
+                account.setLoginVerified(true);
+                accountManager.saveAccounts();
+            }
+            
+            return ResponseEntity.ok(result);
+        } catch (Exception e) {
+            log.error("验证登录失败: providerName={}, accountId={}", providerName, accountId, e);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                 .body(Map.of("error", e.getMessage()));
         }
@@ -323,7 +494,7 @@ public class AdminController {
             }
             
             // 检查提供器是否存在
-            if (providerRegistry.getProviderByName(providerName) == null) {
+            if (providerAdminService.getProviderByName(providerName) == null) {
                 return ResponseEntity.status(HttpStatus.NOT_FOUND)
                     .body(Map.of("error", "提供器不存在"));
             }
@@ -559,7 +730,7 @@ public class AdminController {
             Map<String, Object> stats = new HashMap<>();
             
             // 获取代码中注册的所有提供器
-            Map<String, Object> allProviders = providerRegistry.getAllProviders();
+            Map<String, Object> allProviders = providerAdminService.getAllProviders();
             
             // 获取账号统计（以代码中注册的提供器为基准）
             Map<String, List<AccountManager.AccountInfo>> allAccounts = accountManager.getAllAccounts();
@@ -634,6 +805,17 @@ public class AdminController {
     
     @Data
     public static class VerifyLoginRequest {
+        private String sessionId;
+    }
+    
+    @Data
+    public static class AccountPasswordLoginRequest {
+        private String account;
+        private String password;
+    }
+    
+    @Data
+    public static class ConfirmQrCodeRequest {
         private String sessionId;
     }
 }

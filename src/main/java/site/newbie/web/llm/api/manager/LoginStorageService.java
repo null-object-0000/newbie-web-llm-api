@@ -3,12 +3,9 @@ package site.newbie.web.llm.api.manager;
 import jakarta.annotation.PostConstruct;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 import site.newbie.web.llm.api.model.LoginInfo;
-import site.newbie.web.llm.api.provider.ProviderRegistry;
 import tools.jackson.core.type.TypeReference;
 import tools.jackson.databind.ObjectMapper;
 
@@ -38,11 +35,6 @@ public class LoginStorageService {
     // 从配置文件读取，与浏览器数据目录保持一致
     @Value("${app.browser.user-data-dir:./user-data}")
     private String userDataDir;
-    
-    // 使用 @Lazy 避免循环依赖
-    @Autowired(required = false)
-    @Lazy
-    private ProviderRegistry providerRegistry;
     
     public LoginStorageService(ObjectMapper objectMapper) {
         this.objectMapper = objectMapper;
@@ -133,24 +125,14 @@ public class LoginStorageService {
     
     /**
      * 保存登录会话
+     * 注意：登录状态的更新应由调用者在需要时通过 ProviderAdminService 显式处理
      */
     public void saveLoginSession(String providerName, String accountId, String conversationId, LoginSessionManager.LoginSession session) {
         Map<String, LoginSessionManager.LoginSession> loginSessionsMap = loadLoginSessionsMap();
         if (session != null && conversationId != null && !conversationId.isEmpty()) {
             String key = generateSessionKey(providerName, accountId, conversationId);
-            // 检查是否是新建的登录会话（之前不存在）
-            boolean isNewSession = !loginSessionsMap.containsKey(key);
             loginSessionsMap.put(key, session);
-            log.debug("保存登录会话: key={}, state={}, isNew={}", key, session.getState(), isNewSession);
-            
-            // 只有在新建登录会话且状态为 WAITING_LOGIN_METHOD 时，才更新登录状态为未登录
-            // 这样可以避免覆盖已登录的状态（比如用户已经登录，但是因为某种原因创建了登录会话）
-            if (isNewSession && session.getState() == LoginSessionManager.LoginSessionState.WAITING_LOGIN_METHOD) {
-                log.info("检测到新建了 WAITING_LOGIN_METHOD 状态的登录会话，立即更新登录状态为未登录");
-                if (providerRegistry != null) {
-                    providerRegistry.setLoginStatus(providerName, false);
-                }
-            }
+            log.debug("保存登录会话: key={}, state={}", key, session.getState());
         } else {
             if (conversationId != null && !conversationId.isEmpty()) {
                 String key = generateSessionKey(providerName, conversationId);

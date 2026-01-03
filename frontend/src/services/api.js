@@ -8,6 +8,12 @@ export const apiService = {
     return response.data;
   },
   
+  // 提供器管理
+  async getProviders() {
+    const response = await axios.get(`${API_BASE}/admin/api/providers`);
+    return response.data;
+  },
+  
   // 账号管理
   async getAccounts(provider = null) {
     const url = provider 
@@ -72,8 +78,38 @@ export const apiService = {
     return response.data;
   },
   
+  async startAccountPasswordLogin(providerName, accountId, account, password) {
+    const response = await axios.post(
+      `${API_BASE}/admin/api/accounts/${providerName}/${accountId}/login/account-password`,
+      { account, password }
+    );
+    return response.data;
+  },
+  
+  async startQrCodeLogin(providerName, accountId) {
+    const response = await axios.post(
+      `${API_BASE}/admin/api/accounts/${providerName}/${accountId}/login/qr-code`
+    );
+    return response.data;
+  },
+  
+  async confirmQrCodeScanned(providerName, accountId, sessionId) {
+    const response = await axios.post(
+      `${API_BASE}/admin/api/accounts/${providerName}/${accountId}/login/qr-code/confirm`,
+      { sessionId }
+    );
+    return response.data;
+  },
+  
   async verifyLogin(sessionId) {
     const response = await axios.post(`${API_BASE}/admin/api/accounts/login/verify`, { sessionId });
+    return response.data;
+  },
+  
+  async verifyProviderLogin(providerName, accountId) {
+    const response = await axios.post(
+      `${API_BASE}/admin/api/accounts/${providerName}/${accountId}/login/verify`
+    );
     return response.data;
   },
   
